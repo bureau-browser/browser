@@ -39,6 +39,10 @@ RUN apt-get update && apt-get install -y \
     unzip \
     # yt-dlp runtime dependency
     python3-minimal \
+    # ffmpeg for x11grab screen recording (the Playwright-Firefox video
+    # path doesn't work on Camoufox, so we record the Xvfb display
+    # directly — see `recordVideo` branch in server.js).
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-bake Camoufox browser binary into image via bind mount (downloaded by Makefile)

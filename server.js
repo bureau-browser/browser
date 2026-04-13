@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
+import { spawn as ffmpegSpawn } from 'child_process';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
@@ -1745,14 +1746,19 @@ app.post('/tabs', async (req, res) => {
 
         const width = Number(recordVideo.width) || 1280;
         const height = Number(recordVideo.height) || 720;
+        const fps = Number(recordVideo.fps) || 15;
 
+        // We used to pass `recordVideo` to Playwright's newContext here so
+        // Playwright would drive the capture internally. That turned out not
+        // to work on Camoufox — Playwright's Firefox video path depends on
+        // a Juggler screencast command that Camoufox's patched Firefox
+        // doesn't implement correctly (smoke test: 24 frames regardless of
+        // session length). We fall back to recording the Xvfb display
+        // directly via ffmpeg x11grab, which ignores Camoufox's patches
+        // entirely and just reads raw framebuffer pixels. See README.
         const contextOptions = {
           viewport: { width, height },
           permissions: ['geolocation'],
-          recordVideo: {
-            dir: videoDir,
-            size: { width, height },
-          },
         };
         if (!CONFIG.proxy.host) {
           contextOptions.locale = 'en-US';
@@ -1765,12 +1771,43 @@ app.post('/tabs', async (req, res) => {
         const tabState = createTabState(page);
         attachDownloadListener(tabState, tabId);
 
+        // Spawn ffmpeg to capture the Xvfb display into <tabId>.webm. The
+        // process runs for the lifetime of the recorded tab; closeTab /
+        // getVideo stops it with SIGINT so ffmpeg flushes the container
+        // header cleanly. `-loglevel warning` keeps the container log clean.
+        const videoPath = path.join(videoDir, `${tabId}.webm`);
+        const display = process.env.DISPLAY || ':99';
+        const ffmpegProcess = ffmpegSpawn(
+          [
+            '-loglevel', 'warning',
+            '-f', 'x11grab',
+            '-video_size', `${width}x${height}`,
+            '-framerate', String(fps),
+            '-i', display,
+            '-c:v', 'libvpx',
+            '-b:v', '1M',
+            '-cpu-used', '4',
+            '-deadline', 'realtime',
+            '-y',
+            videoPath,
+          ],
+          { stdio: ['ignore', 'ignore', 'pipe'] }
+        );
+        ffmpegProcess.stderr?.on('data', (buf) => {
+          const msg = buf.toString().trim();
+          if (msg) log('warn', 'ffmpeg stderr', { tabId, msg: msg.slice(0, 200) });
+        });
+        ffmpegProcess.on('exit', (code, signal) => {
+          log('info', 'ffmpeg exited', { tabId, code, signal });
+        });
+
         recordedTabs.set(tabId, {
           tabState,
           context,
           videoDir,
+          videoPath,
           videoSettled: false,
-          videoPath: null,
+          ffmpegProcess,
           userId: normalizeUserId(userId),
           listItemId: resolvedSessionKey,
           createdAt: Date.now(),
@@ -1797,8 +1834,10 @@ app.post('/tabs', async (req, res) => {
           videoDir,
           width,
           height,
+          fps,
+          ffmpegPid: ffmpegProcess.pid,
         });
-        return { tabId, url: page.url(), recordVideo: { width, height } };
+        return { tabId, url: page.url(), recordVideo: { width, height, fps } };
       })(), requestTimeoutMs(), 'recorded tab create');
 
       return res.json(result);
@@ -2672,14 +2711,16 @@ app.delete('/tabs/:tabId', async (req, res) => {
     if (!userId) return res.status(400).json({ error: 'userId required (query or body)' });
     const tabId = req.params.tabId;
 
-    // Recorded tabs own their own context — close the context (which
-    // finalizes the Playwright video file to disk), then schedule a
-    // grace-window cleanup of the video dir so a late
-    // `GET /tabs/:tabId/video` can still read it.
+    // Recorded tabs own their own context + ffmpeg subprocess. Stop
+    // ffmpeg first (SIGINT flushes the WebM container header to disk),
+    // then close the Playwright context, then schedule a grace-window
+    // cleanup of the video dir so a late `GET /tabs/:tabId/video` can
+    // still read the finalized file.
     const recorded = recordedTabs.get(tabId);
     if (recorded) {
       await clearTabDownloads(recorded.tabState);
       if (!recorded.videoSettled) {
+        await stopFfmpegAndWait(recorded, 'delete');
         try {
           await recorded.context.close();
         } catch (err) {
@@ -2690,7 +2731,6 @@ app.delete('/tabs/:tabId', async (req, res) => {
           });
         }
         recorded.videoSettled = true;
-        recorded.videoPath = resolveRecordedVideoPath(recorded.videoDir);
       }
       const lock = tabLocks.get(tabId);
       if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
@@ -2726,19 +2766,47 @@ app.delete('/tabs/:tabId', async (req, res) => {
 });
 
 // ── Recorded-tab helpers ──────────────────────────────────────
-//
-// Playwright writes one .webm per page into the dir passed as
-// `recordVideo.dir`. Since each recorded context has exactly one page,
-// the dir contains exactly one file after the context closes. We just
-// grab the first .webm entry.
-function resolveRecordedVideoPath(videoDir) {
-  try {
-    const files = fs.readdirSync(videoDir).filter((f) => f.endsWith('.webm'));
-    if (files.length === 0) return null;
-    return path.join(videoDir, files[0]);
-  } catch {
-    return null;
-  }
+
+/**
+ * Stop the ffmpeg x11grab subprocess for a recorded tab and wait for it
+ * to exit cleanly. SIGINT is critical: SIGKILL would leave the WebM file
+ * with an incomplete container header (no seek index / duration), which
+ * most players refuse to open. SIGINT triggers ffmpeg's normal shutdown
+ * path that writes the final trailer.
+ *
+ * If ffmpeg doesn't exit within 5s (stuck, huge buffer, etc) we escalate
+ * to SIGKILL as a last resort — the file will be truncated but some
+ * content is better than a hung close.
+ */
+async function stopFfmpegAndWait(recorded, reason) {
+  const proc = recorded.ffmpegProcess;
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killer);
+      resolve();
+    };
+    proc.once('exit', finish);
+    proc.once('close', finish);
+    try {
+      proc.kill('SIGINT');
+    } catch {
+      // already dead
+      finish();
+      return;
+    }
+    const killer = setTimeout(() => {
+      if (settled) return;
+      log('warn', 'ffmpeg SIGINT timed out, escalating to SIGKILL', {
+        tabId: recorded.tabState?.tabId,
+        reason,
+      });
+      try { proc.kill('SIGKILL'); } catch {}
+    }, 5000);
+  });
 }
 
 // After a recorded tab closes, keep the video dir for VIDEO_GRACE_WINDOW_MS
@@ -2787,6 +2855,7 @@ app.get('/tabs/:tabId/video', async (req, res) => {
     }
 
     if (!recorded.videoSettled) {
+      await stopFfmpegAndWait(recorded, 'get');
       try {
         await recorded.context.close();
       } catch (err) {
@@ -2797,7 +2866,6 @@ app.get('/tabs/:tabId/video', async (req, res) => {
         });
       }
       recorded.videoSettled = true;
-      recorded.videoPath = resolveRecordedVideoPath(recorded.videoDir);
     }
 
     if (!recorded.videoPath) {
