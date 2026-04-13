@@ -25,6 +25,19 @@ npm install && npm start
 
 ---
 
+## Downstream fork
+
+This is the `agstudio/native-video` branch of `jo-inc/camofox-browser`. It
+adds native Playwright video recording on top of upstream — see
+[`docs/native-video.md`](docs/native-video.md) for the API.
+
+`POST /tabs` accepts an optional `recordVideo: { width, height }` block.
+When set, the tab gets its own Playwright context with `recordVideo`
+enabled and a new `GET /tabs/:tabId/video` endpoint streams the
+resulting `.webm` back to the caller after the context closes. Existing
+routes are untouched — recorded tabs live in a separate top-level map
+and the shared-session codepath for normal tabs is identical to upstream.
+
 ## Why
 
 AI agents need to browse the real web. Playwright gets blocked. Headless Chrome gets fingerprinted. Stealth plugins become the fingerprint.
