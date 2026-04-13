@@ -1778,6 +1778,7 @@ app.post('/tabs', async (req, res) => {
         const videoPath = path.join(videoDir, `${tabId}.webm`);
         const display = process.env.DISPLAY || ':99';
         const ffmpegProcess = ffmpegSpawn(
+          'ffmpeg',
           [
             '-loglevel', 'warning',
             '-f', 'x11grab',
