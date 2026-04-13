@@ -59,6 +59,13 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --production
 
+# Playwright ffmpeg binary — required for `page.video()` / recordVideo
+# contexts. Without this, any newContext({ recordVideo }) call fails with
+# "Executable doesn't exist at /root/.cache/ms-playwright/ffmpeg-XXXX/ffmpeg-linux".
+# Only the ffmpeg helper is installed (not the Playwright browsers, which
+# Camoufox ships separately).
+RUN npx playwright install ffmpeg
+
 COPY server.js ./
 COPY lib/ ./lib/
 
