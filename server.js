@@ -255,25 +255,41 @@ let browser = null;
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
 
-// ── Native video recording (agstudio/native-video branch) ────────────
+// ── Dedicated-context tabs (agstudio/native-video branch) ────────────
 //
-// Tabs created with `recordVideo` in the POST /tabs body get a dedicated
-// Playwright context (not the shared session context) so the video file
-// is scoped to exactly one tab. The entry lives in this top-level map
-// instead of `session.tabGroups`, and `findTab` falls through to check
-// it — so existing routes /navigate, /snapshot, /click, /type, /evaluate
-// etc. all keep working with zero modification.
+// Tabs created with `recordVideo` OR `viewport` in the POST /tabs body
+// get their own Playwright context (not the shared session context) so
+// they're isolated from other tabs in the same user's session.
+//
+// Two reasons to need a dedicated context:
+//   1. `recordVideo` — an ffmpeg x11grab subprocess records the Xvfb
+//      display for the lifetime of this tab, into a .webm that the
+//      downstream fetches via GET /tabs/:tabId/video.
+//   2. `viewport` — the caller wants a specific viewport width/height.
+//      Playwright's viewport is a per-context option locked at
+//      newContext() time (no hot resize), so different sizes need
+//      different contexts. No ffmpeg, no video file — just isolation.
+//
+// Entries live in this top-level map instead of `session.tabGroups`,
+// and `findTab` falls through to check it — so existing routes
+// /navigate, /snapshot, /click, /type, /evaluate etc. all keep working
+// with zero modification.
 //
 // Lifecycle:
-//   POST /tabs + recordVideo → create dedicated context with recordVideo,
-//                              entry in recordedTabs, return { tabId }
-//   any /tabs/:tabId/* route → findTab() resolves from recordedTabs
-//   GET  /tabs/:tabId/video  → close context (finalizes .webm), stream file
-//   DELETE /tabs/:tabId      → close context if still open, schedule
-//                              grace-window cleanup of the video dir
+//   POST /tabs + (recordVideo|viewport) → fresh context + entry in map
+//   any /tabs/:tabId/* route → findTab() resolves from dedicatedTabs
+//   GET  /tabs/:tabId/video  → only valid on recordVideo entries;
+//                              400 for viewport-only tabs
+//   DELETE /tabs/:tabId      → close context; if recordVideo, schedule
+//                              grace-window video-dir cleanup; otherwise
+//                              evict immediately (nothing to fetch)
 //
-// tabId -> { tabState, context, videoDir, videoSettled, userId, listItemId, createdAt }
-const recordedTabs = new Map();
+// tabId -> {
+//   tabState, context, userId, listItemId, createdAt,
+//   // recordVideo-only:
+//   ffmpegProcess?, videoDir?, videoPath?, videoSettled?,
+// }
+const dedicatedTabs = new Map();
 const VIDEO_BASE_DIR = process.env.CAMOFOX_VIDEO_DIR || '/tmp/camofox-videos';
 // How long the .webm stays on disk after the tab is closed. A client that
 // did `DELETE /tabs/:tabId` before `GET /tabs/:tabId/video` has this window
@@ -941,7 +957,7 @@ function findTab(session, tabId) {
   // Playwright context — check there first so tabs created via
   // `POST /tabs { recordVideo: ... }` resolve even though they aren't
   // in any user session's tabGroups.
-  const recorded = recordedTabs.get(tabId);
+  const recorded = dedicatedTabs.get(tabId);
   if (recorded) {
     return {
       tabState: recorded.tabState,
@@ -1714,133 +1730,165 @@ app.get('/metrics', async (_req, res) => {
   res.send(await reg.metrics());
 });
 
+// Shared helper for the POST /tabs dedicated-context path. Used by both
+// the recordVideo branch (ffmpeg x11grab) and the viewport branch
+// (fresh context at a custom width/height). Either or both can be set;
+// unset inputs just skip the corresponding setup step.
+async function createDedicatedTab({ req, userId, resolvedSessionKey, url, recordVideo, viewport }) {
+  const b = await ensureBrowser();
+  if (getTotalTabCount() >= MAX_TABS_GLOBAL) {
+    throw Object.assign(new Error('Maximum tabs (global) reached'), {
+      statusCode: 429,
+    });
+  }
+  const tabId = fly.makeTabId();
+
+  // Pick viewport: explicit `viewport` arg wins over `recordVideo.width/height`
+  // which wins over the 1280x720 default.
+  let width = 1280;
+  let height = 720;
+  if (recordVideo) {
+    if (Number(recordVideo.width) > 0) width = Number(recordVideo.width);
+    if (Number(recordVideo.height) > 0) height = Number(recordVideo.height);
+  }
+  if (viewport) {
+    if (Number(viewport.width) > 0) width = Number(viewport.width);
+    if (Number(viewport.height) > 0) height = Number(viewport.height);
+  }
+
+  const contextOptions = {
+    viewport: { width, height },
+    permissions: ['geolocation'],
+  };
+  if (!CONFIG.proxy.host) {
+    contextOptions.locale = 'en-US';
+    contextOptions.timezoneId = 'America/Los_Angeles';
+    contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
+  }
+
+  const context = await b.newContext(contextOptions);
+  const page = await context.newPage();
+  const tabState = createTabState(page);
+  attachDownloadListener(tabState, tabId);
+
+  // recordVideo path: spawn ffmpeg x11grab against the Xvfb display.
+  // See the native-video README for why we don't use Playwright's
+  // built-in recordVideo on Camoufox.
+  let ffmpegProcess;
+  let videoDir;
+  let videoPath;
+  if (recordVideo) {
+    const fps = Number(recordVideo.fps) || 15;
+    videoDir = path.join(VIDEO_BASE_DIR, tabId);
+    fs.mkdirSync(videoDir, { recursive: true });
+    videoPath = path.join(videoDir, `${tabId}.webm`);
+    const display = process.env.DISPLAY || ':99';
+    ffmpegProcess = ffmpegSpawn(
+      'ffmpeg',
+      [
+        '-loglevel', 'warning',
+        '-f', 'x11grab',
+        '-video_size', `${width}x${height}`,
+        '-framerate', String(fps),
+        '-i', display,
+        '-c:v', 'libvpx',
+        '-b:v', '1M',
+        '-cpu-used', '4',
+        '-deadline', 'realtime',
+        '-y',
+        videoPath,
+      ],
+      { stdio: ['ignore', 'ignore', 'pipe'] }
+    );
+    ffmpegProcess.stderr?.on('data', (buf) => {
+      const msg = buf.toString().trim();
+      if (msg) log('warn', 'ffmpeg stderr', { tabId, msg: msg.slice(0, 200) });
+    });
+    ffmpegProcess.on('exit', (code, signal) => {
+      log('info', 'ffmpeg exited', { tabId, code, signal });
+    });
+  }
+
+  dedicatedTabs.set(tabId, {
+    tabState,
+    context,
+    videoDir,
+    videoPath,
+    videoSettled: !ffmpegProcess, // already "settled" for viewport-only tabs
+    ffmpegProcess,
+    userId: normalizeUserId(userId),
+    listItemId: resolvedSessionKey,
+    createdAt: Date.now(),
+  });
+  refreshActiveTabsGauge();
+
+  if (url) {
+    const urlErr = validateUrl(url);
+    if (urlErr) {
+      throw Object.assign(new Error(urlErr), { statusCode: 400 });
+    }
+    tabState.lastRequestedUrl = url;
+    await withPageLoadDuration('open_url', () =>
+      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    );
+    tabState.visitedUrls.add(url);
+  }
+
+  log('info', 'dedicated tab created', {
+    reqId: req.reqId,
+    tabId,
+    userId,
+    sessionKey: resolvedSessionKey,
+    width,
+    height,
+    recorded: !!recordVideo,
+    videoDir,
+    ffmpegPid: ffmpegProcess?.pid,
+  });
+
+  const result = { tabId, url: page.url(), viewport: { width, height } };
+  if (recordVideo) {
+    result.recordVideo = { width, height, fps: Number(recordVideo.fps) || 15 };
+  }
+  return result;
+}
+
 // Create new tab
 app.post('/tabs', async (req, res) => {
   try {
-    const { userId, sessionKey, listItemId, url, recordVideo } = req.body;
+    const { userId, sessionKey, listItemId, url, recordVideo, viewport } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
     const resolvedSessionKey = sessionKey || listItemId;
     if (!userId || !resolvedSessionKey) {
       return res.status(400).json({ error: 'userId and sessionKey required' });
     }
 
-    // ── Native video recording path (agstudio/native-video) ─────────
+    // ── Dedicated-context path (agstudio/native-video) ──────────────
     //
-    // Give this tab its own Playwright context with `recordVideo` set so
-    // the .webm is scoped to exactly one tab. We skip the shared session
-    // entirely — the entry lives in the top-level `recordedTabs` map and
-    // findTab() falls through to it, so /navigate /click /type /snapshot
-    // /evaluate etc. all keep working without modification.
-    if (recordVideo && typeof recordVideo === 'object') {
-      const result = await withTimeout((async () => {
-        const b = await ensureBrowser();
-        if (getTotalTabCount() >= MAX_TABS_GLOBAL) {
-          throw Object.assign(
-            new Error('Maximum tabs (global) reached'),
-            { statusCode: 429 }
-          );
-        }
-        const tabId = fly.makeTabId();
-        const videoDir = path.join(VIDEO_BASE_DIR, tabId);
-        fs.mkdirSync(videoDir, { recursive: true });
-
-        const width = Number(recordVideo.width) || 1280;
-        const height = Number(recordVideo.height) || 720;
-        const fps = Number(recordVideo.fps) || 15;
-
-        // We used to pass `recordVideo` to Playwright's newContext here so
-        // Playwright would drive the capture internally. That turned out not
-        // to work on Camoufox — Playwright's Firefox video path depends on
-        // a Juggler screencast command that Camoufox's patched Firefox
-        // doesn't implement correctly (smoke test: 24 frames regardless of
-        // session length). We fall back to recording the Xvfb display
-        // directly via ffmpeg x11grab, which ignores Camoufox's patches
-        // entirely and just reads raw framebuffer pixels. See README.
-        const contextOptions = {
-          viewport: { width, height },
-          permissions: ['geolocation'],
-        };
-        if (!CONFIG.proxy.host) {
-          contextOptions.locale = 'en-US';
-          contextOptions.timezoneId = 'America/Los_Angeles';
-          contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
-        }
-
-        const context = await b.newContext(contextOptions);
-        const page = await context.newPage();
-        const tabState = createTabState(page);
-        attachDownloadListener(tabState, tabId);
-
-        // Spawn ffmpeg to capture the Xvfb display into <tabId>.webm. The
-        // process runs for the lifetime of the recorded tab; closeTab /
-        // getVideo stops it with SIGINT so ffmpeg flushes the container
-        // header cleanly. `-loglevel warning` keeps the container log clean.
-        const videoPath = path.join(videoDir, `${tabId}.webm`);
-        const display = process.env.DISPLAY || ':99';
-        const ffmpegProcess = ffmpegSpawn(
-          'ffmpeg',
-          [
-            '-loglevel', 'warning',
-            '-f', 'x11grab',
-            '-video_size', `${width}x${height}`,
-            '-framerate', String(fps),
-            '-i', display,
-            '-c:v', 'libvpx',
-            '-b:v', '1M',
-            '-cpu-used', '4',
-            '-deadline', 'realtime',
-            '-y',
-            videoPath,
-          ],
-          { stdio: ['ignore', 'ignore', 'pipe'] }
-        );
-        ffmpegProcess.stderr?.on('data', (buf) => {
-          const msg = buf.toString().trim();
-          if (msg) log('warn', 'ffmpeg stderr', { tabId, msg: msg.slice(0, 200) });
-        });
-        ffmpegProcess.on('exit', (code, signal) => {
-          log('info', 'ffmpeg exited', { tabId, code, signal });
-        });
-
-        recordedTabs.set(tabId, {
-          tabState,
-          context,
-          videoDir,
-          videoPath,
-          videoSettled: false,
-          ffmpegProcess,
-          userId: normalizeUserId(userId),
-          listItemId: resolvedSessionKey,
-          createdAt: Date.now(),
-        });
-        refreshActiveTabsGauge();
-
-        if (url) {
-          const urlErr = validateUrl(url);
-          if (urlErr) {
-            throw Object.assign(new Error(urlErr), { statusCode: 400 });
-          }
-          tabState.lastRequestedUrl = url;
-          await withPageLoadDuration('open_url', () =>
-            page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-          );
-          tabState.visitedUrls.add(url);
-        }
-
-        log('info', 'recorded tab created', {
-          reqId: req.reqId,
-          tabId,
+    // When either `recordVideo` or `viewport` is set, the tab gets its
+    // own Playwright context instead of joining the shared session.
+    //
+    //  - `recordVideo` — ffmpeg x11grab captures the Xvfb display for
+    //    the lifetime of this tab into a .webm fetched via GET /video.
+    //  - `viewport` — Playwright's viewport is locked at newContext()
+    //    time, so custom sizes need a fresh context.
+    //
+    // Both cases live in `dedicatedTabs` and findTab() falls through.
+    const hasRecordVideo = recordVideo && typeof recordVideo === 'object';
+    const hasCustomViewport = viewport && typeof viewport === 'object';
+    if (hasRecordVideo || hasCustomViewport) {
+      const result = await withTimeout(
+        createDedicatedTab({
+          req,
           userId,
-          sessionKey: resolvedSessionKey,
-          videoDir,
-          width,
-          height,
-          fps,
-          ffmpegPid: ffmpegProcess.pid,
-        });
-        return { tabId, url: page.url(), recordVideo: { width, height, fps } };
-      })(), requestTimeoutMs(), 'recorded tab create');
-
+          resolvedSessionKey,
+          url,
+          recordVideo: hasRecordVideo ? recordVideo : null,
+          viewport: hasCustomViewport ? viewport : null,
+        }),
+        requestTimeoutMs(),
+        'dedicated tab create'
+      );
       return res.json(result);
     }
 
@@ -2717,7 +2765,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
     // then close the Playwright context, then schedule a grace-window
     // cleanup of the video dir so a late `GET /tabs/:tabId/video` can
     // still read the finalized file.
-    const recorded = recordedTabs.get(tabId);
+    const recorded = dedicatedTabs.get(tabId);
     if (recorded) {
       await clearTabDownloads(recorded.tabState);
       if (!recorded.videoSettled) {
@@ -2735,7 +2783,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
       }
       const lock = tabLocks.get(tabId);
       if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
-      scheduleRecordedTabCleanup(tabId);
+      scheduleDedicatedTabCleanup(tabId);
       refreshActiveTabsGauge();
       log('info', 'recorded tab closed', {
         reqId: req.reqId,
@@ -2810,24 +2858,33 @@ async function stopFfmpegAndWait(recorded, reason) {
   });
 }
 
-// After a recorded tab closes, keep the video dir for VIDEO_GRACE_WINDOW_MS
-// so a trailing `GET /tabs/:tabId/video` that comes in after `DELETE` can
-// still read the file. After the grace window expires, evict the dir and
-// the recordedTabs entry.
-function scheduleRecordedTabCleanup(tabId) {
+// After a dedicated tab closes, schedule cleanup.
+// Recording tabs (have videoDir): keep the dir for VIDEO_GRACE_WINDOW_MS so
+// a trailing `GET /tabs/:tabId/video` after `DELETE` can still read the
+// file, then remove both dir and map entry.
+// Viewport-only tabs (no videoDir): nothing to fetch later, evict the map
+// entry immediately.
+function scheduleDedicatedTabCleanup(tabId) {
+  const entry = dedicatedTabs.get(tabId);
+  if (!entry) return;
+  if (!entry.videoDir) {
+    // Viewport-only: no file to preserve, drop immediately.
+    dedicatedTabs.delete(tabId);
+    return;
+  }
   setTimeout(() => {
-    const entry = recordedTabs.get(tabId);
-    if (!entry) return;
+    const stillThere = dedicatedTabs.get(tabId);
+    if (!stillThere) return;
     try {
-      fs.rmSync(entry.videoDir, { recursive: true, force: true });
+      fs.rmSync(stillThere.videoDir, { recursive: true, force: true });
     } catch (err) {
       log('warn', 'recorded video dir cleanup failed', {
         tabId,
-        dir: entry.videoDir,
+        dir: stillThere.videoDir,
         error: err.message,
       });
     }
-    recordedTabs.delete(tabId);
+    dedicatedTabs.delete(tabId);
   }, VIDEO_GRACE_WINDOW_MS).unref?.();
 }
 
@@ -2847,12 +2904,21 @@ app.get('/tabs/:tabId/video', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const tabId = req.params.tabId;
-    const recorded = recordedTabs.get(tabId);
+    const recorded = dedicatedTabs.get(tabId);
     if (!recorded) {
       return res.status(404).json({ error: 'recorded tab not found' });
     }
     if (recorded.userId !== normalizeUserId(userId)) {
       return res.status(404).json({ error: 'recorded tab not found' });
+    }
+    // Viewport-only tabs (no ffmpegProcess, no videoPath) weren't recording.
+    // Return 400 instead of 404 so callers know the tab exists but isn't
+    // a recording target.
+    if (!recorded.ffmpegProcess && !recorded.videoPath) {
+      return res.status(400).json({
+        error:
+          'this tab was not opened with recordVideo — no video to fetch. Open a new tab with { recordVideo: {...} } to record one.',
+      });
     }
 
     if (!recorded.videoSettled) {
