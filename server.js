@@ -255,6 +255,28 @@ let browser = null;
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
 
+// ── Persistent sessions (CAMOFOX_PROFILE_DIR) ────────────────────────
+// When set, each userId's cookies + localStorage are saved to disk and
+// restored on the next context, so logins (X, TikTok, …) survive restarts.
+// Off by default → ephemeral, as before.
+const PROFILE_DIR = process.env.CAMOFOX_PROFILE_DIR || null;
+if (PROFILE_DIR) { try { fs.mkdirSync(PROFILE_DIR, { recursive: true }); } catch {} }
+const stateFile = (userId) => path.join(PROFILE_DIR, `${String(userId).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
+function loadStorageState(userId) {
+  if (!PROFILE_DIR) return undefined;
+  try { const f = stateFile(userId); if (fs.existsSync(f)) return f; } catch {}
+  return undefined;
+}
+async function saveStorageState(userId, context) {
+  if (!PROFILE_DIR || !context) return;
+  try { await context.storageState({ path: stateFile(userId) }); } catch {}
+}
+if (PROFILE_DIR) {
+  setInterval(() => {
+    for (const [userId, s] of sessions.entries()) saveStorageState(userId, s.context).catch(() => {});
+  }, 20_000).unref?.();
+}
+
 // ── Dedicated-context tabs (agstudio/native-video branch) ────────────
 //
 // Tabs created with `recordVideo` OR `viewport` in the POST /tabs body
@@ -643,7 +665,9 @@ async function launchBrowserInstance() {
 
     try {
       const options = await launchOptions({
-        headless: useVirtualDisplay ? false : true,
+        // CAMOFOX_HEADFUL=true → real visible window (e.g. macOS, no Xvfb) for
+        // interactive use / solving captchas; otherwise headless.
+        headless: (useVirtualDisplay || process.env.CAMOFOX_HEADFUL === 'true') ? false : true,
         os: hostOS,
         humanize: true,
         enable_cache: true,
@@ -785,8 +809,10 @@ async function getSession(userId) {
       contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
       log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
     }
+    const restored = loadStorageState(key);
+    if (restored) contextOptions.storageState = restored;
     const context = await b.newContext(contextOptions);
-    
+
     session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null };
     sessions.set(key, session);
     log('info', 'session created', {
@@ -3628,6 +3654,12 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   log('info', 'shutting down', { signal });
+
+  // flush persistent sessions (cookies/logins) before exit
+  if (PROFILE_DIR) {
+    for (const [userId, s] of sessions.entries()) { try { await saveStorageState(userId, s.context); } catch {} }
+    log('info', 'persisted sessions', { count: sessions.size, dir: PROFILE_DIR });
+  }
 
   const forceTimeout = setTimeout(() => {
     log('error', 'shutdown timed out, forcing exit');
