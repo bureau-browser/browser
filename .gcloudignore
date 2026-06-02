@@ -1,0 +1,12 @@
+# Upload filter for `gcloud builds submit` from the fork checkout.
+# Everything in here is excluded from the source tarball.
+
+.git
+.gitignore
+.github
+node_modules
+dist
+tests
+*.log
+coverage
+.DS_Store
