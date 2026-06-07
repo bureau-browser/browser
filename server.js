@@ -670,6 +670,10 @@ async function launchBrowserInstance() {
         headless: (useVirtualDisplay || process.env.CAMOFOX_HEADFUL === 'true') ? false : true,
         os: hostOS,
         humanize: true,
+        // set navigator.languages / Intl at the browser level too (not just the
+        // context's Accept-Language) so locale is consistent end-to-end. FR by
+        // default; geoip overrides when a proxy is configured.
+        ...(launchProxy ? {} : { locale: (process.env.CAMOFOX_LOCALE || 'fr-FR').split(',') }),
         enable_cache: true,
         proxy: launchProxy,
         geoip: !!launchProxy,
@@ -793,11 +797,15 @@ async function getSession(userId) {
       permissions: ['geolocation'],
     };
     // When geoip is active (proxy configured), camoufox auto-configures
-    // locale/timezone/geolocation from the proxy IP. Without proxy, use defaults.
+    // locale/timezone/geolocation from the proxy IP. Without proxy, use defaults
+    // — keep locale/timezone/geo CONSISTENT (an en-US locale + LA timezone on a
+    // .fr site is exactly the cross-signal mismatch anti-bots flag). Default FR;
+    // override via CAMOFOX_LOCALE / CAMOFOX_TZ / CAMOFOX_GEO="lat,lng".
     if (!CONFIG.proxy.host) {
-      contextOptions.locale = 'en-US';
-      contextOptions.timezoneId = 'America/Los_Angeles';
-      contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
+      const [glat, glng] = (process.env.CAMOFOX_GEO || '48.8566,2.3522').split(',').map(Number);
+      contextOptions.locale = process.env.CAMOFOX_LOCALE || 'fr-FR';
+      contextOptions.timezoneId = process.env.CAMOFOX_TZ || 'Europe/Paris';
+      contextOptions.geolocation = { latitude: glat, longitude: glng };
     }
     let sessionProxy = null;
     if (proxyPool?.canRotateSessions) {
@@ -1787,9 +1795,10 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     permissions: ['geolocation'],
   };
   if (!CONFIG.proxy.host) {
-    contextOptions.locale = 'en-US';
-    contextOptions.timezoneId = 'America/Los_Angeles';
-    contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
+    const [glat, glng] = (process.env.CAMOFOX_GEO || '48.8566,2.3522').split(',').map(Number);
+    contextOptions.locale = process.env.CAMOFOX_LOCALE || 'fr-FR';
+    contextOptions.timezoneId = process.env.CAMOFOX_TZ || 'Europe/Paris';
+    contextOptions.geolocation = { latitude: glat, longitude: glng };
   }
 
   const context = await b.newContext(contextOptions);
@@ -2281,13 +2290,14 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         const x = box.x + box.width / 2;
         const y = box.y + box.height / 2;
         
-        // Move mouse to element (triggers mouseover/mouseenter)
-        await tabState.page.mouse.move(x, y);
-        await tabState.page.waitForTimeout(50);
-        
+        // Move mouse to element (direct, a few steps — not a teleport, not a
+        // wiggle), then a natural click HOLD (~70-150ms), like a person.
+        await tabState.page.mouse.move(x, y, { steps: 4 });
+        await tabState.page.waitForTimeout(70 + Math.floor(Math.random() * 120));
+
         // Full click sequence
         await tabState.page.mouse.down();
-        await tabState.page.waitForTimeout(50);
+        await tabState.page.waitForTimeout(60 + Math.floor(Math.random() * 90));
         await tabState.page.mouse.up();
         
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
@@ -2298,7 +2308,10 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       const onGoogleSerp = isGoogleSerp(tabState.page.url());
       
       const doClick = async (locatorOrSelector, isLocator) => {
-        const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
+        // .first() so a selector that matches duplicates (e.g. desktop+mobile
+        // variants sharing an id, like leboncoin's didomi consent button) doesn't
+        // trip Playwright strict mode.
+        const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector).first();
         
         if (onGoogleSerp) {
           try {
@@ -2427,18 +2440,49 @@ app.post('/tabs/:tabId/type', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector, text } = req.body;
+    const { userId, ref, selector, text, human, delay } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
-    
+
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
-    
+
     if (!ref && !selector) {
       return res.status(400).json({ error: 'ref or selector required' });
     }
-    
+
+    // Human typing: focus the field, then emit one real keydown/keyup per
+    // character with a jittered inter-keystroke delay — so the page sees genuine
+    // keyboard events (DataDome &co. watch keystroke cadence), not an instant
+    // value-set. Default stays `.fill()` (fast) unless human/delay is requested.
+    const baseDelay = typeof delay === 'number' ? delay : 75;
+    const typeHuman = async (locator) => {
+      // navigate like a human: glide the real cursor to the field (visible,
+      // curved, multi-step), pause, then a real mouse click — before any keys.
+      const box = await locator.boundingBox().catch(() => null);
+      if (box) {
+        // a DIRECT move to the field (few steps), then click — NOT a many-step
+        // jittered glide. Empirically the high-step "wiggle" trips DataDome;
+        // a clean point-to-point move (like the click path) does not.
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        await tabState.page.mouse.move(cx, cy, { steps: 3 });
+        await tabState.page.waitForTimeout(80 + Math.floor(Math.random() * 120));
+        await tabState.page.mouse.down();
+        await tabState.page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+        await tabState.page.mouse.up();
+      } else {
+        await locator.click({ timeout: 10000 }).catch(() => {});
+      }
+      await tabState.page.waitForTimeout(120 + Math.floor(Math.random() * 200));
+      await locator.fill('').catch(() => {}); // clear existing value
+      for (const ch of String(text)) {
+        await tabState.page.keyboard.type(ch, { delay: baseDelay + Math.floor(Math.random() * 90) });
+        if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500)); // occasional think-pause
+      }
+    };
+
     await withTabLock(tabId, async () => {
       if (ref) {
         let locator = refToLocator(tabState.page, ref, tabState.refs);
@@ -2448,7 +2492,10 @@ app.post('/tabs/:tabId/type', async (req, res) => {
           locator = refToLocator(tabState.page, ref, tabState.refs);
         }
         if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
-        await locator.fill(text, { timeout: 10000 });
+        if (human || delay != null) await typeHuman(locator);
+        else await locator.fill(text, { timeout: 10000 });
+      } else if (human || delay != null) {
+        await typeHuman(tabState.page.locator(selector).first());
       } else {
         await tabState.page.fill(selector, text, { timeout: 10000 });
       }
@@ -2503,6 +2550,71 @@ app.post('/tabs/:tabId/press', async (req, res) => {
   }
 });
 
+// Solve a DataDome "slide to confirm" puzzle with a HUMAN drag curve. The
+// challenge lives in a cross-origin captcha-delivery iframe; Playwright frames
+// pierce it. We grab the handle, press, then drag right with an ease-in-out
+// velocity profile + vertical jitter + a small overshoot-and-settle — a linear
+// constant-velocity drag is exactly what DataDome's motion analysis flags.
+app.post('/tabs/:tabId/slide', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    const page = tabState.page;
+
+    // locate the captcha frame
+    const frame = page.frames().find(f => /captcha-delivery\.com/.test(f.url() || ''));
+    if (!frame) return res.json({ ok: false, reason: 'no captcha frame' });
+
+    // find the draggable handle (DataDome markup varies — try known anchors)
+    const HANDLE = ['.slider-control', '.slider .slider-control', '[class*="slider"] [class*="control"]',
+      '.sliderContainer .slider', '[class*="slider"] [draggable]', '.slider', '#ddv1-captcha-container [class*="slider"]'];
+    let handle = null;
+    for (const sel of HANDLE) {
+      const loc = frame.locator(sel).first();
+      const box = await loc.boundingBox().catch(() => null);
+      if (box && box.width > 8 && box.width < 160 && box.height > 8) { handle = box; break; }
+    }
+    if (!handle) return res.json({ ok: false, reason: 'no slider handle' });
+
+    // track width → drag distance (full track; overshoot is clamped by the widget)
+    const track = await frame.locator('.slider, [class*="sliderContainer"], [class*="slider-track"]').first().boundingBox().catch(() => null);
+    const dx = Math.round((track ? track.width : 280) - handle.width * 0.5);
+
+    const sx = handle.x + handle.width / 2;
+    const sy = handle.y + handle.height / 2;
+    await page.mouse.move(sx, sy, { steps: 4 });
+    await page.waitForTimeout(120 + Math.floor(Math.random() * 160));
+    await page.mouse.down();
+
+    // ease-in-out path with jitter, then a small overshoot and settle-back
+    const steps = 28 + Math.floor(Math.random() * 14);
+    const overshoot = 6 + Math.floor(Math.random() * 10);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const eased = 0.5 - Math.cos(Math.PI * t) / 2;       // cosine ease-in-out
+      const x = sx + (dx + overshoot) * eased;
+      const y = sy + (Math.random() * 3 - 1.5);            // tiny vertical drift
+      await page.mouse.move(x, y, { steps: 1 });
+      await page.waitForTimeout(8 + Math.floor(Math.random() * 22));
+    }
+    await page.waitForTimeout(60 + Math.floor(Math.random() * 80));
+    await page.mouse.move(sx + dx, sy, { steps: 3 });       // settle back from overshoot
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+    await page.mouse.up();
+    await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
+
+    const stillThere = !!page.frames().find(f => /captcha-delivery\.com/.test(f.url() || ''));
+    res.json({ ok: true, dragged: dx, solved: !stillThere });
+  } catch (err) {
+    log('error', 'slide failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Scroll
 app.post('/tabs/:tabId/scroll', async (req, res) => {
   try {
@@ -2522,6 +2634,47 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     log('error', 'scroll failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Human-like mouse movement — real (trusted) pointer motion via Playwright, so
+// anti-bot heuristics (DataDome &co.) see organic mouse activity rather than a
+// cursor frozen at (0,0). Modes: wander N times across the viewport (default),
+// move to {x,y}, or hover a {selector}. Stepped paths + jittered dwell.
+app.post('/tabs/:tabId/mouse', async (req, res) => {
+  try {
+    const { userId, moves = 3, x, y, selector } = req.body || {};
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    const page = tabState.page;
+    const rnd = (n) => Math.floor(Math.random() * n);
+
+    const vp = (await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }))
+      .catch(() => null)) || { w: 1280, h: 800 };
+
+    const path = [];
+    if (selector) {
+      const box = await page.locator(selector).first().boundingBox().catch(() => null);
+      if (box) path.push([box.x + box.width / 2, box.y + box.height / 2]);
+    } else if (typeof x === 'number' && typeof y === 'number') {
+      path.push([x, y]);
+    }
+    if (!path.length) {
+      const hops = Math.max(1, Math.min(8, moves));
+      for (let i = 0; i < hops; i++) path.push([40 + rnd(Math.max(1, vp.w - 80)), 60 + rnd(Math.max(1, vp.h - 120))]);
+    }
+    for (const [tx, ty] of path) {
+      await page.mouse.move(tx, ty, { steps: 3 }); // DIRECT point-to-point (no jitter wiggle — that trips DataDome)
+      await page.waitForTimeout(120 + rnd(400));
+    }
+    res.json({ ok: true, moves: path.length });
+  } catch (err) {
+    log('error', 'mouse failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
