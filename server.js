@@ -268,45 +268,97 @@ function loadStorageState(userId) {
   return undefined;
 }
 const cookieKey = (c) => `${c.name}|${c.domain}|${c.path || '/'}|${c.partitionKey || ''}`;
+
+// Per-platform auth-cookie registry. A jar is "authed for" a platform when every
+// listed cookie name is present on a cookie whose domain matches. This gates
+// persistence (see saveStorageState) so a transiently logged-out jar can never
+// overwrite a known-good authed one on disk. Adding a platform = one entry, no
+// call-site edits.
+const AUTH_COOKIE_REGISTRY = [
+  { platform: 'linkedin',  domain: /(^|\.)linkedin\.com$/,         required: ['li_at'] },
+  { platform: 'x',         domain: /(^|\.)(x|twitter)\.com$/,      required: ['auth_token'] },
+  { platform: 'instagram', domain: /(^|\.)instagram\.com$/,        required: ['sessionid'] },
+  { platform: 'tiktok',    domain: /(^|\.)tiktok\.com$/,           required: ['sessionid'] },
+  { platform: 'facebook',  domain: /(^|\.)facebook\.com$/,         required: ['c_user', 'xs'] },
+  { platform: 'reddit',    domain: /(^|\.)reddit\.com$/,           required: ['reddit_session'] },
+  { platform: 'youtube',   domain: /(^|\.)(youtube|google)\.com$/, required: ['SID'] },
+];
+
+// Set of platform ids a cookie jar carries a complete auth set for.
+function authedPlatforms(cookies) {
+  const out = new Set();
+  for (const entry of AUTH_COOKIE_REGISTRY) {
+    const names = new Set(
+      (cookies || []).filter((c) => entry.domain.test(c.domain || '')).map((c) => c.name)
+    );
+    if (entry.required.every((n) => names.has(n))) out.add(entry.platform);
+  }
+  return out;
+}
+
+// Persist a session's cookie jar + origins to disk. `context.cookies()` is the
+// jar authority — it returns the FULL jar incl httpOnly and PARTITIONED (CHIPS)
+// cookies that storageState() silently drops (e.g. LinkedIn's partitioned
+// `li_at`); storageState() is consulted only for its origins/localStorage. Still-
+// valid cookies from the prior file are carried over (live wins on conflict) so a
+// value that transiently vanished mid-navigation isn't dropped. Returns a result
+// describing what happened; never throws.
 async function saveStorageState(userId, context) {
-  if (!PROFILE_DIR || !context) return;
+  if (!PROFILE_DIR || !context) return { written: false, reason: 'no-profile-dir' };
   try {
     const state = await context.storageState();
-    // storageState() omits PARTITIONED (CHIPS) cookies — e.g. LinkedIn's `li_at`,
-    // which is partitioned, so it never lands on disk and a restored session is
-    // unauthenticated. context.cookies() returns the FULL jar incl partitionKey;
-    // merge it in (full jar wins) so auth survives a restart. Deduped by
-    // name|domain|path|partitionKey.
-    let full = [];
-    try { full = await context.cookies(); } catch {}
+    let live = [];
+    try { live = await context.cookies(); } catch {}
+
+    let prior = null;
+    try { prior = JSON.parse(fs.readFileSync(stateFile(userId), 'utf8')); } catch {}
+
+    const now = Date.now() / 1000;
     const map = new Map();
-    // Carry over still-valid cookies from the PRIOR persisted jar first, so an
-    // auth cookie that transiently vanished from the live context — a flush
-    // firing while the tab is mid-navigation or on a brief logged-out bounce —
-    // isn't overwritten away (this kept wiping LinkedIn's `li_at`). Live cookies
-    // win on conflict, so a fresh value always supersedes; only UNEXPIRED priors
-    // are kept, so a genuinely expired cookie still drops off.
-    try {
-      const prior = JSON.parse(fs.readFileSync(stateFile(userId), 'utf8'));
-      const now = Date.now() / 1000;
-      for (const c of prior.cookies || []) {
-        if (c.expires === undefined || c.expires === -1 || c.expires > now) {
-          map.set(cookieKey(c), c);
-        }
-      }
-    } catch {
-      // no prior file (or unreadable) — first save, nothing to carry over.
+    for (const c of prior?.cookies || []) {
+      if (c.expires === undefined || c.expires === -1 || c.expires > now) map.set(cookieKey(c), c);
     }
     for (const c of state.cookies || []) map.set(cookieKey(c), c);
-    for (const c of full) map.set(cookieKey(c), c);
-    state.cookies = [...map.values()];
+    for (const c of live) map.set(cookieKey(c), c);
+    const merged = [...map.values()];
+
+    // Auth-gate: refuse to write a jar that has LOST auth for a platform the prior
+    // file held. Carry-over already protects against a transient blink; this is
+    // the belt to that suspenders — a genuinely expired/cleared auth cookie would
+    // otherwise persist a dead session over the last good one. Skip instead, so
+    // disk stays authed until a real re-login produces a fresh authed jar.
+    if (prior) {
+      const after = authedPlatforms(merged);
+      const lost = [...authedPlatforms(prior.cookies)].filter((p) => !after.has(p));
+      if (lost.length) return { written: false, reason: 'auth-downgrade', lost };
+    }
+
+    state.cookies = merged;
     fs.writeFileSync(stateFile(userId), JSON.stringify(state));
-  } catch {}
+    return { written: true, authed: [...authedPlatforms(merged)] };
+  } catch {
+    return { written: false, reason: 'error' };
+  }
 }
-if (PROFILE_DIR) {
-  setInterval(() => {
-    for (const [userId, s] of sessions.entries()) saveStorageState(userId, s.context).catch(() => {});
-  }, 20_000).unref?.();
+
+// Checkpoint persistence — flush a session's jar shortly after the LAST of a burst
+// of successful operations (debounced per user), instead of on a blind global
+// timer that could catch a mid-navigation/logged-out jar. Paired with the explicit
+// flushes on login (/persist) and shutdown, this covers durability without a tick
+// that races auth.
+const flushTimers = new Map();
+function scheduleFlush(userId, delayMs = 2000) {
+  if (!PROFILE_DIR) return;
+  const key = normalizeUserId(userId);
+  const existing = flushTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    flushTimers.delete(key);
+    const s = sessions.get(key);
+    if (s?.context) saveStorageState(key, s.context).catch(() => {});
+  }, delayMs);
+  t.unref?.();
+  flushTimers.set(key, t);
 }
 
 // POST /sessions/:userId/persist — force-flush this session's storageState to
@@ -325,10 +377,18 @@ app.post('/sessions/:userId/persist', async (req, res) => {
     const key = normalizeUserId(req.params.userId);
     const session = sessions.get(key);
     if (!session) return res.status(404).json({ error: 'No such session' });
-    await saveStorageState(key, session.context);
+    const result = await saveStorageState(key, session.context);
     let names = [];
     try { names = (await session.context.cookies()).map(c => c.name); } catch {}
-    res.json({ ok: true, userId: key, cookieCount: names.length, cookieNames: [...new Set(names)].sort() });
+    res.json({
+      ok: true,
+      userId: key,
+      written: result.written,
+      authed: result.authed || [],
+      ...(result.written ? {} : { skipped: result.reason, lost: result.lost }),
+      cookieCount: names.length,
+      cookieNames: [...new Set(names)].sort(),
+    });
   } catch (err) {
     res.status(500).json({ error: safeError(err) });
   }
@@ -452,11 +512,25 @@ function getTabLock(tabId) {
 
 // Timeout is INSIDE the lock so each operation gets its full budget
 // regardless of how long it waited in the queue.
+// Which user session owns a tab — for checkpoint flushing after a page op.
+// Dedicated/recorded tabs carry their userId; session tabs live in tabGroups.
+function userIdForTab(tabId) {
+  const rec = dedicatedTabs.get(tabId);
+  if (rec?.userId) return rec.userId;
+  for (const [userId, s] of sessions.entries()) {
+    for (const group of s.tabGroups.values()) if (group.has(tabId)) return userId;
+  }
+  return null;
+}
+
 async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS) {
   const lock = getTabLock(tabId);
   await lock.acquire(TAB_LOCK_TIMEOUT_MS);
   try {
-    return await withTimeout(operation(), timeoutMs, 'action');
+    const result = await withTimeout(operation(), timeoutMs, 'action');
+    const owner = userIdForTab(tabId);
+    if (owner) scheduleFlush(owner);
+    return result;
   } finally {
     lock.release();
   }
@@ -495,6 +569,7 @@ async function withUserLimit(userId, operation) {
   try {
     const result = await operation();
     healthState.lastSuccessfulNav = Date.now();
+    if (sessions.has(key)) scheduleFlush(key);
     return result;
   } finally {
     healthState.activeOps--;
