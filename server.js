@@ -267,6 +267,28 @@ function loadStorageState(userId) {
   try { const f = stateFile(userId); if (fs.existsSync(f)) return f; } catch {}
   return undefined;
 }
+// Re-inject a persisted jar into a fresh context. storageState restore skips
+// PARTITIONED cookies (the same reason saveStorageState merges them), so a
+// partitioned auth cookie like LinkedIn's `li_at` wouldn't load and the context
+// would be unauthenticated. addCookies honours partitionKey. Best-effort
+// per-cookie; logs only the actionable case (a cookie on disk that didn't make
+// it back into the context). Shared by the session path and recorded tabs so
+// both restore auth identically.
+async function restorePartitionedCookies(context, key, stateFilePath) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(stateFilePath, 'utf8'));
+    if (Array.isArray(saved.cookies) && saved.cookies.length) {
+      await context.addCookies(saved.cookies).catch(async (e) => {
+        log('warn', 'addCookies batch failed, per-cookie fallback', { userId: key, error: e.message });
+        // a malformed cookie aborts the batch — fall back to one-by-one
+        for (const c of saved.cookies) await context.addCookies([c]).catch((err) => log('warn', 'addCookie skipped', { name: c.name, error: err.message }));
+      });
+      const restoredNames = new Set((await context.cookies().catch(() => [])).map(c => c.name));
+      const dropped = saved.cookies.filter(c => !restoredNames.has(c.name)).map(c => c.name);
+      if (dropped.length) log('warn', 'cookies not restored into context', { userId: key, dropped: [...new Set(dropped)] });
+    }
+  } catch (e) { log('warn', 'cookie restore failed', { userId: key, error: e.message }); }
+}
 const cookieKey = (c) => `${c.name}|${c.domain}|${c.path || '/'}|${c.partitionKey || ''}`;
 
 // Per-platform auth-cookie registry. A jar is "authed for" a platform when every
@@ -984,28 +1006,7 @@ async function getSession(userId) {
     if (restored) contextOptions.storageState = restored;
     const context = await createContextResilient(contextOptions);
 
-    // storageState restore skips PARTITIONED cookies (the same reason saveStorageState
-    // has to merge them in). Re-inject the saved jar explicitly — addCookies honours
-    // partitionKey — so a partitioned auth cookie like LinkedIn's `li_at` actually
-    // loads and the restored session is authenticated. Best-effort per-cookie.
-    if (restored) {
-      try {
-        const saved = JSON.parse(fs.readFileSync(restored, 'utf8'));
-        if (Array.isArray(saved.cookies) && saved.cookies.length) {
-          await context.addCookies(saved.cookies).catch(async (e) => {
-            log('warn', 'addCookies batch failed, per-cookie fallback', { userId: key, error: e.message });
-            // a malformed cookie aborts the batch — fall back to one-by-one
-            for (const c of saved.cookies) await context.addCookies([c]).catch((err) => log('warn', 'addCookie skipped', { name: c.name, error: err.message }));
-          });
-          // Surface only the actionable case: a cookie was on disk but didn't
-          // make it back into the context (so a "restored" session is silently
-          // unauthenticated). The happy path stays quiet.
-          const restoredNames = new Set((await context.cookies().catch(() => [])).map(c => c.name));
-          const dropped = saved.cookies.filter(c => !restoredNames.has(c.name)).map(c => c.name);
-          if (dropped.length) log('warn', 'cookies not restored into context', { userId: key, dropped: [...new Set(dropped)] });
-        }
-      } catch (e) { log('warn', 'cookie restore failed', { userId: key, error: e.message }); }
-    }
+    if (restored) await restorePartitionedCookies(context, key, restored);
 
     session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null };
     sessions.set(key, session);
@@ -1963,12 +1964,14 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
   }
   const tabId = fly.makeTabId();
 
-  // Camoufox locks its window to the launch viewport (1280x720, matching the
-  // shared-session contexts) and IGNORES a smaller per-context viewport — but
-  // Playwright still clips screenshots/recordings to the context viewport, so a
-  // recording must CAPTURE at the real window size or the right/bottom edge is
-  // cut off. recordVideo.width/height therefore set the OUTPUT size (ffmpeg
-  // scales the full-window capture into it), not a smaller capture box.
+  // Sizing. A recording tab must CAPTURE the full window: camoufox renders at the
+  // real host-window size (anti-detection) and IGNORES a fixed viewport for
+  // rendering, but Playwright still clips screenshots to a declared viewport — so
+  // a fixed box captures only the top-left corner. viewport:null keeps render and
+  // capture in sync, exactly like the shared session contexts. recordVideo.width/
+  // height, if given, set the OUTPUT size (ffmpeg scales the full-window capture
+  // into it). A non-recording dedicated tab with an explicit `viewport` is a
+  // deliberate render-size request and keeps that fixed viewport.
   let width = 1280;
   let height = 720;
   let outWidth = width;
@@ -1977,15 +1980,16 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     if (Number(recordVideo.width) > 0) outWidth = Number(recordVideo.width);
     if (Number(recordVideo.height) > 0) outHeight = Number(recordVideo.height);
   }
-  // The `viewport` arg (non-recording dedicated tab) is a deliberate render-size
-  // request, so it still drives the capture viewport.
   if (viewport) {
     if (Number(viewport.width) > 0) width = Number(viewport.width);
     if (Number(viewport.height) > 0) height = Number(viewport.height);
   }
 
+  const recordKey = normalizeUserId(userId);
   const contextOptions = {
-    viewport: { width, height },
+    // Recording captures the full window (camoufox clips screenshots to a fixed
+    // viewport) → null. A non-recording dedicated tab keeps its requested size.
+    viewport: recordVideo ? null : { width, height },
     permissions: ['geolocation'],
   };
   if (!CONFIG.proxy.host) {
@@ -1994,8 +1998,15 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     contextOptions.timezoneId = process.env.CAMOFOX_TZ || 'Europe/Paris';
     contextOptions.geolocation = { latitude: glat, longitude: glng };
   }
+  // Restore the user's persisted jar so a recorded tab films the AUTHED view —
+  // the session frame-grab records the user's authed session, and this dedicated
+  // tab must match, not an anonymous context. Recording only; a non-recording
+  // custom-size tab stays anonymous as before.
+  const recordRestored = recordVideo ? loadStorageState(recordKey) : undefined;
+  if (recordRestored) contextOptions.storageState = recordRestored;
 
   const context = await b.newContext(contextOptions);
+  if (recordRestored) await restorePartitionedCookies(context, recordKey, recordRestored);
   const page = await context.newPage();
   const tabState = createTabState(page);
   attachDownloadListener(tabState, tabId);
