@@ -280,6 +280,23 @@ async function saveStorageState(userId, context) {
     let full = [];
     try { full = await context.cookies(); } catch {}
     const map = new Map();
+    // Carry over still-valid cookies from the PRIOR persisted jar first, so an
+    // auth cookie that transiently vanished from the live context — a flush
+    // firing while the tab is mid-navigation or on a brief logged-out bounce —
+    // isn't overwritten away (this kept wiping LinkedIn's `li_at`). Live cookies
+    // win on conflict, so a fresh value always supersedes; only UNEXPIRED priors
+    // are kept, so a genuinely expired cookie still drops off.
+    try {
+      const prior = JSON.parse(fs.readFileSync(stateFile(userId), 'utf8'));
+      const now = Date.now() / 1000;
+      for (const c of prior.cookies || []) {
+        if (c.expires === undefined || c.expires === -1 || c.expires > now) {
+          map.set(cookieKey(c), c);
+        }
+      }
+    } catch {
+      // no prior file (or unreadable) — first save, nothing to carry over.
+    }
     for (const c of state.cookies || []) map.set(cookieKey(c), c);
     for (const c of full) map.set(cookieKey(c), c);
     state.cookies = [...map.values()];
@@ -685,6 +702,10 @@ async function launchBrowserInstance() {
       if (os.platform() === 'linux') {
         localVirtualDisplay = new VirtualDisplay();
         vdDisplay = localVirtualDisplay.get();
+        // camoufox passes the display to Firefox via launch env but does NOT
+        // export DISPLAY to this process — record the active display ourselves so
+        // x11grab targets the real Xvfb (e.g. :99) instead of a stale guess.
+        activeDisplay = vdDisplay;
         log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
       }
     } catch (err) {
@@ -855,7 +876,12 @@ async function getSession(userId) {
     }
     const b = await ensureBrowser();
     const contextOptions = {
-      viewport: { width: 1280, height: 720 },
+      // null = use the real browser window. Camoufox sizes the window from the
+      // host screen (anti-detection) and IGNORES a fixed viewport for rendering,
+      // but Playwright still clips screenshots to a declared viewport — so a
+      // fixed 1280x720 here renders at (say) 1728x933 yet captures only the
+      // top-left 1280x720. null keeps render and capture in sync (full window).
+      viewport: null,
       permissions: ['geolocation'],
     };
     // When geoip is active (proxy configured), camoufox auto-configures
@@ -1862,14 +1888,22 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
   }
   const tabId = fly.makeTabId();
 
-  // Pick viewport: explicit `viewport` arg wins over `recordVideo.width/height`
-  // which wins over the 1280x720 default.
+  // Camoufox locks its window to the launch viewport (1280x720, matching the
+  // shared-session contexts) and IGNORES a smaller per-context viewport — but
+  // Playwright still clips screenshots/recordings to the context viewport, so a
+  // recording must CAPTURE at the real window size or the right/bottom edge is
+  // cut off. recordVideo.width/height therefore set the OUTPUT size (ffmpeg
+  // scales the full-window capture into it), not a smaller capture box.
   let width = 1280;
   let height = 720;
+  let outWidth = width;
+  let outHeight = height;
   if (recordVideo) {
-    if (Number(recordVideo.width) > 0) width = Number(recordVideo.width);
-    if (Number(recordVideo.height) > 0) height = Number(recordVideo.height);
+    if (Number(recordVideo.width) > 0) outWidth = Number(recordVideo.width);
+    if (Number(recordVideo.height) > 0) outHeight = Number(recordVideo.height);
   }
+  // The `viewport` arg (non-recording dedicated tab) is a deliberate render-size
+  // request, so it still drives the capture viewport.
   if (viewport) {
     if (Number(viewport.width) > 0) width = Number(viewport.width);
     if (Number(viewport.height) > 0) height = Number(viewport.height);
@@ -1891,42 +1925,62 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
   const tabState = createTabState(page);
   attachDownloadListener(tabState, tabId);
 
-  // recordVideo path: spawn ffmpeg x11grab against the Xvfb display.
-  // See the native-video README for why we don't use Playwright's
-  // built-in recordVideo on Camoufox.
+  // recordVideo capture backend. Two paths, picked per host:
+  //  - x11grab: ffmpeg grabs the Xvfb framebuffer (the Linux deploy). Native
+  //    Playwright recordVideo is NOT an option — it's Chromium-only and this is
+  //    Firefox/Camoufox (Browser.setScreencastOptions unsupported).
+  //  - frame-grab: off-display (macOS/dev, no X) snapshot the page on a timer
+  //    and ffmpeg-assembles the PNGs at finalize. Lower fps, but cross-platform.
+  // Same map shape + /video endpoint for both; the backend is an internal detail.
   let ffmpegProcess;
+  let frameRecorder;
   let videoDir;
   let videoPath;
   if (recordVideo) {
-    const fps = Number(recordVideo.fps) || 15;
     videoDir = path.join(VIDEO_BASE_DIR, tabId);
     fs.mkdirSync(videoDir, { recursive: true });
     videoPath = path.join(videoDir, `${tabId}.webm`);
-    const display = process.env.DISPLAY || ':99';
-    ffmpegProcess = ffmpegSpawn(
-      'ffmpeg',
-      [
-        '-loglevel', 'warning',
-        '-f', 'x11grab',
-        '-video_size', `${width}x${height}`,
-        '-framerate', String(fps),
-        '-i', display,
-        '-c:v', 'libvpx',
-        '-b:v', '1M',
-        '-cpu-used', '4',
-        '-deadline', 'realtime',
-        '-y',
+    const scale = (outWidth !== width || outHeight !== height)
+      ? ['-vf', `scale=${outWidth}:${outHeight}`]
+      : [];
+    if (x11GrabAvailable()) {
+      const fps = Number(recordVideo.fps) || 15;
+      const display = activeDisplay || ':99';
+      ffmpegProcess = ffmpegSpawn(
+        'ffmpeg',
+        [
+          '-loglevel', 'warning',
+          '-f', 'x11grab',
+          '-video_size', `${width}x${height}`,
+          '-framerate', String(fps),
+          '-i', display,
+          ...scale,
+          '-c:v', 'libvpx',
+          '-b:v', '1M',
+          '-cpu-used', '4',
+          '-deadline', 'realtime',
+          '-y',
+          videoPath,
+        ],
+        { stdio: ['ignore', 'ignore', 'pipe'] }
+      );
+      ffmpegProcess.stderr?.on('data', (buf) => {
+        const msg = buf.toString().trim();
+        if (msg) log('warn', 'ffmpeg stderr', { tabId, msg: msg.slice(0, 200) });
+      });
+      ffmpegProcess.on('exit', (code, signal) => {
+        log('info', 'ffmpeg exited', { tabId, code, signal });
+      });
+    } else {
+      frameRecorder = startFrameRecorder({
+        page,
+        videoDir,
         videoPath,
-      ],
-      { stdio: ['ignore', 'ignore', 'pipe'] }
-    );
-    ffmpegProcess.stderr?.on('data', (buf) => {
-      const msg = buf.toString().trim();
-      if (msg) log('warn', 'ffmpeg stderr', { tabId, msg: msg.slice(0, 200) });
-    });
-    ffmpegProcess.on('exit', (code, signal) => {
-      log('info', 'ffmpeg exited', { tabId, code, signal });
-    });
+        tabId,
+        fps: Number(recordVideo.fps) || 4,
+        scale,
+      });
+    }
   }
 
   dedicatedTabs.set(tabId, {
@@ -1934,7 +1988,10 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     context,
     videoDir,
     videoPath,
-    videoSettled: !ffmpegProcess, // already "settled" for viewport-only tabs
+    frameRecorder,
+    // x11grab settles when ffmpeg exits, frame-grab when assembly finishes;
+    // viewport-only tabs (neither) are already settled — nothing to fetch.
+    videoSettled: !ffmpegProcess && !frameRecorder,
     ffmpegProcess,
     userId: normalizeUserId(userId),
     listItemId: resolvedSessionKey,
@@ -3032,19 +3089,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
     const recorded = dedicatedTabs.get(tabId);
     if (recorded) {
       await clearTabDownloads(recorded.tabState);
-      if (!recorded.videoSettled) {
-        await stopFfmpegAndWait(recorded, 'delete');
-        try {
-          await recorded.context.close();
-        } catch (err) {
-          log('warn', 'recorded context close failed', {
-            reqId: req.reqId,
-            tabId,
-            error: err.message,
-          });
-        }
-        recorded.videoSettled = true;
-      }
+      await finalizeRecording(recorded, 'delete');
       const lock = tabLocks.get(tabId);
       if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
       scheduleDedicatedTabCleanup(tabId);
@@ -3091,6 +3136,123 @@ app.delete('/tabs/:tabId', async (req, res) => {
  * to SIGKILL as a last resort — the file will be truncated but some
  * content is better than a hung close.
  */
+// The X display x11grab captures. Seeded from DISPLAY if the host set one, else
+// stamped with camoufox's Xvfb display (e.g. :99) when the browser launches —
+// camoufox starts Xvfb but doesn't export DISPLAY, so we can't rely on the env.
+let activeDisplay = process.env.DISPLAY || null;
+
+// Camoufox runs its Xvfb at 1x1 — it renders to an internal virtual viewport,
+// not a real framebuffer — so x11grab (which captures the X screen) has nothing
+// to grab and fails with "capture area outside screen size 1x1". Frame-grab
+// (Playwright screenshots, which read the browser's own rendering) is therefore
+// the universal backend on every host. x11grab stays reachable only behind an
+// explicit opt-in, for a hypothetical non-camoufox setup with a real-sized X.
+function x11GrabAvailable() {
+  return (
+    process.platform === 'linux' &&
+    Boolean(activeDisplay) &&
+    process.env.CAMOFOX_X11GRAB === '1'
+  );
+}
+
+/**
+ * Off-display recorder for Firefox/Camoufox: snapshot the page on a timer into
+ * PNG frames, then ffmpeg-assemble them into `videoPath` at stop(). Best-effort
+ * — a frame that fails (navigation in flight, page closing) is skipped, and the
+ * single-flight guard drops ticks while a screenshot is still running rather
+ * than queueing. Returns { videoPath, stop() } where stop() is idempotent and
+ * resolves once the .webm exists (or there were no frames to assemble).
+ */
+function startFrameRecorder({ page, videoDir, videoPath, tabId, fps, scale = [] }) {
+  const framesDir = path.join(videoDir, 'frames');
+  fs.mkdirSync(framesDir, { recursive: true });
+  const intervalMs = Math.max(50, Math.round(1000 / Math.max(1, fps)));
+  let frameCount = 0;
+  let busy = false;
+  let stopped = false;
+  const tick = async () => {
+    if (busy || stopped) return;
+    busy = true;
+    try {
+      const buf = await page.screenshot({ type: 'png' });
+      if (!stopped) {
+        const name = `frame-${String(frameCount).padStart(6, '0')}.png`;
+        fs.writeFileSync(path.join(framesDir, name), buf);
+        frameCount++;
+      }
+    } catch {
+      // page mid-navigation or closing — skip this frame.
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = setInterval(tick, intervalMs);
+  timer.unref?.();
+
+  let stopPromise;
+  const stop = () => {
+    if (stopPromise) return stopPromise;
+    stopped = true;
+    clearInterval(timer);
+    stopPromise = (async () => {
+      // Let an in-flight screenshot land before assembling.
+      for (let i = 0; busy && i < 20; i++) await new Promise(r => setTimeout(r, 50));
+      if (frameCount === 0) {
+        log('warn', 'frame recorder produced no frames', { tabId });
+        return undefined;
+      }
+      await new Promise((resolve) => {
+        const proc = ffmpegSpawn(
+          'ffmpeg',
+          [
+            '-loglevel', 'warning',
+            '-framerate', String(Math.max(1, fps)),
+            '-i', path.join(framesDir, 'frame-%06d.png'),
+            ...scale,
+            '-c:v', 'libvpx',
+            '-b:v', '1M',
+            '-pix_fmt', 'yuv420p',
+            '-y',
+            videoPath,
+          ],
+          { stdio: ['ignore', 'ignore', 'pipe'] }
+        );
+        proc.stderr?.on('data', (b) => {
+          const m = b.toString().trim();
+          if (m) log('warn', 'ffmpeg assemble stderr', { tabId, msg: m.slice(0, 200) });
+        });
+        proc.on('exit', () => resolve());
+        proc.on('error', () => resolve());
+      });
+      fs.rmSync(framesDir, { recursive: true, force: true });
+      return videoPath;
+    })();
+    return stopPromise;
+  };
+  return { videoPath, stop, frameCount: () => frameCount };
+}
+
+/**
+ * Finalize a recorded tab's video so the .webm is readable on disk, idempotent.
+ * x11grab: SIGINT ffmpeg (flush trailer) then close the context. Frame-grab:
+ * stop the timer + assemble frames, then close the context. Either flips
+ * `videoSettled`. If frame-grab produced nothing, `videoPath` is cleared so the
+ * /video endpoint reports the empty case instead of a missing-file error.
+ */
+async function finalizeRecording(recorded, reason) {
+  if (recorded.videoSettled) return;
+  recorded.videoSettled = true;
+  if (recorded.ffmpegProcess) {
+    await stopFfmpegAndWait(recorded, reason);
+  } else if (recorded.frameRecorder) {
+    const out = await recorded.frameRecorder.stop();
+    if (!out) recorded.videoPath = undefined;
+  }
+  await recorded.context.close().catch((err) =>
+    log('warn', 'recorded context close failed', { reason, error: err.message })
+  );
+}
+
 async function stopFfmpegAndWait(recorded, reason) {
   const proc = recorded.ffmpegProcess;
   if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
@@ -3175,34 +3337,21 @@ app.get('/tabs/:tabId/video', async (req, res) => {
     if (recorded.userId !== normalizeUserId(userId)) {
       return res.status(404).json({ error: 'recorded tab not found' });
     }
-    // Viewport-only tabs (no ffmpegProcess, no videoPath) weren't recording.
-    // Return 400 instead of 404 so callers know the tab exists but isn't
-    // a recording target.
-    if (!recorded.ffmpegProcess && !recorded.videoPath) {
+    // Viewport-only tabs (no recorder, no video) weren't recording. Return 400
+    // instead of 404 so callers know the tab exists but isn't a recording target.
+    if (!recorded.ffmpegProcess && !recorded.frameRecorder && !recorded.videoPath) {
       return res.status(400).json({
         error:
           'this tab was not opened with recordVideo — no video to fetch. Open a new tab with { recordVideo: {...} } to record one.',
       });
     }
 
-    if (!recorded.videoSettled) {
-      await stopFfmpegAndWait(recorded, 'get');
-      try {
-        await recorded.context.close();
-      } catch (err) {
-        log('warn', 'context close during video fetch failed', {
-          reqId: req.reqId,
-          tabId,
-          error: err.message,
-        });
-      }
-      recorded.videoSettled = true;
-    }
+    await finalizeRecording(recorded, 'get');
 
     if (!recorded.videoPath) {
       return res.status(409).json({
         error:
-          'video file not found — context closed but Playwright produced no .webm',
+          'no video produced — the tab closed before any frame was captured',
       });
     }
     let stat;
