@@ -267,15 +267,55 @@ function loadStorageState(userId) {
   try { const f = stateFile(userId); if (fs.existsSync(f)) return f; } catch {}
   return undefined;
 }
+const cookieKey = (c) => `${c.name}|${c.domain}|${c.path || '/'}|${c.partitionKey || ''}`;
 async function saveStorageState(userId, context) {
   if (!PROFILE_DIR || !context) return;
-  try { await context.storageState({ path: stateFile(userId) }); } catch {}
+  try {
+    const state = await context.storageState();
+    // storageState() omits PARTITIONED (CHIPS) cookies — e.g. LinkedIn's `li_at`,
+    // which is partitioned, so it never lands on disk and a restored session is
+    // unauthenticated. context.cookies() returns the FULL jar incl partitionKey;
+    // merge it in (full jar wins) so auth survives a restart. Deduped by
+    // name|domain|path|partitionKey.
+    let full = [];
+    try { full = await context.cookies(); } catch {}
+    const map = new Map();
+    for (const c of state.cookies || []) map.set(cookieKey(c), c);
+    for (const c of full) map.set(cookieKey(c), c);
+    state.cookies = [...map.values()];
+    fs.writeFileSync(stateFile(userId), JSON.stringify(state));
+  } catch {}
 }
 if (PROFILE_DIR) {
   setInterval(() => {
     for (const [userId, s] of sessions.entries()) saveStorageState(userId, s.context).catch(() => {});
   }, 20_000).unref?.();
 }
+
+// POST /sessions/:userId/persist — force-flush this session's storageState to
+// disk NOW (the periodic flush is every 20s), so a login is durable before any
+// restart. Returns a NAME-level cookie diagnostic (never values) so a caller can
+// confirm auth cookies landed. Loopback-only when no API key (mirrors /cookies).
+app.post('/sessions/:userId/persist', async (req, res) => {
+  try {
+    if (CONFIG.apiKey) {
+      const m = String(req.headers['authorization'] || '').match(/^Bearer\s+(.+)$/i);
+      if (!m || !timingSafeCompare(m[1], CONFIG.apiKey)) return res.status(403).json({ error: 'Forbidden' });
+    } else if (!(CONFIG.nodeEnv !== 'production' && isLoopbackAddress(req.socket?.remoteAddress || ''))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (!PROFILE_DIR) return res.status(409).json({ error: 'CAMOFOX_PROFILE_DIR not set — sessions are ephemeral' });
+    const key = normalizeUserId(req.params.userId);
+    const session = sessions.get(key);
+    if (!session) return res.status(404).json({ error: 'No such session' });
+    await saveStorageState(key, session.context);
+    let names = [];
+    try { names = (await session.context.cookies()).map(c => c.name); } catch {}
+    res.json({ ok: true, userId: key, cookieCount: names.length, cookieNames: [...new Set(names)].sort() });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
 
 // ── Dedicated-context tabs (agstudio/native-video branch) ────────────
 //
@@ -558,7 +598,9 @@ async function restartBrowser(reason) {
     }
     sessions.clear();
     if (browser) {
-      await browser.close().catch(() => {});
+      // close() can itself hang on a wedged browser — bound it, then abandon
+      // the (possibly orphaned) process and relaunch rather than block recovery.
+      await withTimeout(browser.close(), 10000, 'browser.close').catch(() => {});
       browser = null;
     }
     browserLaunchPromise = null;
@@ -765,6 +807,26 @@ async function ensureBrowser() {
   return browserLaunchPromise;
 }
 
+// newContext on a "connected" browser can still hang indefinitely: a wedged
+// camoufox process keeps the CDP/Juggler connection alive (isConnected() ===
+// true) yet stops answering commands, so ensureBrowser hands back a zombie and
+// the await never settles. Bound it, and on timeout force a full recycle and
+// retry once — connectivity is necessary but not sufficient for liveness.
+const NEW_CONTEXT_TIMEOUT_MS = Number(process.env.CAMOFOX_NEWCONTEXT_TIMEOUT_MS || 20000);
+
+async function createContextResilient(contextOptions) {
+  let b = await ensureBrowser();
+  try {
+    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext');
+  } catch (err) {
+    if (!isTimeoutError(err)) throw err;
+    log('warn', 'newContext timed out — browser connected but wedged, recycling', { error: err.message });
+    await restartBrowser('newcontext_timeout');
+    b = await ensureBrowser();
+    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext(retry)');
+  }
+}
+
 // Helper to normalize userId to string (JSON body may parse as number)
 function normalizeUserId(userId) {
   return String(userId);
@@ -819,7 +881,30 @@ async function getSession(userId) {
     }
     const restored = loadStorageState(key);
     if (restored) contextOptions.storageState = restored;
-    const context = await b.newContext(contextOptions);
+    const context = await createContextResilient(contextOptions);
+
+    // storageState restore skips PARTITIONED cookies (the same reason saveStorageState
+    // has to merge them in). Re-inject the saved jar explicitly — addCookies honours
+    // partitionKey — so a partitioned auth cookie like LinkedIn's `li_at` actually
+    // loads and the restored session is authenticated. Best-effort per-cookie.
+    if (restored) {
+      try {
+        const saved = JSON.parse(fs.readFileSync(restored, 'utf8'));
+        if (Array.isArray(saved.cookies) && saved.cookies.length) {
+          await context.addCookies(saved.cookies).catch(async (e) => {
+            log('warn', 'addCookies batch failed, per-cookie fallback', { userId: key, error: e.message });
+            // a malformed cookie aborts the batch — fall back to one-by-one
+            for (const c of saved.cookies) await context.addCookies([c]).catch((err) => log('warn', 'addCookie skipped', { name: c.name, error: err.message }));
+          });
+          // Surface only the actionable case: a cookie was on disk but didn't
+          // make it back into the context (so a "restored" session is silently
+          // unauthenticated). The happy path stays quiet.
+          const restoredNames = new Set((await context.cookies().catch(() => [])).map(c => c.name));
+          const dropped = saved.cookies.filter(c => !restoredNames.has(c.name)).map(c => c.name);
+          if (dropped.length) log('warn', 'cookies not restored into context', { userId: key, dropped: [...new Set(dropped)] });
+        }
+      } catch (e) { log('warn', 'cookie restore failed', { userId: key, error: e.message }); }
+    }
 
     session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null };
     sessions.set(key, session);
