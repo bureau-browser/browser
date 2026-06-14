@@ -1212,6 +1212,12 @@ function createTabState(page) {
     lastSnapshot: null,
     lastRequestedUrl: null,
     googleRetryCount: 0,
+    // Server-side network capture (Playwright request events) — catches calls
+    // even from sites whose JS grabs `fetch` at module-load, which an in-page
+    // wrapper cannot. Armed via POST /tabs/:tabId/capture, drained via GET.
+    netCap: null,
+    netCapRE: null,
+    netCapAttached: false,
   };
 }
 
@@ -1912,6 +1918,65 @@ async function browserTranscript(reqId, url, videoId, lang) {
     }
   });
 }
+
+// Arm server-side network capture on a tab. Records requests whose URL matches
+// `urlPattern` (default: all) into a per-tab ring buffer — at the Playwright
+// layer, so it sees requests issued by JS that captured `fetch` before any
+// in-page wrapper could run (the Airbnb/opaque-client case). Idempotent: a
+// second call just resets the pattern + clears the buffer.
+app.post('/tabs/:tabId/capture', express.json({ limit: '64kb' }), async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, urlPattern, max } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'tab not found' });
+    const ts = found.tabState;
+    const cap = Math.min(Math.max(Number(max) || 100, 1), 500);
+    ts.netCap = [];
+    ts.netCapRE = urlPattern ? new RegExp(urlPattern) : null;
+    if (!ts.netCapAttached) {
+      ts.netCapAttached = true;
+      ts.page.on('request', (request) => {
+        try {
+          if (!ts.netCap) return;
+          const url = request.url();
+          if (ts.netCapRE && !ts.netCapRE.test(url)) return;
+          if (ts.netCap.length >= cap) ts.netCap.shift();
+          ts.netCap.push({
+            method: request.method(),
+            url: url.slice(0, 400),
+            resourceType: request.resourceType(),
+            postData: (request.postData() || null)?.slice(0, 4000) ?? null,
+            headers: request.headers(),
+          });
+        } catch (_) {}
+      });
+    }
+    res.json({ ok: true, armed: true, urlPattern: urlPattern || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// Drain the per-tab capture buffer. `?clear=1` empties it after reading.
+app.get('/tabs/:tabId/capture', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(String(userId)));
+    const found = findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'tab not found' });
+    const ts = found.tabState;
+    const out = (ts.netCap || []).slice();
+    if (req.query.clear) ts.netCap = ts.netCap ? [] : ts.netCap;
+    res.json({ requests: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
 
 app.get('/health', (req, res) => {
   if (healthState.isRecovering) {
