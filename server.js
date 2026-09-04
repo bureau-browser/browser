@@ -648,9 +648,15 @@ let browserLaunchPromise = null;
 let browserWarmRetryTimer = null;
 
 function scheduleBrowserIdleShutdown() {
-  clearBrowserIdleTimer();
+  // Idempotent: the 60s cleanup tick calls this on every pass while idle. It
+  // used to clear-and-rearm each time, so the timer was reset before it could
+  // ever expire and the browser never idled out. Keep a pending timer; it
+  // re-checks `sessions.size` when it fires, and `ensureBrowser()` (any real
+  // request) clears it.
+  if (browserIdleTimer) return;
   if (sessions.size === 0 && browser) {
     browserIdleTimer = setTimeout(async () => {
+      browserIdleTimer = null;
       if (sessions.size === 0 && browser) {
         log('info', 'browser idle shutdown (no sessions)');
         const b = browser;
@@ -4162,10 +4168,17 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await browser.newContext();
-    const page = await testContext.newPage();
-    await page.goto('about:blank', { timeout: 5000 });
-    await page.close();
+    testContext = await withTimeout(browser.newContext(), 5000, 'health probe newContext');
+    // In HEADFUL mode a probe page is a real Firefox window: with no session
+    // open, `newPage()` pops a visible window that closes a few ms later —
+    // every ~2 min while idle. A context round-trip is already a live protocol
+    // exchange with the browser process (a hung browser never answers it), so
+    // headful stops there; headless keeps the full page-level probe.
+    if (process.env.CAMOFOX_HEADFUL !== 'true') {
+      const page = await testContext.newPage();
+      await page.goto('about:blank', { timeout: 5000 });
+      await page.close();
+    }
     await testContext.close();
     healthState.lastSuccessfulNav = Date.now();
   } catch (err) {
