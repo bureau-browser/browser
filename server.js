@@ -342,7 +342,24 @@ async function saveStorageState(userId, context) {
     }
     for (const c of state.cookies || []) map.set(cookieKey(c), c);
     for (const c of live) map.set(cookieKey(c), c);
-    const merged = [...map.values()];
+
+    // Jar slimming — the merge above only ever GROWS (live wins on conflict,
+    // expired priors are dropped but a jar that carried hundreds of third-party
+    // sites' cookies keeps them until they expire, and localStorage accumulates
+    // one entry per site visited). A 2.8MB jar made every newContext injection
+    // blow past its timeout ("browser connected but wedged"). The caps below
+    // bound what restore has to inject; auth cookies for every registered
+    // platform are ALWAYS kept, so no identity is ever trimmed.
+    const authCookies = [...map.values()].filter((c) => isAuthCookie(c));
+    const nonAuth = [...map.values()].filter((c) => !isAuthCookie(c));
+    let merged = [...authCookies, ...nonAuth];
+    if (merged.length > MAX_JAR_COOKIES) {
+      // Non-auth cookies beyond the cap are dropped least-recently-set first
+      // (expires as a recency proxy for session jars, longest-lived last).
+      const byExpiry = [...nonAuth].sort((a, b) => (b.expires || -1) - (a.expires || -1));
+      const keepNonAuth = byExpiry.slice(0, Math.max(0, MAX_JAR_COOKIES - authCookies.length));
+      merged = [...authCookies, ...keepNonAuth];
+    }
 
     // Auth-gate: refuse to write a jar that has LOST auth for a platform the prior
     // file held. Carry-over already protects against a transient blink; this is
@@ -356,11 +373,63 @@ async function saveStorageState(userId, context) {
     }
 
     state.cookies = merged;
+    state.origins = slimOrigins(prior, state);
     fs.writeFileSync(stateFile(userId), JSON.stringify(state));
     return { written: true, authed: [...authedPlatforms(merged)] };
   } catch {
     return { written: false, reason: 'error' };
   }
+}
+
+// A cookie is "auth" when it belongs to a platform the AUTH_COOKIE_REGISTRY
+// tracks AND carries one of that platform's required names — the same rule
+// authedPlatforms uses, per cookie.
+function isAuthCookie(c) {
+  for (const entry of AUTH_COOKIE_REGISTRY) {
+    if (!entry.domain.test(c.domain || '')) continue;
+    if (entry.required.includes(c.name)) return true;
+  }
+  return false;
+}
+
+// Caps for the persisted localStorage. localStorage is conveniences, never
+// identity: any site re-derives it on the next visit. Per-origin entries over
+// the per-origin budget are dropped (largest first), and whole origins beyond
+// the origin budget are skipped (smallest first — keep the ones that carry
+// real state).
+const MAX_JAR_COOKIES = 120;
+const MAX_ORIGIN_LOCALSTORAGE_BYTES = 64 * 1024;
+const MAX_ORIGINS = 60;
+
+function slimOrigins(prior, state) {
+  const measured = (state.origins || []).map((o) => ({
+    origin: o.origin,
+    localStorage: o.localStorage || [],
+    bytes: (o.localStorage || []).reduce((sum, e) => sum + (e.value ? e.value.length : 0) + (e.name ? e.name.length : 0), 0),
+  }));
+  // Carry over prior origins the live state didn't report, so a site not
+  // visited this run doesn't lose its small-but-useful state.
+  const seen = new Set(measured.map((o) => o.origin));
+  for (const o of prior?.origins || []) {
+    if (!seen.has(o.origin)) measured.push({ origin: o.origin, localStorage: o.localStorage || [], bytes: 0, carried: true });
+  }
+  const kept = [];
+  for (const o of measured) {
+    if (o.localStorage.length > 0) {
+      // Drop individual entries until the origin fits its budget (largest first).
+      const entries = [...o.localStorage].sort((a, b) => (b.value ? b.value.length : 0) - (a.value ? a.value.length : 0));
+      let bytes = entries.reduce((sum, e) => sum + (e.value ? e.value.length : 0) + (e.name ? e.name.length : 0), 0);
+      while (bytes > MAX_ORIGIN_LOCALSTORAGE_BYTES && entries.length > 0) {
+        const e = entries.shift();
+        bytes -= (e.value ? e.value.length : 0) + (e.name ? e.name.length : 0);
+      }
+      o.localStorage = entries;
+      o.bytes = bytes;
+    }
+    if (o.localStorage.length > 0 || o.carried) kept.push(o);
+  }
+  kept.sort((a, b) => b.bytes - a.bytes);
+  return kept.slice(0, MAX_ORIGINS).map((o) => ({ origin: o.origin, localStorage: o.localStorage }));
 }
 
 // Checkpoint persistence — flush a session's jar shortly after the LAST of a burst
@@ -547,7 +616,10 @@ function userIdForTab(tabId) {
 
 async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS) {
   const lock = getTabLock(tabId);
-  await lock.acquire(TAB_LOCK_TIMEOUT_MS);
+  // Queue wait scales with the op's own budget: a long human-typed fill
+  // legitimately holds the tab for minutes, so a queued op must not die on
+  // the flat 35s cap while the holder is still doing real work.
+  await lock.acquire(Math.max(TAB_LOCK_TIMEOUT_MS, timeoutMs));
   try {
     const result = await withTimeout(operation(), timeoutMs, 'action');
     const owner = userIdForTab(tabId);
@@ -654,6 +726,7 @@ function scheduleBrowserIdleShutdown() {
   // re-checks `sessions.size` when it fires, and `ensureBrowser()` (any real
   // request) clears it.
   if (browserIdleTimer) return;
+  if (BROWSER_IDLE_TIMEOUT_MS <= 0) return;
   if (sessions.size === 0 && browser) {
     browserIdleTimer = setTimeout(async () => {
       browserIdleTimer = null;
@@ -972,7 +1045,32 @@ async function getSession(userId) {
       session = null;
     }
   }
-  
+
+  // Stale-auth refresh: a live context built BEFORE a login keeps serving the old
+  // (unauthed) jar — restore only runs on context CREATION. So if the on-disk jar
+  // has since GAINED auth for a platform this context wasn't created with (a
+  // `/persist` from a login landed after), recreate so the fresh login is
+  // restored. mtime-gated (one stat/op; re-read only when the jar changed) and
+  // gated on a platform GAIN, so routine checkpoint flushes (same auth set) never
+  // trigger it. This is the "logged in but the daemon kept serving a stale
+  // context" fix.
+  if (session) {
+    try {
+      const f = stateFile(key);
+      const m = fs.statSync(f).mtimeMs;
+      if (m !== session.jarMtime) {
+        session.jarMtime = m;
+        const diskAuth = authedPlatforms(JSON.parse(fs.readFileSync(f, 'utf8')).cookies);
+        if ([...diskAuth].some((p) => !session.authed?.has(p))) {
+          log('info', 'session jar gained auth, recreating to restore login', { userId: key, authed: [...diskAuth] });
+          session.context.close().catch(() => {});
+          sessions.delete(key);
+          session = null;
+        }
+      }
+    } catch { /* no jar yet / unreadable — nothing to refresh from */ }
+  }
+
   if (!session) {
     if (sessions.size >= MAX_SESSIONS) {
       throw new Error('Maximum concurrent sessions reached');
@@ -1014,7 +1112,11 @@ async function getSession(userId) {
 
     if (restored) await restorePartitionedCookies(context, key, restored);
 
-    session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null };
+    // Record what this context was built authed-for + the jar's mtime, so a later
+    // login (which writes a newer, more-authed jar) is detected on reuse above.
+    let jarMtime = 0;
+    try { jarMtime = fs.statSync(stateFile(key)).mtimeMs; } catch {}
+    session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, authed: authedPlatforms(restored?.cookies || []), jarMtime };
     sessions.set(key, session);
     log('info', 'session created', {
       userId: key,
@@ -2190,7 +2292,7 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
 // Create new tab
 app.post('/tabs', async (req, res) => {
   try {
-    const { userId, sessionKey, listItemId, url, recordVideo, viewport } = req.body;
+    const { userId, sessionKey, listItemId, url, recordVideo, viewport, keepAlive } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
     const resolvedSessionKey = sessionKey || listItemId;
     if (!userId || !resolvedSessionKey) {
@@ -2228,6 +2330,7 @@ app.post('/tabs', async (req, res) => {
 
     const result = await withTimeout((async () => {
       const session = await getSession(userId);
+      if (keepAlive) session.keepAlive = true;
 
       let totalTabs = 0;
       for (const group of session.tabGroups.values()) totalTabs += group.size;
@@ -2756,6 +2859,22 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     // keyboard events (DataDome &co. watch keystroke cadence), not an instant
     // value-set. Default stays `.fill()` (fast) unless human/delay is requested.
     const baseDelay = typeof delay === 'number' ? delay : 75;
+    // Budget must scale with the work. Human typing costs baseDelay+0..90ms
+    // per char (~5% of chars add a 180-680ms think-pause). A fixed 30s
+    // handler budget aborted any fill longer than ~220 chars mid-type while
+    // the keystroke loop kept running, and the caller saw success
+    // (dogfood 2026-09-03: silent form corruption). Give the operation a
+    // worst-case budget instead of the flat default.
+    const typeBudgetMs = Math.max(
+      HANDLER_TIMEOUT_MS,
+      Math.ceil(String(text).length * (baseDelay + 90 + 34) + 5000)
+    );
+    // Cancellation flag — flipped in `finally` around the withTabLock call
+    // below. withTimeout can abort this request while typeHuman is still
+    // mid-loop; without the flag the orphaned loop keeps firing keystrokes
+    // into whatever is focused AFTER the lock is released, interleaving with
+    // the next operation's typing (dogfood 2026-09-03: silent corruption).
+    const typeCancelled = { value: false };
     const typeHuman = async (locator) => {
       // navigate like a human: glide the real cursor to the field (visible,
       // curved, multi-step), pause, then a real mouse click — before any keys.
@@ -2777,6 +2896,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       await tabState.page.waitForTimeout(120 + Math.floor(Math.random() * 200));
       await locator.fill('').catch(() => {}); // clear existing value
       for (const ch of String(text)) {
+        if (typeCancelled.value) break; // orphaned post-timeout — stop typing
         await tabState.page.keyboard.type(ch, { delay: baseDelay + Math.floor(Math.random() * 90) });
         if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500)); // occasional think-pause
       }
@@ -2798,7 +2918,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       } else {
         await tabState.page.fill(selector, text, { timeout: 10000 });
       }
-    });
+    }, typeBudgetMs).catch((err) => { typeCancelled.value = true; throw err; });
     
     res.json({ ok: true });
   } catch (err) {
@@ -3606,6 +3726,7 @@ setInterval(() => {
   for (const [userId, session] of sessions) {
     if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
       sessionsExpiredTotal.inc();
+      saveStorageState(userId, session.context).catch(() => {});
       clearSessionDownloads(session).catch(() => {});
       session.context.close().catch(() => {});
       sessions.delete(userId);
@@ -3620,10 +3741,14 @@ setInterval(() => {
   refreshTabLockQueueDepth();
 }, 60_000);
 
-// Per-tab inactivity reaper — close tabs idle for TAB_INACTIVITY_MS
+// Per-tab inactivity reaper — close tabs idle for TAB_INACTIVITY_MS.
+// TAB_INACTIVITY_MS <= 0 disables tab reaping entirely (sessions stay until
+// explicit close or SESSION_TIMEOUT_MS). Per-session keepAlive (set via
+// POST /tabs { keepAlive: true }) exempts that session from reaping.
 setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
+    if (TAB_INACTIVITY_MS <= 0 || session.keepAlive) continue;
     for (const [listItemId, group] of session.tabGroups) {
       for (const [tabId, tabState] of group) {
         if (!tabState._lastReaperCheck) {
@@ -3651,9 +3776,9 @@ setInterval(() => {
         session.tabGroups.delete(listItemId);
       }
     }
-    // Clean up sessions with zero tabs remaining — free browser context memory
     if (session.tabGroups.size === 0) {
       log('info', 'session empty after tab reaper, closing', { userId });
+      saveStorageState(userId, session.context).catch(() => {});
       clearSessionDownloads(session).catch(() => {});
       session.context.close().catch(() => {});
       sessions.delete(userId);
