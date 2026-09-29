@@ -1,5 +1,5 @@
 {
-  "name": "@askjo/camofox-browser",
+  "name": "@bureau-browser/browser",
   "version": "1.5.2",
   "description": "Headless browser automation server and OpenClaw plugin for AI agents - anti-detection, element refs, and session isolation",
   "type": "module",
