@@ -350,7 +350,7 @@ Uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) when available (fast, no browser
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check plus lifecycle fields (`bootId`, `browserState`, ...). See [`docs/BUREAU-API.md`](docs/BUREAU-API.md) |
 | `POST` | `/start` | Start browser engine |
 | `POST` | `/stop` | Stop browser engine |
 
@@ -359,6 +359,9 @@ Uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) when available (fast, no browser
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/sessions/:userId/cookies` | Add cookies to a user session (Playwright cookie objects) |
+| `GET` | `/sessions` | List live sessions: `userId`, `keepAlive`, `tabs`, `lastAccess` (Bearer-gated when `CAMOFOX_API_KEY` is set) |
+
+`POST /tabs { keepAlive: true }` marks the whole session keep-alive: the tab reaper and the session-expiry sweep skip it, and the idle browser timer never closes the browser while any session exists. `keepAlive: false` clears it. A keep-alive session does not survive a browser restart (all contexts are gone) and the dedicated-context path (`recordVideo` / `viewport`) does not honour it.
 
 ## Search Macros
 
@@ -395,6 +398,11 @@ Reddit macros return JSON directly (no HTML parsing needed):
 | `PROXY_COUNTRY` | Target country for proxy geo-targeting | - |
 | `PROXY_STATE` | Target state/region for proxy geo-targeting | - |
 | `TAB_INACTIVITY_MS` | Close tabs idle longer than this | `300000` (5min) |
+| `CAMOFOX_LAUNCH_TIMEOUT_MS` | Budget for one browser launch. A launch that finishes inside the budget is never a failure, however slow. Overrun cancels the attempt, reaps its children and counts one failure | `120000` (120s) |
+| `CAMOFOX_NEWCONTEXT_TIMEOUT_MS` | Budget for `browser.newContext()`. On timeout the browser is restarted (`lastRestartReason: newcontext_timeout`) and the call retried once | `60000` (60s) |
+| `CAMOFOX_CRASH_LOOP_THRESHOLD` | Consecutive failed launches (or consecutive `newContext` timeouts) before `browserState` becomes `crash-looping` and automatic launches stop | `3` |
+
+`browserState: crash-looping` is sticky: `/health` answers 503, tab routes answer 503 with `code: browser_crash_looping`, and nothing relaunches the browser until an explicit `POST /start`, which resets both counters and tries again.
 
 ## Architecture
 
@@ -424,8 +432,24 @@ npm run test:debug    # with server output
 ## npm
 
 ```bash
-npm install @askjo/camofox-browser
+npm install @bureau-sh/camofox-browser
 ```
+
+## Attribution and patches
+
+This is `@bureau-sh/camofox-browser`, a fork of
+[`@askjo/camofox-browser`](https://github.com/jo-inc/camofox-browser)
+(version 1.5.2), MIT licensed, Copyright (c) Jo, Inc. `LICENSE` is the
+upstream file, unchanged; the fork stays MIT.
+
+Patches carried on top of upstream:
+
+- **Native video recording**: per-tab `recordVideo`, ffmpeg x11grab / cross-platform frame-grab recorder, full-viewport capture, per-tab viewport via a dedicated context (see `docs/native-video.md`).
+- **Server-side network capture**: `POST/GET /tabs/:tabId/capture`.
+- **Persistent and headful sessions**: `CAMOFOX_HEADFUL`, `CAMOFOX_PROFILE_DIR`, auth-gated checkpoint session persistence, httpOnly cookie persistence, human-input primitives, FR locale and anti-bot helpers.
+- **Headful probe fix**: no probe window in headful mode, and the idle shutdown timer actually fires.
+- **Cookie-jar cap**: the persisted cookie jar and localStorage are capped, since restore-time injection could wedge `newContext`.
+- **Lifecycle contract (Bureau)**: additive `/health` fields (`bootId`, `startedAt`, `browserState`, `launchedAt`, `lastLaunchMs`, `lastRestartReason`), a cancellable launch with a configurable budget (default 120s), crash-loop detection with an explicit `POST /start` reset, orphan camoufox reaping by tracked child pid (never a global `pkill`), `keepAlive` exposed in `/tabs` and `/sessions` and honoured by the session-expiry sweep and idle browser timer. See `docs/BUREAU-API.md`.
 
 ## Credits
 
