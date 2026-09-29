@@ -26,6 +26,9 @@ import {
   startMemoryReporter, stopMemoryReporter,
 } from './lib/metrics.js';
 import { actionFromReq, classifyError } from './lib/request-utils.js';
+import { createBrowserLifecycle, BrowserCrashLoopError } from './lib/browser-lifecycle.js';
+import { createChildTracker } from './lib/orphan-reaper.js';
+import { browserInUse, sweepExpiredSessions, reapIdleTabs, summarizeSessions, isKeepAlive } from './lib/session-policy.js';
 
 const CONFIG = loadConfig();
 
@@ -131,7 +134,7 @@ class StaleRefsError extends Error {
 }
 
 function safeError(err) {
-  if (CONFIG.nodeEnv === 'production') {
+  if (CONFIG.nodeEnv === 'production' && !err.expose) {
     log('error', 'internal error', { error: err.message, stack: err.stack });
     return 'Internal server error';
   }
@@ -145,6 +148,8 @@ function sendError(res, err, extraFields = {}) {
   if (err instanceof StaleRefsError) {
     body.code = 'stale_refs';
     body.ref = err.ref;
+  } else if (err.expose && err.code) {
+    body.code = err.code;
   }
   res.status(status).json(body);
 }
@@ -714,41 +719,28 @@ if (proxyPool) {
   log('info', 'no proxy configured');
 }
 
-const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
-let browserIdleTimer = null;
-let browserLaunchPromise = null;
 let browserWarmRetryTimer = null;
 
-function scheduleBrowserIdleShutdown() {
-  // Idempotent: the 60s cleanup tick calls this on every pass while idle. It
-  // used to clear-and-rearm each time, so the timer was reset before it could
-  // ever expire and the browser never idled out. Keep a pending timer; it
-  // re-checks `sessions.size` when it fires, and `ensureBrowser()` (any real
-  // request) clears it.
-  if (browserIdleTimer) return;
-  if (BROWSER_IDLE_TIMEOUT_MS <= 0) return;
-  if (sessions.size === 0 && browser) {
-    browserIdleTimer = setTimeout(async () => {
-      browserIdleTimer = null;
-      if (sessions.size === 0 && browser) {
-        log('info', 'browser idle shutdown (no sessions)');
-        const b = browser;
-        browser = null;
-        await b.close().catch(() => {});
-      }
-    }, BROWSER_IDLE_TIMEOUT_MS);
-  }
-}
+const browserChildren = createChildTracker({ log });
 
-function clearBrowserIdleTimer() {
-  if (browserIdleTimer) {
-    clearTimeout(browserIdleTimer);
-    browserIdleTimer = null;
-  }
-}
+const lifecycle = createBrowserLifecycle({
+  getBrowser: () => browser,
+  clearBrowser: () => { browser = null; },
+  launch: (ctx) => launchBrowserInstance(ctx),
+  launchTimeoutMs: proxyPool?.launchTimeoutMs ?? CONFIG.launchTimeoutMs,
+  crashLoopThreshold: CONFIG.crashLoopThreshold,
+  idleTimeoutMs: CONFIG.browserIdleTimeoutMs,
+  browserInUse: () => browserInUse(sessions),
+  isRecovering: () => healthState.isRecovering,
+  children: browserChildren,
+  log,
+});
+
+const scheduleBrowserIdleShutdown = () => lifecycle.scheduleIdleShutdown();
+const clearBrowserIdleTimer = () => lifecycle.clearIdleTimer();
 
 function scheduleBrowserWarmRetry(delayMs = 5000) {
-  if (browserWarmRetryTimer || browser || browserLaunchPromise) return;
+  if (browserWarmRetryTimer || browser || lifecycle.isLaunching() || lifecycle.isCrashLooping()) return;
   browserWarmRetryTimer = setTimeout(async () => {
     browserWarmRetryTimer = null;
     try {
@@ -784,19 +776,14 @@ async function restartBrowser(reason) {
   if (healthState.isRecovering) return;
   healthState.isRecovering = true;
   browserRestartsTotal.labels(reason).inc();
+  lifecycle.noteRestart(reason);
   log('error', 'restarting browser', { reason, failures: healthState.consecutiveNavFailures });
   try {
     for (const [, session] of sessions) {
       await session.context.close().catch(() => {});
     }
     sessions.clear();
-    if (browser) {
-      // close() can itself hang on a wedged browser — bound it, then abandon
-      // the (possibly orphaned) process and relaunch rather than block recovery.
-      await withTimeout(browser.close(), 10000, 'browser.close').catch(() => {});
-      browser = null;
-    }
-    browserLaunchPromise = null;
+    await lifecycle.closeCurrent();
     await ensureBrowser();
     healthState.consecutiveNavFailures = 0;
     healthState.lastSuccessfulNav = Date.now();
@@ -860,12 +847,13 @@ function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
   };
 }
 
-async function launchBrowserInstance() {
+async function launchBrowserInstance({ isCancelled = () => false } = {}) {
   const hostOS = getHostOS();
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (isCancelled()) break;
     const launchProxy = proxyPool
       ? proxyPool.getLaunchProxy(proxyPool.canRotateSessions ? `browser-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}` : undefined)
       : null;
@@ -922,6 +910,10 @@ async function launchBrowserInstance() {
 
       candidateBrowser = await firefox.launch(options);
 
+      if (isCancelled()) {
+        throw new Error('browser launch cancelled: budget exceeded before launch finished');
+      }
+
       if (proxyPool?.canRotateSessions) {
         const probe = await probeGoogleSearch(candidateBrowser);
         if (!probe.ok) {
@@ -943,6 +935,10 @@ async function launchBrowserInstance() {
             proxySession: launchProxy?.sessionId || null,
           });
         }
+      }
+
+      if (isCancelled()) {
+        throw new Error('browser launch cancelled: budget exceeded during probe');
       }
 
       virtualDisplay = localVirtualDisplay;
@@ -969,13 +965,14 @@ async function launchBrowserInstance() {
       });
       await candidateBrowser?.close().catch(() => {});
       if (localVirtualDisplay) localVirtualDisplay.kill();
+      if (isCancelled()) break;
     }
   }
 
   throw lastError || new Error('Failed to launch a usable browser');
 }
 
-async function ensureBrowser() {
+async function ensureBrowser(opts) {
   clearBrowserIdleTimer();
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
@@ -993,15 +990,10 @@ async function ensureBrowser() {
     }
     browserLaunchProxy = null;
     browser = null;
+    lifecycle.noteRestart('browser_disconnected');
+    await browserChildren.reapCurrent().catch(() => {});
   }
-  if (browser) return browser;
-  if (browserLaunchPromise) return browserLaunchPromise;
-  const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
-  browserLaunchPromise = Promise.race([
-    launchBrowserInstance(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)), launchTimeoutMs)),
-  ]).finally(() => { browserLaunchPromise = null; });
-  return browserLaunchPromise;
+  return lifecycle.ensure(opts);
 }
 
 // newContext on a "connected" browser can still hang indefinitely: a wedged
@@ -1009,18 +1001,29 @@ async function ensureBrowser() {
 // true) yet stops answering commands, so ensureBrowser hands back a zombie and
 // the await never settles. Bound it, and on timeout force a full recycle and
 // retry once — connectivity is necessary but not sufficient for liveness.
-const NEW_CONTEXT_TIMEOUT_MS = Number(process.env.CAMOFOX_NEWCONTEXT_TIMEOUT_MS || 20000);
+const NEW_CONTEXT_TIMEOUT_MS = CONFIG.newContextTimeoutMs;
 
 async function createContextResilient(contextOptions) {
   let b = await ensureBrowser();
+  if (lifecycle.isCrashLooping()) throw new BrowserCrashLoopError(CONFIG.crashLoopThreshold);
   try {
-    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext');
+    const ctx = await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext');
+    lifecycle.noteContextOk();
+    return ctx;
   } catch (err) {
     if (!isTimeoutError(err)) throw err;
     log('warn', 'newContext timed out — browser connected but wedged, recycling', { error: err.message });
+    if (lifecycle.noteContextFailure()) throw new BrowserCrashLoopError(CONFIG.crashLoopThreshold);
     await restartBrowser('newcontext_timeout');
     b = await ensureBrowser();
-    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext(retry)');
+    try {
+      const ctx = await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext(retry)');
+      lifecycle.noteContextOk();
+      return ctx;
+    } catch (retryErr) {
+      if (isTimeoutError(retryErr)) lifecycle.noteContextFailure();
+      throw retryErr;
+    }
   }
 }
 
@@ -1032,6 +1035,7 @@ function normalizeUserId(userId) {
 async function getSession(userId) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
+  let carriedKeepAlive = false;
   
   // Check if existing session's context is still alive
   if (session) {
@@ -1040,6 +1044,7 @@ async function getSession(userId) {
       session.context.pages();
     } catch (err) {
       log('warn', 'session context dead, recreating', { userId: key, error: err.message });
+      carriedKeepAlive = isKeepAlive(session);
       session.context.close().catch(() => {});
       sessions.delete(key);
       session = null;
@@ -1063,6 +1068,7 @@ async function getSession(userId) {
         const diskAuth = authedPlatforms(JSON.parse(fs.readFileSync(f, 'utf8')).cookies);
         if ([...diskAuth].some((p) => !session.authed?.has(p))) {
           log('info', 'session jar gained auth, recreating to restore login', { userId: key, authed: [...diskAuth] });
+          carriedKeepAlive = isKeepAlive(session);
           session.context.close().catch(() => {});
           sessions.delete(key);
           session = null;
@@ -1117,6 +1123,7 @@ async function getSession(userId) {
     let jarMtime = 0;
     try { jarMtime = fs.statSync(stateFile(key)).mtimeMs; } catch {}
     session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, authed: authedPlatforms(restored?.cookies || []), jarMtime };
+    if (carriedKeepAlive) session.keepAlive = true;
     sessions.set(key, session);
     log('info', 'session created', {
       userId: key,
@@ -2087,10 +2094,21 @@ app.get('/tabs/:tabId/capture', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  const lc = lifecycle.snapshot();
   if (healthState.isRecovering) {
-    return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
+    return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true, ...lc });
   }
   const running = browser !== null && (browser.isConnected?.() ?? false);
+  if (lifecycle.isCrashLooping()) {
+    return res.status(503).json({
+      ok: false,
+      engine: 'camoufox',
+      browserConnected: running,
+      browserRunning: running,
+      ...lc,
+      ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
+    });
+  }
   if (proxyPool?.canRotateSessions && !running) {
     scheduleBrowserWarmRetry();
     return res.status(503).json({
@@ -2099,6 +2117,7 @@ app.get('/health', (req, res) => {
       browserConnected: false,
       browserRunning: false,
       warming: true,
+      ...lc,
       ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
     });
   }
@@ -2109,7 +2128,9 @@ app.get('/health', (req, res) => {
     browserRunning: running,
     activeTabs: getTotalTabCount(),
     activeSessions: sessions.size,
+    keepAliveSessions: summarizeSessions(sessions).filter((x) => x.keepAlive).length,
     consecutiveFailures: healthState.consecutiveNavFailures,
+    ...lc,
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
 });
@@ -2330,7 +2351,8 @@ app.post('/tabs', async (req, res) => {
 
     const result = await withTimeout((async () => {
       const session = await getSession(userId);
-      if (keepAlive) session.keepAlive = true;
+      if (keepAlive === true) session.keepAlive = true;
+      else if (keepAlive === false) delete session.keepAlive;
 
       let totalTabs = 0;
       for (const group of session.tabGroups.values()) totalTabs += group.size;
@@ -2360,8 +2382,8 @@ app.post('/tabs', async (req, res) => {
         tabState.visitedUrls.add(url);
       }
       
-      log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-      return { tabId, url: page.url() };
+      log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url(), keepAlive: isKeepAlive(session) });
+      return { tabId, url: page.url(), keepAlive: isKeepAlive(session) };
     })(), requestTimeoutMs(), 'tab create');
 
     res.json(result);
@@ -3722,18 +3744,18 @@ app.delete('/sessions/:userId', async (req, res) => {
 
 // Cleanup stale sessions
 setInterval(() => {
-  const now = Date.now();
-  for (const [userId, session] of sessions) {
-    if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+  sweepExpiredSessions(sessions, {
+    now: Date.now(),
+    timeoutMs: SESSION_TIMEOUT_MS,
+    onExpire: (userId, session) => {
       sessionsExpiredTotal.inc();
       saveStorageState(userId, session.context).catch(() => {});
       clearSessionDownloads(session).catch(() => {});
       session.context.close().catch(() => {});
-      sessions.delete(userId);
       refreshActiveTabsGauge();
       log('info', 'session expired', { userId });
-    }
-  }
+    },
+  });
   // When all sessions gone, start idle timer to kill browser
   if (sessions.size === 0) {
     scheduleBrowserIdleShutdown();
@@ -3746,46 +3768,26 @@ setInterval(() => {
 // explicit close or SESSION_TIMEOUT_MS). Per-session keepAlive (set via
 // POST /tabs { keepAlive: true }) exempts that session from reaping.
 setInterval(() => {
-  const now = Date.now();
-  for (const [userId, session] of sessions) {
-    if (TAB_INACTIVITY_MS <= 0 || session.keepAlive) continue;
-    for (const [listItemId, group] of session.tabGroups) {
-      for (const [tabId, tabState] of group) {
-        if (!tabState._lastReaperCheck) {
-          tabState._lastReaperCheck = now;
-          tabState._lastReaperToolCalls = tabState.toolCalls;
-          continue;
-        }
-        if (tabState.toolCalls === tabState._lastReaperToolCalls) {
-          const idleMs = now - tabState._lastReaperCheck;
-          if (idleMs >= TAB_INACTIVITY_MS) {
-            tabsReapedTotal.inc();
-            log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
-            safePageClose(tabState.page);
-            group.delete(tabId);
-            { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
-            refreshTabLockQueueDepth();
-            refreshActiveTabsGauge();
-          }
-        } else {
-          tabState._lastReaperCheck = now;
-          tabState._lastReaperToolCalls = tabState.toolCalls;
-        }
-      }
-      if (group.size === 0) {
-        session.tabGroups.delete(listItemId);
-      }
-    }
-    if (session.tabGroups.size === 0) {
+  reapIdleTabs(sessions, {
+    now: Date.now(),
+    inactivityMs: TAB_INACTIVITY_MS,
+    onTabReaped: ({ userId, listItemId, tabId, tabState, idleMs }) => {
+      tabsReapedTotal.inc();
+      log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
+      safePageClose(tabState.page);
+      { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
+      refreshTabLockQueueDepth();
+      refreshActiveTabsGauge();
+    },
+    onSessionEmpty: (userId, session) => {
       log('info', 'session empty after tab reaper, closing', { userId });
       saveStorageState(userId, session.context).catch(() => {});
       clearSessionDownloads(session).catch(() => {});
       session.context.close().catch(() => {});
-      sessions.delete(userId);
       sessionsExpiredTotal.inc();
       refreshActiveTabsGauge();
-    }
-  }
+    },
+  });
   if (sessions.size === 0) scheduleBrowserIdleShutdown();
 }, 60_000);
 
@@ -3807,6 +3809,15 @@ app.get('/', (req, res) => {
   });
 });
 
+// GET /sessions - List live sessions (Bearer CAMOFOX_API_KEY when configured)
+app.get('/sessions', (req, res) => {
+  if (CONFIG.apiKey) {
+    const m = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+    if (!m || !timingSafeCompare(m[1], CONFIG.apiKey)) return res.status(403).json({ error: 'Forbidden' });
+  }
+  res.json({ sessions: summarizeSessions(sessions) });
+});
+
 // GET /tabs - List all tabs (OpenClaw expects this)
 app.get('/tabs', async (req, res) => {
   try {
@@ -3814,7 +3825,7 @@ app.get('/tabs', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     
     if (!session) {
-      return res.json({ running: true, tabs: [] });
+      return res.json({ running: true, keepAlive: false, tabs: [] });
     }
     
     const tabs = [];
@@ -3825,12 +3836,13 @@ app.get('/tabs', async (req, res) => {
           tabId,
           url: tabState.page.url(),
           title: await tabState.page.title().catch(() => ''),
-          listItemId
+          listItemId,
+          keepAlive: isKeepAlive(session),
         });
       }
     }
     
-    res.json({ running: true, tabs });
+    res.json({ running: true, keepAlive: isKeepAlive(session), tabs });
   } catch (err) {
     log('error', 'list tabs failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
@@ -3892,7 +3904,7 @@ app.post('/tabs/open', async (req, res) => {
 // POST /start - Start browser (OpenClaw expects this)
 app.post('/start', async (req, res) => {
   try {
-    await ensureBrowser();
+    await ensureBrowser({ explicit: true });
     res.json({ ok: true, profile: 'camoufox' });
   } catch (err) {
     failuresTotal.labels('browser_launch', 'start').inc();
@@ -3907,10 +3919,7 @@ app.post('/stop', async (req, res) => {
     if (!adminKey || !timingSafeCompare(adminKey, CONFIG.adminKey)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (browser) {
-      await browser.close().catch(() => {});
-      browser = null;
-    }
+    await lifecycle.closeCurrent();
     const cleanupTasks = [];
     for (const session of sessions.values()) {
       cleanupTasks.push(clearSessionDownloads(session));
@@ -4349,7 +4358,7 @@ async function gracefulShutdown(signal) {
   for (const [userId, session] of sessions) {
     await session.context.close().catch(() => {});
   }
-  if (browser) await browser.close().catch(() => {});
+  await lifecycle.closeCurrent();
   process.exit(0);
 }
 
