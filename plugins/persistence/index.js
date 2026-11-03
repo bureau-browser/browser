@@ -33,6 +33,7 @@ import {
   getUserPersistencePaths,
   loadPersistedStorageState,
   persistStorageState,
+  restoreCookiesIntoContext,
 } from '../../lib/persistence.js';
 import { importBootstrapCookies } from '../../lib/cookies.js';
 
@@ -120,9 +121,16 @@ export async function register(app, ctx, pluginConfig = {}) {
   events.on('session:created', async ({ userId, context }) => {
     activeSessions.set(userId, context);
 
-    // If no persisted state was restored, try bootstrap cookies
+    // storageState restore can skip partitioned/httpOnly cookies; re-inject the
+    // full persisted jar so a restored login is actually authenticated.
     const existingState = await loadPersistedStorageState(profileDir, userId, logger);
-    if (!existingState) {
+    if (existingState) {
+      await restoreCookiesIntoContext(context, existingState, logger);
+      return;
+    }
+
+    // If no persisted state was restored, try bootstrap cookies
+    {
       const result = await importBootstrapCookies({
         cookiesDir: config.cookiesDir,
         context,

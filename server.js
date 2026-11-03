@@ -5,6 +5,9 @@ import express from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
+import { x11GrabAvailable, startFrameRecorder, startX11Grab, stopFfmpegAndWait } from './lib/video-recorder.js';
+import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
 import { getSearchFallbacks } from './lib/search-fallbacks.js';
 import { hasGoogleOrganicResults } from './lib/google-serp.js';
@@ -74,7 +77,7 @@ const _pkgVersion = (() => { try { return JSON.parse(readFileSync(new URL('./pac
 initSentry({ ...CONFIG, version: _pkgVersion });
 const reporter = createReporter({ ...CONFIG, version: _pkgVersion });
 function _countTabs() {
-  let total = 0;
+  let total = dedicatedTabs.size;
   for (const session of sessions.values()) {
     for (const group of session.tabGroups.values()) total += group.size;
   }
@@ -494,6 +497,17 @@ let _lastBrowserRestartAt = 0; // Timestamp of last browser relaunch (for stale 
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
 
+// Tabs that need their own Playwright context, outside the shared per-user one:
+//  - recordVideo: ffmpeg/frame-grab capture is per tab, and the recorded tab
+//    must not drag the user's other tabs into the video.
+//  - viewport: Playwright locks the viewport at newContext() time, so a
+//    custom-size tab needs a fresh context.
+// findTab() falls through to this map, so every existing /tabs/:id/* route
+// works on dedicated tabs without call-site changes.
+const dedicatedTabs = new Map(); // tabId -> { tabState, context, userId, listItemId, ... }
+const VIDEO_BASE_DIR = CONFIG.videoDir;
+const VIDEO_GRACE_WINDOW_MS = 5 * 60 * 1000;
+
 const SESSION_TIMEOUT_MS = CONFIG.sessionTimeoutMs;
 const MAX_SNAPSHOT_NODES = 500;
 const TAB_INACTIVITY_MS = CONFIG.tabInactivityMs;
@@ -843,7 +857,7 @@ async function restartBrowser(reason) {
 }
 
 function getTotalTabCount() {
-  let total = 0;
+  let total = dedicatedTabs.size;
   for (const session of sessions.values()) {
     try {
       // Use real Playwright page count so leaked pages exert backpressure
@@ -1135,7 +1149,7 @@ async function launchBrowserInstance() {
 
     let localVirtualDisplay = null;
     let vdDisplay = undefined;
-    const useDesktopWindow = CONFIG.interactiveMode === 'desktop';
+    const useDesktopWindow = CONFIG.interactiveMode === 'desktop' || CONFIG.headful;
     let candidateBrowser = null;
     try {
       if (os.platform() === 'linux' && !useDesktopWindow) {
@@ -1343,7 +1357,7 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
   }
 }
 
-async function getSession(userId, { trace = false } = {}) {
+async function getSession(userId, { trace = false, storageState } = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
   
@@ -1397,6 +1411,10 @@ async function getSession(userId, { trace = false } = {}) {
           directIdentity: CONFIG.directIdentity,
         }),
       };
+      // A caller-supplied storageState (browser-profiles passes one on first
+      // tab create) seeds a brand-new context. The persistence plugin may also
+      // set contextOptions.storageState via session:creating.
+      if (storageState) contextOptions.storageState = storageState;
       let sessionProxy = null;
       if (proxyPool?.canRotateSessions) {
         sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
@@ -1513,7 +1531,7 @@ function handleRouteError(err, req, res, extraFields = {}) {
   let foundForContext = null;
   if (userId && tabId) {
     const session = sessions.get(normalizeUserId(userId));
-    foundForContext = session && findTab(session, tabId);
+    foundForContext = findTab(session, tabId);
   }
   const pageUrl = safePageUrl(foundForContext?.tabState?.page);
   const sentryContext = {
@@ -1626,7 +1644,7 @@ function handleRouteError(err, req, res, extraFields = {}) {
   const FRUSTRATION_TYPES = new Set(['timeout', 'dead_context', 'nav_aborted']);
   if (FRUSTRATION_TYPES.has(failureType) && userId && tabId) {
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (found) {
       const ts = found.tabState;
       ts.consecutiveFailures = (ts.consecutiveFailures || 0) + 1;
@@ -1685,7 +1703,7 @@ function destroyTab(session, tabId, reason, userId) {
 }
 
 async function destroyTimedOutTab(session, tabId, reason, userId) {
-  const found = session && findTab(session, tabId);
+  const found = findTab(session, tabId);
   if (!found) return;
   const { tabState, group, listItemId } = found;
   log('warn', 'destroying timed-out tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason });
@@ -1745,6 +1763,15 @@ async function recycleOldestTab(session, reqId, userId) {
 
 async function destroySession(userId, { reason = 'destroy_session' } = {}) {
   const key = normalizeUserId(userId);
+  // Dedicated-context tabs are independent of the shared session but belong to
+  // the same user; an explicit session delete tears them down too.
+  for (const [tabId, entry] of Array.from(dedicatedTabs.entries())) {
+    if (entry.userId !== key) continue;
+    await finalizeRecording(entry, reason).catch(() => {});
+    const lock = tabLocks.get(tabId);
+    if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+    scheduleDedicatedTabCleanup(tabId);
+  }
   const session = sessions.get(key);
   if (!session) return false;
   log('warn', 'destroying session', { userId: key, reason });
@@ -1755,6 +1782,13 @@ async function destroySession(userId, { reason = 'destroy_session' } = {}) {
 }
 
 function findTab(session, tabId) {
+  // Dedicated-context tabs (recording / custom viewport) are not in any
+  // session's tabGroups; check their own map first.
+  const dedicated = dedicatedTabs.get(tabId);
+  if (dedicated) {
+    return { tabState: dedicated.tabState, listItemId: dedicated.listItemId, group: null, dedicated: true };
+  }
+  if (!session) return null;
   for (const [listItemId, group] of session.tabGroups) {
     if (group.has(tabId)) {
       const tabState = group.get(tabId);
@@ -2680,6 +2714,218 @@ async function refreshTabRefs(tabState, options = {}) {
  *                 recovering:
  *                   type: boolean
  */
+// Network capture
+/**
+ * @openapi
+ * /tabs/{tabId}/capture:
+ *   post:
+ *     tags: [Content]
+ *     summary: Arm per-tab network capture
+ *     description: >
+ *       Attaches a Playwright request listener and records requests into a
+ *       bounded per-tab ring buffer. Read them back with GET on the same path.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               urlPattern:
+ *                 type: string
+ *                 description: Optional regular expression; only matching URLs are kept.
+ *               max:
+ *                 type: integer
+ *                 description: Ring buffer size (1..500, default 100).
+ *     responses:
+ *       200:
+ *         description: Capture armed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       404:
+ *         description: Tab not found.
+ *   get:
+ *     tags: [Content]
+ *     summary: Read captured requests
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: clear
+ *         in: query
+ *         schema:
+ *           type: boolean
+ *     responses:
+ *       200:
+ *         description: Captured requests.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 requests:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *       404:
+ *         description: Tab not found.
+ */
+app.post('/tabs/:tabId/capture', express.json({ limit: '64kb' }), async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, urlPattern, max } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'tab not found' });
+    const ts = found.tabState;
+    const cap = Math.min(Math.max(Number(max) || 100, 1), 500);
+    ts.netCap = [];
+    ts.netCapRE = urlPattern ? new RegExp(urlPattern) : null;
+    if (!ts.netCapAttached) {
+      ts.netCapAttached = true;
+      ts.page.on('request', (request) => {
+        try {
+          if (!ts.netCap) return;
+          const url = request.url();
+          if (ts.netCapRE && !ts.netCapRE.test(url)) return;
+          if (ts.netCap.length >= cap) ts.netCap.shift();
+          ts.netCap.push({
+            method: request.method(),
+            url: url.slice(0, 400),
+            resourceType: request.resourceType(),
+            postData: (request.postData() || null)?.slice(0, 4000) ?? null,
+            headers: request.headers(),
+          });
+        } catch (_) {}
+      });
+    }
+    res.json({ ok: true, armed: true, urlPattern: urlPattern || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+app.get('/tabs/:tabId/capture', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(String(userId)));
+    const found = findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'tab not found' });
+    const ts = found.tabState;
+    const out = (ts.netCap || []).slice();
+    if (req.query.clear) ts.netCap = ts.netCap ? [] : ts.netCap;
+    res.json({ requests: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+// Force-flush a session's persisted storage state
+/**
+ * @openapi
+ * /sessions/{userId}/persist:
+ *   post:
+ *     tags: [Sessions]
+ *     summary: Checkpoint a session's storage state now
+ *     description: >
+ *       Writes the session's current cookie jar + localStorage to the
+ *       configured profile dir immediately, instead of waiting for the next
+ *       background checkpoint. Returns a name-level cookie diagnostic (never
+ *       values) so a caller can confirm auth cookies landed.
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Checkpoint result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 written:
+ *                   type: boolean
+ *                 authed:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                 cookies:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *       404:
+ *         description: No such live session.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Persistence is not configured.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/sessions/:userId/persist', authMiddleware(), async (req, res) => {
+  try {
+    if (!CONFIG.profileDir) {
+      return res.status(409).json({ error: 'CAMOFOX_PROFILE_DIR not set - sessions are ephemeral' });
+    }
+    const key = normalizeUserId(req.params.userId);
+    const session = sessions.get(key);
+    if (!session) return res.status(404).json({ error: 'No such session' });
+
+    const result = await persistStorageState({
+      profileDir: CONFIG.profileDir,
+      userId: key,
+      context: session.context,
+      logger: { warn: (msg, fields = {}) => log('warn', msg, { userId: key, ...fields }) },
+    });
+    let names = [];
+    try {
+      names = (await session.context.cookies()).map((cookie) => cookie.name);
+    } catch {}
+
+    res.json({
+      ok: true,
+      written: result.persisted,
+      ...(result.reason ? { reason: result.reason } : {}),
+      ...(result.lost ? { lost: result.lost } : {}),
+      authed: result.authed || [],
+      cookies: names,
+    });
+  } catch (err) {
+    log('error', 'persist failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 app.get('/health', (req, res) => {
   if (healthState.isRecovering) {
     return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
@@ -2840,6 +3086,196 @@ app.post('/pressure/cleanup', async (req, res) => {
   }
 });
 
+
+// Create a tab in its own Playwright context (recording and/or custom viewport).
+async function createDedicatedTab({ req, userId, resolvedSessionKey, url, recordVideo, viewport }) {
+  const b = await ensureBrowser();
+  if (getTotalTabCount() >= MAX_TABS_GLOBAL) {
+    throw Object.assign(new Error('Maximum tabs (global) reached'), { statusCode: 429 });
+  }
+  const tabId = fly.makeTabId();
+
+  // Sizing. A recording tab captures the full window (Camoufox ignores a fixed
+  // viewport for rendering but Playwright still clips screenshots to one), so
+  // use viewport:null. recordVideo.width/height only sets the output size.
+  let width = 1280;
+  let height = 720;
+  let outWidth = width;
+  let outHeight = height;
+  if (recordVideo) {
+    if (Number(recordVideo.width) > 0) outWidth = Number(recordVideo.width);
+    if (Number(recordVideo.height) > 0) outHeight = Number(recordVideo.height);
+  }
+  if (viewport) {
+    if (Number(viewport.width) > 0) width = Number(viewport.width);
+    if (Number(viewport.height) > 0) height = Number(viewport.height);
+  }
+
+  const recordKey = normalizeUserId(userId);
+  const contextOptions = {
+    viewport: recordVideo ? null : { width, height },
+    permissions: ['geolocation'],
+    ...contextIdentityOptions({
+      hasProxy: !!proxyPool,
+      directIdentity: CONFIG.directIdentity,
+    }),
+  };
+
+  // A recording tab films the AUTHED view, like the session it mirrors.
+  // Restore the persisted jar before the context exists, then re-inject the
+  // full cookie jar (partitioned/httpOnly cookies can be skipped by
+  // storageState restore).
+  let restoredStatePath = null;
+  if (recordVideo) {
+    restoredStatePath = await loadPersistedStorageState(CONFIG.profileDir, recordKey, {
+      warn: (msg, fields) => log('warn', msg, fields),
+    }).catch(() => undefined);
+    if (restoredStatePath) contextOptions.storageState = restoredStatePath;
+  }
+
+  const context = await b.newContext(contextOptions);
+  if (restoredStatePath) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(restoredStatePath, 'utf8'));
+      if (Array.isArray(saved.cookies) && saved.cookies.length) {
+        await context.addCookies(saved.cookies).catch(async (err) => {
+          log('warn', 'dedicated tab addCookies batch failed, per-cookie fallback', {
+            userId: recordKey, error: err.message,
+          });
+          for (const c of saved.cookies) {
+            await context.addCookies([c]).catch((e) => log('warn', 'dedicated tab addCookie skipped', {
+              name: c.name, error: e.message,
+            }));
+          }
+        });
+      }
+    } catch (err) {
+      log('warn', 'dedicated tab cookie restore failed', { userId: recordKey, error: err.message });
+    }
+  }
+
+  const page = await context.newPage();
+  const tabState = createTabState(page);
+  attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+
+  let ffmpegProcess;
+  let frameRecorder;
+  let videoDir;
+  let videoPath;
+  if (recordVideo) {
+    videoDir = path.join(VIDEO_BASE_DIR, tabId);
+    fs.mkdirSync(videoDir, { recursive: true });
+    videoPath = path.join(videoDir, `${tabId}.webm`);
+    const scale = outWidth !== width || outHeight !== height
+      ? ['-vf', `scale=${outWidth}:${outHeight}`]
+      : [];
+    if (x11GrabAvailable(process.env.DISPLAY || null)) {
+      ffmpegProcess = startX11Grab({
+        videoPath,
+        tabId,
+        width,
+        height,
+        fps: Number(recordVideo.fps) || 15,
+        scale,
+        display: process.env.DISPLAY || ':99',
+        log,
+      });
+    } else {
+      frameRecorder = startFrameRecorder({
+        page,
+        videoDir,
+        videoPath,
+        tabId,
+        fps: Number(recordVideo.fps) || 4,
+        scale,
+        log,
+      });
+    }
+  }
+
+  dedicatedTabs.set(tabId, {
+    tabState,
+    context,
+    videoDir,
+    videoPath,
+    frameRecorder,
+    videoSettled: !ffmpegProcess && !frameRecorder,
+    ffmpegProcess,
+    userId: recordKey,
+    listItemId: resolvedSessionKey,
+    createdAt: Date.now(),
+  });
+  refreshActiveTabsGauge();
+
+  if (url) {
+    const urlErr = validateUrl(url);
+    if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
+    tabState.lastRequestedUrl = url;
+    await withPageLoadDuration('open_url', () =>
+      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    );
+    tabState.visitedUrls.add(url);
+  }
+
+  log('info', 'dedicated tab created', {
+    reqId: req.reqId,
+    tabId,
+    userId,
+    sessionKey: resolvedSessionKey,
+    width,
+    height,
+    recorded: !!recordVideo,
+    videoDir,
+    ffmpegPid: ffmpegProcess?.pid,
+  });
+
+  const result = { tabId, url: page.url(), viewport: { width, height } };
+  if (recordVideo) result.recordVideo = { width, height, fps: Number(recordVideo.fps) || 4 };
+  return result;
+}
+
+/**
+ * Finalize a recorded tab's video so the .webm is readable on disk, idempotent.
+ */
+async function finalizeRecording(recorded, reason) {
+  if (recorded.videoSettled) return;
+  recorded.videoSettled = true;
+  if (recorded.ffmpegProcess) {
+    await stopFfmpegAndWait(recorded.ffmpegProcess, {
+      tabId: recorded.tabState?.tabId, reason, log,
+    });
+  } else if (recorded.frameRecorder) {
+    const out = await recorded.frameRecorder.stop();
+    if (!out) recorded.videoPath = undefined;
+  }
+  await recorded.context.close().catch((err) =>
+    log('warn', 'recorded context close failed', { reason, error: err.message })
+  );
+}
+
+// Recording tabs keep their video dir for a grace window so a trailing
+// GET /video after DELETE still works. Viewport-only tabs have no file.
+function scheduleDedicatedTabCleanup(tabId) {
+  const entry = dedicatedTabs.get(tabId);
+  if (!entry) return;
+  if (!entry.videoDir) {
+    dedicatedTabs.delete(tabId);
+    return;
+  }
+  setTimeout(() => {
+    const stillThere = dedicatedTabs.get(tabId);
+    if (!stillThere) return;
+    try {
+      fs.rmSync(stillThere.videoDir, { recursive: true, force: true });
+    } catch (err) {
+      log('warn', 'recorded video dir cleanup failed', {
+        tabId, dir: stillThere.videoDir, error: err.message,
+      });
+    }
+    dedicatedTabs.delete(tabId);
+  }, VIDEO_GRACE_WINDOW_MS).unref?.();
+}
+
 // Create new tab
 /**
  * @openapi
@@ -2923,11 +3359,31 @@ app.post('/tabs', async (req, res) => {
     createdTabId = null;
   };
   try {
-    const { userId, sessionKey, listItemId, url, trace } = req.body;
+    const { userId, sessionKey, listItemId, url, trace, recordVideo, viewport, keepAlive, storageState } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
     const resolvedSessionKey = sessionKey || listItemId;
     if (!userId || !resolvedSessionKey) {
       return res.status(400).json({ error: 'userId and sessionKey required' });
+    }
+
+    // Dedicated-context path: recording and/or a custom viewport. Both need
+    // their own Playwright context, so they bypass the shared session.
+    const hasRecordVideo = recordVideo && typeof recordVideo === 'object';
+    const hasCustomViewport = viewport && typeof viewport === 'object';
+    if (hasRecordVideo || hasCustomViewport) {
+      const result = await withTimeout(
+        createDedicatedTab({
+          req,
+          userId,
+          resolvedSessionKey,
+          url,
+          recordVideo: hasRecordVideo ? recordVideo : null,
+          viewport: hasCustomViewport ? viewport : null,
+        }),
+        tabCreateRequestTimeoutMs(),
+        'dedicated tab create'
+      );
+      return res.json(result);
     }
 
     // Session overflow redirect (Fly.io only) — if this machine is above its
@@ -2954,7 +3410,8 @@ app.post('/tabs', async (req, res) => {
           { statusCode: 409 },
         );
       }
-      let session = await getSession(userId, { trace: !!trace });
+      let session = await getSession(userId, { trace: !!trace, storageState });
+      if (keepAlive) session.keepAlive = true;
       
       let totalTabs = 0;
       for (const group of session.tabGroups.values()) totalTabs += group.size;
@@ -3159,9 +3616,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
     let session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
 
     const result = await withUserLimit(userId, () => withTimeout((async () => {
       await ensureBrowser();
@@ -3598,9 +4055,9 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     const format = req.query.format || 'text';
     const offset = parseInt(req.query.offset) || 0;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -3781,9 +4238,9 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
   try {
     const { userId, timeout = 10000, waitForNetwork = true, dismissConsent = false } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork, dismissConsent });
@@ -3867,9 +4324,9 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     const { userId, ref, selector } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -4064,7 +4521,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     if (err.code !== 'tab_timeout' && err.message?.includes('timed out')) {
       try {
         const session = sessions.get(normalizeUserId(req.body.userId));
-        const found = session && findTab(session, tabId);
+        const found = findTab(session, tabId);
         if (found?.tabState?.page && !found.tabState.page.isClosed()) {
           found.tabState.refs = await refreshTabRefs(found.tabState, { reason: 'click_timeout' });
           found.tabState.lastSnapshot = null;
@@ -4174,9 +4631,9 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
     const paths = await resolveUploadPaths({ uploadsDir: CONFIG.uploadsDir, filePaths: Array.isArray(filePath) ? filePath : [filePath] });
 
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
@@ -4371,24 +4828,24 @@ app.post('/tabs/:tabId/type', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector, text, mode = 'fill', delay = 30, submit = false, pressEnter = false } = req.body;
+    const { userId, ref, selector, text, mode = 'fill', delay, human = false, submit = false, pressEnter = false } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
-    if (mode !== 'fill' && mode !== 'keyboard') {
-      return res.status(400).json({ error: "mode must be 'fill' or 'keyboard'" });
+    if (mode !== 'fill' && mode !== 'keyboard' && mode !== 'human') {
+      return res.status(400).json({ error: "mode must be 'fill', 'keyboard' or 'human'" });
     }
     if (typeof text !== 'string') {
       return res.status(400).json({ error: 'text is required' });
     }
     // keyboard mode: ref/selector are optional (types into current focus)
-    if (mode === 'fill' && !ref && !selector) {
-      return res.status(400).json({ error: 'ref or selector required for mode=fill' });
+    if ((mode === 'fill' || mode === 'human' || human) && !ref && !selector) {
+      return res.status(400).json({ error: 'ref or selector required' });
     }
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
@@ -4407,11 +4864,36 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
       }
       
-      if (mode === 'fill') {
+      if (mode === 'fill' && !human) {
         if (locator) {
           await fillLocator(locator, text);
         } else {
           await fillLocator(tabState.page.locator(selector), text);
+        }
+      } else if (human || mode === 'human') {
+        // Human typing: glide the real pointer to the field, click it, then
+        // emit one real key event per character with jittered cadence and an
+        // occasional think-pause. DataDome and friends watch keystroke timing;
+        // an instant value-set looks nothing like a person.
+        const baseDelay = typeof delay === 'number' ? delay : 75;
+        const target = locator || tabState.page.locator(selector).first();
+        const box = await target.boundingBox({ timeout: 5000 }).catch(() => null);
+        if (box) {
+          const cx = box.x + box.width / 2;
+          const cy = box.y + box.height / 2;
+          await tabState.page.mouse.move(cx, cy, { steps: 3 });
+          await tabState.page.waitForTimeout(80 + Math.floor(Math.random() * 120));
+          await tabState.page.mouse.down();
+          await tabState.page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+          await tabState.page.mouse.up();
+        } else {
+          await target.click({ timeout: 10000 }).catch(() => {});
+        }
+        await tabState.page.waitForTimeout(120 + Math.floor(Math.random() * 200));
+        await target.fill('').catch(() => {});
+        for (const ch of String(text)) {
+          await tabState.page.keyboard.type(ch, { delay: baseDelay + Math.floor(Math.random() * 90) });
+          if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500));
         }
       } else {
         // keyboard mode -- char-by-char real key events (required for Ember/contenteditable)
@@ -4420,7 +4902,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         } else if (selector) {
           await tabState.page.focus(selector, { timeout: 10000 });
         }
-        await tabState.page.keyboard.type(text, { delay });
+        await tabState.page.keyboard.type(text, { delay: delay ?? 30 });
       }
       if (shouldSubmit) await tabState.page.keyboard.press('Enter');
     });
@@ -4432,7 +4914,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     if (err.message?.includes('timed out') || err.message?.includes('not an <input>')) {
       try {
         const session = sessions.get(normalizeUserId(req.body.userId));
-        const found = session && findTab(session, tabId);
+        const found = findTab(session, tabId);
         if (found?.tabState?.page && !found.tabState.page.isClosed()) {
           found.tabState.refs = await refreshTabRefs(found.tabState, { reason: 'type_timeout' });
           found.tabState.lastSnapshot = null;
@@ -4509,14 +4991,14 @@ app.post('/tabs/:tabId/select', async (req, res) => {
   try {
     const { userId, ref, selector, option } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
     if ((!ref && !selector) || typeof option !== 'string' || !option) {
       return res.status(400).json({ error: 'ref or selector and a nonempty option are required' });
     }
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     await withTabLock(tabId, async () => {
@@ -4590,9 +5072,9 @@ app.post('/tabs/:tabId/press', async (req, res) => {
   try {
     const { userId, key } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -4656,13 +5138,176 @@ app.post('/tabs/:tabId/press', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
+// Human-like pointer movement
+/**
+ * @openapi
+ * /tabs/{tabId}/mouse:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Move the real pointer like a human
+ *     description: >
+ *       Emits trusted Playwright mouse motion: wander N points, move to {x,y},
+ *       or hover a {selector}. Point-to-point moves with jittered dwell time.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               moves:
+ *                 type: integer
+ *               x:
+ *                 type: number
+ *               y:
+ *                 type: number
+ *               selector:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Pointer moved.
+ *       404:
+ *         description: Tab not found.
+ */
+app.post('/tabs/:tabId/mouse', async (req, res) => {
+  try {
+    const { userId, moves = 3, x, y, selector } = req.body || {};
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    const page = tabState.page;
+    const rnd = (n) => Math.floor(Math.random() * n);
+
+    const vp = (await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }))
+      .catch(() => null)) || { w: 1280, h: 800 };
+
+    const path = [];
+    if (selector) {
+      const box = await page.locator(selector).first().boundingBox({ timeout: 5000 }).catch(() => null);
+      if (box) path.push([box.x + box.width / 2, box.y + box.height / 2]);
+    } else if (typeof x === 'number' && typeof y === 'number') {
+      path.push([x, y]);
+    }
+    if (!path.length) {
+      const hops = Math.max(1, Math.min(8, moves));
+      for (let i = 0; i < hops; i++) path.push([40 + rnd(Math.max(1, vp.w - 80)), 60 + rnd(Math.max(1, vp.h - 120))]);
+    }
+    for (const [tx, ty] of path) {
+      // Direct point-to-point: a many-step jittered "wiggle" trips DataDome.
+      await page.mouse.move(tx, ty, { steps: 3 });
+      await page.waitForTimeout(120 + rnd(400));
+    }
+    res.json({ ok: true, moves: path.length });
+  } catch (err) {
+    log('error', 'mouse failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// DataDome slide-to-confirm
+/**
+ * @openapi
+ * /tabs/{tabId}/slide:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Solve a DataDome slide puzzle with a human drag curve
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Drag result.
+ *       404:
+ *         description: Tab not found.
+ */
+app.post('/tabs/:tabId/slide', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    const page = tabState.page;
+
+    const frame = page.frames().find((f) => /captcha-delivery\.com/.test(f.url() || ''));
+    if (!frame) return res.json({ ok: false, reason: 'no captcha frame' });
+
+    const HANDLE = ['.slider-control', '.slider .slider-control', '[class*="slider"] [class*="control"]',
+      '.sliderContainer .slider', '[class*="slider"] [draggable]', '.slider', '#ddv1-captcha-container [class*="slider"]'];
+    let handle = null;
+    for (const sel of HANDLE) {
+      const loc = frame.locator(sel).first();
+      const box = await loc.boundingBox({ timeout: 5000 }).catch(() => null);
+      if (box && box.width > 8 && box.width < 160 && box.height > 8) { handle = box; break; }
+    }
+    if (!handle) return res.json({ ok: false, reason: 'no slider handle' });
+
+    const track = await frame.locator('.slider, [class*="sliderContainer"], [class*="slider-track"]').first().boundingBox({ timeout: 5000 }).catch(() => null);
+    const dx = Math.round((track ? track.width : 280) - handle.width * 0.5);
+
+    const sx = handle.x + handle.width / 2;
+    const sy = handle.y + handle.height / 2;
+    await page.mouse.move(sx, sy, { steps: 4 });
+    await page.waitForTimeout(120 + Math.floor(Math.random() * 160));
+    await page.mouse.down();
+
+    const steps = 28 + Math.floor(Math.random() * 14);
+    const overshoot = 6 + Math.floor(Math.random() * 10);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const eased = 0.5 - Math.cos(Math.PI * t) / 2;
+      const px = sx + (dx + overshoot) * eased;
+      const py = sy + (Math.random() * 3 - 1.5);
+      await page.mouse.move(px, py, { steps: 1 });
+      await page.waitForTimeout(8 + Math.floor(Math.random() * 22));
+    }
+    await page.waitForTimeout(60 + Math.floor(Math.random() * 80));
+    await page.mouse.move(sx + dx, sy, { steps: 3 });
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+    await page.mouse.up();
+    await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
+
+    const stillThere = !!page.frames().find((f) => /captcha-delivery\.com/.test(f.url() || ''));
+    res.json({ ok: true, dragged: dx, solved: !stillThere });
+  } catch (err) {
+    log('error', 'slide failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 app.post('/tabs/:tabId/scroll', async (req, res) => {
   try {
     const { userId, direction = 'down', amount = 500 } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -4747,9 +5392,9 @@ app.post('/tabs/:tabId/viewport', async (req, res) => {
       return res.status(400).json({ error: 'width and height required (100..4000 px)' });
     }
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
 
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -4813,9 +5458,9 @@ app.post('/tabs/:tabId/back', async (req, res) => {
   try {
     const { userId } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -4891,9 +5536,9 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
   try {
     const { userId } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -4959,9 +5604,9 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
   try {
     const { userId } = req.body;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, tabId);
+    const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -5029,12 +5674,12 @@ app.get('/tabs/:tabId/links', async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const offset = parseInt(req.query.offset) || 0;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) {
       log('warn', 'links: tab not found', { reqId: req.reqId, tabId: req.params.tabId, userId, hasSession: !!session });
       return tabNotFoundResponse(res, req.params.tabId);
     }
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
@@ -5103,7 +5748,7 @@ app.post('/tabs/:tabId/fetch-current-resource', async (req, res) => {
   try {
     const userId = req.body?.userId;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId);
     const { tabState } = found;
     const url = tabState.page.url();
@@ -5140,7 +5785,7 @@ app.post('/tabs/:tabId/fetch-current-resource', async (req, res) => {
     const filename = pathname.split('/').pop() || 'document.pdf';
     const download = await captureFetchedResource(tabState, { url, mimeType, filename, body });
     tabState.toolCalls++;
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     res.json({ tabId: req.params.tabId, download });
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'fetch_current_resource').inc();
@@ -5201,9 +5846,9 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
     const maxBytesRaw = Number(req.query.maxBytes);
     const maxBytes = Number.isFinite(maxBytesRaw) && maxBytesRaw > 0 ? maxBytesRaw : MAX_DOWNLOAD_INLINE_BYTES;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
 
     const { tabState } = found;
     tabState.toolCalls++;
@@ -5277,9 +5922,9 @@ app.get('/tabs/:tabId/images', async (req, res) => {
     const maxBytes = Number.isFinite(maxBytesRaw) && maxBytesRaw > 0 ? maxBytesRaw : MAX_DOWNLOAD_INLINE_BYTES;
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 20) : 8;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
 
     const { tabState } = found;
     tabState.toolCalls++;
@@ -5313,6 +5958,25 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *       - name: selector
+ *         in: query
+ *         schema:
+ *           type: string
+ *         description: Capture only this CSS-selected element.
+ *       - name: format
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: [png, jpeg]
+ *       - name: quality
+ *         in: query
+ *         schema:
+ *           type: integer
+ *         description: JPEG quality (1..100).
+ *       - name: fullPage
+ *         in: query
+ *         schema:
+ *           type: boolean
  *     responses:
  *       200:
  *         description: Screenshot.
@@ -5339,15 +6003,24 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
   try {
     const userId = req.query.userId;
     const fullPage = req.query.fullPage === 'true';
+    const selector = req.query.selector;
+    const format = req.query.format === 'jpeg' ? 'jpeg' : 'png';
+    const qualityRaw = Number(req.query.quality);
+    const quality = Number.isFinite(qualityRaw) && qualityRaw > 0 && qualityRaw <= 100
+      ? Math.round(qualityRaw)
+      : undefined;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
-    
+    if (session) session.lastAccess = Date.now();
+
     const { tabState } = found;
-    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    const options = { type: format, ...(format === 'jpeg' && quality ? { quality } : {}) };
+    const buffer = selector
+      ? await tabState.page.locator(selector).first().screenshot({ ...options, timeout: 10000 })
+      : await tabState.page.screenshot({ ...options, fullPage });
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
-    res.set('Content-Type', 'image/png');
+    res.set('Content-Type', format === 'jpeg' ? 'image/jpeg' : 'image/png');
     res.send(buffer);
   } catch (err) {
     log('error', 'screenshot failed', { reqId: req.reqId, error: err.message });
@@ -5407,9 +6080,9 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
   try {
     const userId = req.query.userId;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     
     const { tabState, listItemId } = found;
     res.json({
@@ -5498,10 +6171,10 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     if (!expression) return res.status(400).json({ error: 'expression is required' });
 
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
 
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
@@ -5643,10 +6316,10 @@ app.post('/tabs/:tabId/extract', express.json({ limit: '256kb' }), async (req, r
     if (!check.ok) return res.status(400).json({ error: check.error });
 
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
+    const found = findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
 
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
 
@@ -5707,21 +6380,124 @@ app.post('/tabs/:tabId/extract', express.json({ limit: '256kb' }), async (req, r
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
+// Get recorded video
+/**
+ * @openapi
+ * /tabs/{tabId}/video:
+ *   get:
+ *     tags: [Content]
+ *     summary: Download a tab recording
+ *     description: >
+ *       Streams the .webm recorded for a tab opened with
+ *       `POST /tabs { recordVideo }`. The first call finalizes the recording
+ *       (stops the frame timer / ffmpeg and closes the context). A tab opened
+ *       without recordVideo returns 400; an unknown/expired recording 404/410.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: WebM video.
+ *         content:
+ *           video/webm:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       400:
+ *         description: Tab exists but was not opened with recordVideo.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Recorded tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/tabs/:tabId/video', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const tabId = req.params.tabId;
+    const recorded = dedicatedTabs.get(tabId);
+    if (!recorded || recorded.userId !== normalizeUserId(userId)) {
+      return res.status(404).json({ error: 'recorded tab not found' });
+    }
+    if (!recorded.ffmpegProcess && !recorded.frameRecorder && !recorded.videoPath) {
+      return res.status(400).json({
+        error: 'this tab was not opened with recordVideo - no video to fetch.',
+      });
+    }
+
+    await finalizeRecording(recorded, 'get');
+
+    if (!recorded.videoPath) {
+      return res.status(409).json({
+        error: 'no video produced - the tab closed before any frame was captured',
+      });
+    }
+    let stat;
+    try {
+      stat = fs.statSync(recorded.videoPath);
+    } catch {
+      return res.status(410).json({ error: 'video file gone (grace window expired?)' });
+    }
+    res.setHeader('Content-Type', 'video/webm');
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('Cache-Control', 'no-store');
+    const stream = fs.createReadStream(recorded.videoPath);
+    stream.on('error', (err) => {
+      log('error', 'video stream failed', { reqId: req.reqId, tabId, error: err.message });
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+      else res.destroy(err);
+    });
+    stream.pipe(res);
+  } catch (err) {
+    log('error', 'video fetch failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 app.delete('/tabs/:tabId', async (req, res) => {
   try {
     const userId = req.query.userId || req.body?.userId;
     if (!userId) return res.status(400).json({ error: 'userId required (query or body)' });
+    const tabId = req.params.tabId;
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, req.params.tabId);
-    if (found) {
+    const found = findTab(session, tabId);
+    if (found && !found.dedicated) {
       if (found.tabState.navigateAbort) found.tabState.navigateAbort.abort();
       await clearTabDownloads(found.tabState);
       await safePageClose(found.tabState.page);
-      found.group.delete(req.params.tabId);
-      { const _l = tabLocks.get(req.params.tabId); if (_l) _l.drain(); tabLocks.delete(req.params.tabId); refreshTabLockQueueDepth(); }
+      found.group.delete(tabId);
+      { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
       dropEmptyTabGroup(session, found.listItemId, found.group);
       refreshActiveTabsGauge();
-      log('info', 'tab closed', { reqId: req.reqId, tabId: req.params.tabId, userId });
+      log('info', 'tab closed', { reqId: req.reqId, tabId, userId });
+      return res.json({ ok: true });
+    }
+
+    // Dedicated-context tabs own their context (and maybe a recorder).
+    const dedicated = dedicatedTabs.get(tabId);
+    if (dedicated) {
+      if (dedicated.tabState.navigateAbort) dedicated.tabState.navigateAbort.abort();
+      await clearTabDownloads(dedicated.tabState);
+      await finalizeRecording(dedicated, 'delete');
+      const lock = tabLocks.get(tabId);
+      if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+      scheduleDedicatedTabCleanup(tabId);
+      refreshActiveTabsGauge();
+      log('info', 'dedicated tab closed', { reqId: req.reqId, tabId, userId });
     }
     res.json({ ok: true });
   } catch (err) {
@@ -6131,6 +6907,9 @@ if (FLY_MACHINE_ID) {
 setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
+    // TAB_INACTIVITY_MS=0 disables reaping entirely (a human signing in makes no
+    // API calls). keepAlive marks a session whose tabs must survive idle time.
+    if (TAB_INACTIVITY_MS <= 0 || session.keepAlive) continue;
     for (const [listItemId, group] of session.tabGroups) {
       for (const [tabId, tabState] of group) {
         if (!tabState._lastReaperCheck) {
@@ -6327,25 +7106,36 @@ app.get('/', (req, res) => {
 app.get('/tabs', async (req, res) => {
   try {
     const userId = req.query.userId;
-    const session = sessions.get(normalizeUserId(userId));
-    
-    if (!session) {
-      return res.json({ running: true, tabs: [] });
-    }
-    
+    const key = normalizeUserId(userId);
+    const session = sessions.get(key);
+
     const tabs = [];
-    for (const [listItemId, group] of session.tabGroups) {
-      for (const [tabId, tabState] of group) {
-        tabs.push({
-          targetId: tabId,
-          tabId,
-          url: tabState.page.url(),
-          title: await tabState.page.title().catch(() => ''),
-          listItemId
-        });
+    if (session) {
+      for (const [listItemId, group] of session.tabGroups) {
+        for (const [tabId, tabState] of group) {
+          tabs.push({
+            targetId: tabId,
+            tabId,
+            url: tabState.page.url(),
+            title: await tabState.page.title().catch(() => ''),
+            listItemId,
+          });
+        }
       }
     }
-    
+    // Dedicated-context tabs (recording / custom viewport) belong to the same
+    // user but live outside session.tabGroups.
+    for (const [tabId, entry] of dedicatedTabs) {
+      if (entry.userId !== key) continue;
+      tabs.push({
+        targetId: tabId,
+        tabId,
+        url: entry.tabState.page.url(),
+        title: await entry.tabState.page.title().catch(() => ''),
+        listItemId: entry.listItemId,
+      });
+    }
+
     res.json({ running: true, tabs });
   } catch (err) {
     log('error', 'list tabs failed', { reqId: req.reqId, error: err.message });
@@ -6612,7 +7402,7 @@ app.post('/navigate', async (req, res) => {
     if (urlErr) return res.status(400).json({ error: urlErr });
     
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, targetId);
+    const found = findTab(session, targetId);
     if (!found) {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
@@ -6708,7 +7498,7 @@ app.get('/snapshot', async (req, res) => {
     }
     
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, targetId);
+    const found = findTab(session, targetId);
     if (!found) {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
@@ -6878,7 +7668,7 @@ app.post('/act', async (req, res) => {
     }
     
     const session = sessions.get(normalizeUserId(userId));
-    const found = session && findTab(session, targetId);
+    const found = findTab(session, targetId);
     if (!found) {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }

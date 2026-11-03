@@ -95,11 +95,19 @@ describe('loadConfig', () => {
   test('preserves zero timeout values to disable session expiry and idle shutdown', () => {
     process.env.SESSION_TIMEOUT_MS = '0';
     process.env.BROWSER_IDLE_TIMEOUT_MS = '0';
-
     const config = loadConfig();
 
     expect(config.sessionTimeoutMs).toBe(0);
     expect(config.browserIdleTimeoutMs).toBe(0);
+  });
+
+  test('CAMOFOX_HEADFUL selects the desktop (visible window) launch path', () => {
+    delete process.env.CAMOFOX_HEADFUL;
+    expect(loadConfig().headful).toBe(false);
+    process.env.CAMOFOX_HEADFUL = 'true';
+    expect(loadConfig().headful).toBe(true);
+    process.env.CAMOFOX_HEADFUL = '1';
+    expect(loadConfig().headful).toBe(true);
   });
 
   test('uses default timeout values when timeout environment variables are unset or invalid', () => {
