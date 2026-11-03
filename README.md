@@ -1,3 +1,18 @@
+# Bureau Browser
+
+Bureau Browser is a fork of [camofox-browser](https://github.com/askjo/camofox-browser) (MIT, (c) Jo, Inc) - an anti-detection browser server for AI agents powered by Camoufox. This fork adds:
+
+- per-tab video recording (ffmpeg frame-grab, x11grab opt-in)
+- auth-gated checkpoint session persistence
+- httpOnly / partitioned cookie-jar persistence (bounded on write)
+- human-input primitives + anti-bot helpers
+- headful mode (`CAMOFOX_HEADFUL`) + persistent profiles (`CAMOFOX_PROFILE_DIR`)
+- hardened Docker (non-root uid 1001, writable HOME)
+
+Package name: `@bureau-browser/browser` (previously `@askjo/camofox-browser`).
+
+---
+
 <div align="center">
   <img src="fox.png" alt="camofox-browser" width="200" />
   <h1>camofox-browser</h1>
@@ -80,7 +95,7 @@ The Docker image includes yt-dlp. For local dev, install it for the `/youtube/tr
 ### OpenClaw Plugin
 
 ```bash
-openclaw plugins install @askjo/camofox-browser
+openclaw plugins install @bureau-browser/browser
 ```
 
 **Tools:** `camofox_create_tab`  |  `camofox_snapshot`  |  `camofox_click`  |  `camofox_type`  |  `camofox_navigate`  |  `camofox_scroll`  |  `camofox_screenshot`  |  `camofox_close_tab`  |  `camofox_list_tabs`  |  `camofox_import_cookies`
@@ -766,7 +781,7 @@ npm run test:debug    # with server output
 ## npm
 
 ```bash
-npm install @askjo/camofox-browser
+npm install @bureau-browser/browser
 ```
 
 ## Credits
