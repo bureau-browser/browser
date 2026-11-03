@@ -26,8 +26,19 @@ import {
   startMemoryReporter, stopMemoryReporter,
 } from './lib/metrics.js';
 import { actionFromReq, classifyError } from './lib/request-utils.js';
+import {
+  initWindowTrace,
+  traceContextCreated,
+  traceContextClosed,
+  traceAllContextsClosed,
+  tracePageCreated,
+  tracePageClosed,
+  newTracedPage,
+  closeTracedContext,
+} from './lib/window-trace.js';
 
 const CONFIG = loadConfig();
+initWindowTrace(CONFIG.traceWindows);
 
 const {
   requestsTotal, requestDuration, pageLoadDuration,
@@ -678,7 +689,8 @@ async function withUserLimit(userId, operation) {
   }
 }
 
-async function safePageClose(page) {
+async function safePageClose(page, reason = 'page-close', fields = {}) {
+  tracePageClosed(page, reason, fields);
   try {
     await Promise.race([
       page.close(),
@@ -734,6 +746,7 @@ function scheduleBrowserIdleShutdown() {
         log('info', 'browser idle shutdown (no sessions)');
         const b = browser;
         browser = null;
+        traceAllContextsClosed('idle-shutdown');
         await b.close().catch(() => {});
       }
     }, BROWSER_IDLE_TIMEOUT_MS);
@@ -787,9 +800,10 @@ async function restartBrowser(reason) {
   log('error', 'restarting browser', { reason, failures: healthState.consecutiveNavFailures });
   try {
     for (const [, session] of sessions) {
-      await session.context.close().catch(() => {});
+      await closeTracedContext(session.context, 'restart', { restartReason: reason }).catch(() => {});
     }
     sessions.clear();
+    traceAllContextsClosed('restart', { restartReason: reason });
     if (browser) {
       // close() can itself hang on a wedged browser — bound it, then abandon
       // the (possibly orphaned) process and relaunch rather than block recovery.
@@ -827,11 +841,11 @@ let browserLaunchProxy = null;
 async function probeGoogleSearch(candidateBrowser) {
   let context = null;
   try {
-    context = await candidateBrowser.newContext({
+    context = traceContextCreated(await candidateBrowser.newContext({
       viewport: { width: 1280, height: 720 },
       permissions: ['geolocation'],
-    });
-    const page = await context.newPage();
+    }), 'probe', { probe: 'google-launch' });
+    const page = await newTracedPage(context, 'probe', { probe: 'google-launch' });
     await page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(1200);
     await page.goto('https://www.google.com/search?q=weather%20today', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -844,7 +858,7 @@ async function probeGoogleSearch(candidateBrowser) {
       blocked,
     };
   } finally {
-    await context?.close().catch(() => {});
+    if (context) await closeTracedContext(context, 'probe-done', { probe: 'google-launch' }).catch(() => {});
   }
 }
 
@@ -983,9 +997,10 @@ async function ensureBrowser() {
       deadSessions: sessions.size,
     });
     for (const [userId, session] of sessions) {
-      await session.context.close().catch(() => {});
+      await closeTracedContext(session.context, 'browser-disconnected', { userId }).catch(() => {});
     }
     sessions.clear();
+    traceAllContextsClosed('browser-disconnected');
     // Clean up virtual display from dead browser before relaunching
     if (virtualDisplay) {
       virtualDisplay.kill();
@@ -1011,16 +1026,18 @@ async function ensureBrowser() {
 // retry once — connectivity is necessary but not sufficient for liveness.
 const NEW_CONTEXT_TIMEOUT_MS = Number(process.env.CAMOFOX_NEWCONTEXT_TIMEOUT_MS || 20000);
 
-async function createContextResilient(contextOptions) {
+async function createContextResilient(contextOptions, reason = 'session-create', fields = {}) {
   let b = await ensureBrowser();
   try {
-    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext');
+    const context = await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext');
+    return traceContextCreated(context, reason, fields);
   } catch (err) {
     if (!isTimeoutError(err)) throw err;
     log('warn', 'newContext timed out — browser connected but wedged, recycling', { error: err.message });
     await restartBrowser('newcontext_timeout');
     b = await ensureBrowser();
-    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext(retry)');
+    const context = await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext(retry)');
+    return traceContextCreated(context, reason, { ...fields, retried: true });
   }
 }
 
@@ -1029,7 +1046,7 @@ function normalizeUserId(userId) {
   return String(userId);
 }
 
-async function getSession(userId) {
+async function getSession(userId, reason = 'session-create', fields = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
   
@@ -1040,6 +1057,7 @@ async function getSession(userId) {
       session.context.pages();
     } catch (err) {
       log('warn', 'session context dead, recreating', { userId: key, error: err.message });
+      traceContextClosed(session.context, 'session-dead', { userId: key });
       session.context.close().catch(() => {});
       sessions.delete(key);
       session = null;
@@ -1063,6 +1081,7 @@ async function getSession(userId) {
         const diskAuth = authedPlatforms(JSON.parse(fs.readFileSync(f, 'utf8')).cookies);
         if ([...diskAuth].some((p) => !session.authed?.has(p))) {
           log('info', 'session jar gained auth, recreating to restore login', { userId: key, authed: [...diskAuth] });
+          traceContextClosed(session.context, 'session-auth-refresh', { userId: key });
           session.context.close().catch(() => {});
           sessions.delete(key);
           session = null;
@@ -1108,7 +1127,7 @@ async function getSession(userId) {
     }
     const restored = loadStorageState(key);
     if (restored) contextOptions.storageState = restored;
-    const context = await createContextResilient(contextOptions);
+    const context = await createContextResilient(contextOptions, reason, { userId: key, ...fields });
 
     if (restored) await restorePartitionedCookies(context, key, restored);
 
@@ -1228,7 +1247,7 @@ function destroyTab(session, tabId, reason) {
     if (group.has(tabId)) {
       const tabState = group.get(tabId);
       log('warn', 'destroying stuck tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason: reason || 'unknown' });
-      safePageClose(tabState.page);
+      safePageClose(tabState.page, 'tab-destroyed', { tabId, destroyReason: reason || 'unknown' });
       group.delete(tabId);
       if (group.size === 0) session.tabGroups.delete(listItemId);
       refreshActiveTabsGauge();
@@ -1261,7 +1280,7 @@ async function recycleOldestTab(session, reqId) {
   }
   if (!oldestTab) return null;
 
-  await safePageClose(oldestTab.page);
+  await safePageClose(oldestTab.page, 'tab-recycled', { tabId: oldestTabId });
   oldestGroup.delete(oldestTabId);
   if (oldestGroup.size === 0) session.tabGroups.delete(oldestGroupKey);
   const lock = tabLocks.get(oldestTabId);
@@ -1277,6 +1296,7 @@ function destroySession(userId) {
   const session = sessions.get(key);
   if (!session) return;
   log('warn', 'destroying dead session', { userId: key });
+  traceContextClosed(session.context, 'session-destroyed', { userId: key });
   session.context.close().catch(() => {});
   sessions.delete(key);
 }
@@ -1346,12 +1366,12 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   const key = normalizeUserId(userId);
   const oldSession = sessions.get(key);
   if (oldSession) {
-    await oldSession.context.close().catch(() => {});
+    await closeTracedContext(oldSession.context, 'session-replaced-google', { userId }).catch(() => {});
     sessions.delete(key);
   }
-  const session = await getSession(userId);
+  const session = await getSession(userId, 'session-create', { replacedForGoogle: true });
   const group = getTabGroup(session, sessionKey);
-  const page = await session.context.newPage();
+  const page = await newTracedPage(session.context, 'tab', { tabId, rotation: 'google' });
   const tabState = createTabState(page);
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
@@ -1905,7 +1925,7 @@ async function browserTranscript(reqId, url, videoId, lang) {
   return await withUserLimit('__yt_transcript__', async () => {
     await ensureBrowser();
     const session = await getSession('__yt_transcript__');
-    const page = await session.context.newPage();
+    const page = await newTracedPage(session.context, 'youtube-transcript');
 
     try {
       await page.addInitScript(() => {
@@ -2012,13 +2032,14 @@ async function browserTranscript(reqId, url, videoId, lang) {
         available_languages: meta.languages,
       };
     } finally {
-      await safePageClose(page);
+      await safePageClose(page, 'youtube-transcript-done');
       // Clean up phantom transcript session if no tabs remain
       const ytSession = sessions.get(normalizeUserId('__yt_transcript__'));
       if (ytSession) {
         let totalTabs = 0;
         for (const g of ytSession.tabGroups.values()) totalTabs += g.size;
         if (totalTabs === 0) {
+          traceContextClosed(ytSession.context, 'youtube-transcript-done');
           ytSession.context.close().catch(() => {});
           sessions.delete(normalizeUserId('__yt_transcript__'));
         }
@@ -2178,9 +2199,15 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
   const recordRestored = recordVideo ? loadStorageState(recordKey) : undefined;
   if (recordRestored) contextOptions.storageState = recordRestored;
 
-  const context = await b.newContext(contextOptions);
+  const context = traceContextCreated(await b.newContext(contextOptions), 'dedicated-tab', {
+    userId: recordKey,
+    tabId,
+    recorded: !!recordVideo,
+    width,
+    height,
+  });
   if (recordRestored) await restorePartitionedCookies(context, recordKey, recordRestored);
-  const page = await context.newPage();
+  const page = await newTracedPage(context, 'dedicated-tab', { tabId, recorded: !!recordVideo });
   const tabState = createTabState(page);
   attachDownloadListener(tabState, tabId);
 
@@ -2345,7 +2372,7 @@ app.post('/tabs', async (req, res) => {
 
       const group = getTabGroup(session, resolvedSessionKey);
 
-      const page = await session.context.newPage();
+      const page = await newTracedPage(session.context, 'tab', { userId, sessionKey: resolvedSessionKey });
       const tabId = fly.makeTabId();
       const tabState = createTabState(page);
       attachDownloadListener(tabState, tabId);
@@ -2398,7 +2425,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           }
         }
         {
-          const page = await session.context.newPage();
+          const page = await newTracedPage(session.context, 'tab', { userId, tabId, autoCreated: true });
           tabState = createTabState(page);
           attachDownloadListener(tabState, tabId, log);
           const group = getTabGroup(session, resolvedSessionKey);
@@ -2447,12 +2474,12 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           const key = normalizeUserId(userId);
           const oldSession = sessions.get(key);
           if (oldSession) {
-            await oldSession.context.close().catch(() => {});
+            await closeTracedContext(oldSession.context, 'session-replaced-google', { userId }).catch(() => {});
             sessions.delete(key);
           }
-          session = await getSession(userId);
+          session = await getSession(userId, 'session-create', { replacedForGoogle: true });
           const group = getTabGroup(session, currentSessionKey);
-          const page = await session.context.newPage();
+          const page = await newTracedPage(session.context, 'tab', { tabId, rotation: 'google' });
           tabState = createTabState(page);
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log);
@@ -3384,7 +3411,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
     const found = findTab(session, tabId);
     if (found) {
       await clearTabDownloads(found.tabState);
-      await safePageClose(found.tabState.page);
+      await safePageClose(found.tabState.page, 'tab-close', { tabId });
       found.group.delete(tabId);
       { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
       if (found.group.size === 0) {
@@ -3525,6 +3552,7 @@ async function finalizeRecording(recorded, reason) {
     const out = await recorded.frameRecorder.stop();
     if (!out) recorded.videoPath = undefined;
   }
+  traceContextClosed(recorded.context, 'dedicated-tab-close', { tabId: recorded.tabState?.tabId, closeReason: reason });
   await recorded.context.close().catch((err) =>
     log('warn', 'recorded context close failed', { reason, error: err.message })
   );
@@ -3670,7 +3698,7 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
     if (group) {
       for (const [tabId, tabState] of group) {
         await clearTabDownloads(tabState);
-        await safePageClose(tabState.page);
+        await safePageClose(tabState.page, 'tab-group-close', { tabId, listItemId: req.params.listItemId });
         const lock = tabLocks.get(tabId);
         if (lock) {
           lock.drain();
@@ -3696,7 +3724,7 @@ app.delete('/sessions/:userId', async (req, res) => {
     const session = sessions.get(userId);
     if (session) {
       await clearSessionDownloads(session);
-      await session.context.close();
+      await closeTracedContext(session.context, 'session-close', { userId });
       sessions.delete(userId);
       // Remove any lingering tab locks for the session
       for (const [listItemId, group] of session.tabGroups) {
@@ -3728,6 +3756,7 @@ setInterval(() => {
       sessionsExpiredTotal.inc();
       saveStorageState(userId, session.context).catch(() => {});
       clearSessionDownloads(session).catch(() => {});
+      traceContextClosed(session.context, 'session-expired', { userId });
       session.context.close().catch(() => {});
       sessions.delete(userId);
       refreshActiveTabsGauge();
@@ -3761,7 +3790,7 @@ setInterval(() => {
           if (idleMs >= TAB_INACTIVITY_MS) {
             tabsReapedTotal.inc();
             log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
-            safePageClose(tabState.page);
+            safePageClose(tabState.page, 'reaper', { tabId, idleMs });
             group.delete(tabId);
             { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
             refreshTabLockQueueDepth();
@@ -3780,6 +3809,7 @@ setInterval(() => {
       log('info', 'session empty after tab reaper, closing', { userId });
       saveStorageState(userId, session.context).catch(() => {});
       clearSessionDownloads(session).catch(() => {});
+      traceContextClosed(session.context, 'reaper', { userId });
       session.context.close().catch(() => {});
       sessions.delete(userId);
       sessionsExpiredTotal.inc();
@@ -3865,7 +3895,7 @@ app.post('/tabs/open', async (req, res) => {
     
     const group = getTabGroup(session, listItemId);
     
-    const page = await session.context.newPage();
+    const page = await newTracedPage(session.context, 'tab', { userId, openclaw: true });
     const tabId = fly.makeTabId();
     const tabState = createTabState(page);
     attachDownloadListener(tabState, tabId, log);
@@ -3908,6 +3938,7 @@ app.post('/stop', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     if (browser) {
+      traceAllContextsClosed('browser-stop');
       await browser.close().catch(() => {});
       browser = null;
     }
@@ -4237,7 +4268,7 @@ app.post('/act', async (req, res) => {
         }
         
         case 'close': {
-          await safePageClose(tabState.page);
+          await safePageClose(tabState.page, 'tab-close', { tabId: targetId, via: 'act' });
           found.group.delete(targetId);
           { const _l = tabLocks.get(targetId); if (_l) _l.drain(); tabLocks.delete(targetId); }
           return { ok: true, targetId };
@@ -4293,23 +4324,31 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await withTimeout(browser.newContext(), 5000, 'health probe newContext');
+    testContext = traceContextCreated(
+      await withTimeout(browser.newContext(), 5000, 'health probe newContext'),
+      'probe',
+      { probe: 'health' },
+    );
     // In HEADFUL mode a probe page is a real Firefox window: with no session
     // open, `newPage()` pops a visible window that closes a few ms later —
     // every ~2 min while idle. A context round-trip is already a live protocol
     // exchange with the browser process (a hung browser never answers it), so
     // headful stops there; headless keeps the full page-level probe.
     if (process.env.CAMOFOX_HEADFUL !== 'true') {
-      const page = await testContext.newPage();
+      const page = await newTracedPage(testContext, 'probe', { probe: 'health' });
       await page.goto('about:blank', { timeout: 5000 });
+      tracePageClosed(page, 'probe-done', { probe: 'health' });
       await page.close();
     }
-    await testContext.close();
+    await closeTracedContext(testContext, 'probe-done', { probe: 'health' });
     healthState.lastSuccessfulNav = Date.now();
   } catch (err) {
     failuresTotal.labels('health_probe', 'internal').inc();
     log('warn', 'health probe failed', { error: err.message, timeSinceSuccessMs: timeSinceSuccess });
-    if (testContext) await testContext.close().catch(() => {});
+    if (testContext) {
+      traceContextClosed(testContext, 'probe-failed', { probe: 'health' });
+      await testContext.close().catch(() => {});
+    }
     restartBrowser('health probe failed').catch(() => {});
   }
 }, 60_000);
@@ -4347,8 +4386,9 @@ async function gracefulShutdown(signal) {
   stopMemoryReporter();
 
   for (const [userId, session] of sessions) {
-    await session.context.close().catch(() => {});
+    await closeTracedContext(session.context, 'shutdown', { userId }).catch(() => {});
   }
+  traceAllContextsClosed('shutdown');
   if (browser) await browser.close().catch(() => {});
   process.exit(0);
 }
