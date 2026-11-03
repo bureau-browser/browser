@@ -92,13 +92,22 @@ describe('loadConfig', () => {
     expect(config.serverEnv.CAMOFOX_EVALUATE_MAX_BODY_SIZE).toBe('10mb');
   });
 
-  test('preserves zero timeout values to disable session expiry and idle shutdown', () => {
+  test('preserves zero timeout values to disable session expiry, idle shutdown and tab reaping', () => {
     process.env.SESSION_TIMEOUT_MS = '0';
     process.env.BROWSER_IDLE_TIMEOUT_MS = '0';
+    process.env.TAB_INACTIVITY_MS = '0';
     const config = loadConfig();
 
     expect(config.sessionTimeoutMs).toBe(0);
     expect(config.browserIdleTimeoutMs).toBe(0);
+    expect(config.tabInactivityMs).toBe(0);
+  });
+
+  test('TAB_INACTIVITY_MS unset or invalid falls back to 300000', () => {
+    delete process.env.TAB_INACTIVITY_MS;
+    expect(loadConfig().tabInactivityMs).toBe(300000);
+    process.env.TAB_INACTIVITY_MS = 'not-a-number';
+    expect(loadConfig().tabInactivityMs).toBe(300000);
   });
 
   test('CAMOFOX_HEADFUL selects the desktop (visible window) launch path', () => {
