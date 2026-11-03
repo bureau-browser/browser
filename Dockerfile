@@ -4,6 +4,13 @@
 # unaffected because that prebuild targets an older glibc.
 FROM node:22-trixie-slim AS camofox-browser
 
+# Run as a non-root user (uid 1001) to match the cluster securityContext
+# (runAsNonRoot / runAsUser: 1001). Camoufox resolves its binary cache via
+# $HOME, and /root is mode 700, so bake the cache under a writable home.
+ENV HOME=/home/camofox
+RUN groupadd -g 1001 camofox \
+    && useradd -u 1001 -g 1001 -m -d /home/camofox -s /usr/sbin/nologin camofox
+
 # Pinned Camoufox version for reproducible builds
 # Update these when upgrading Camoufox
 ARG CAMOUFOX_VERSION=152.0.4
@@ -47,6 +54,9 @@ RUN apt-get update && apt-get install -y \
     unzip \
     # yt-dlp runtime dependency
     python3-minimal \
+    # ffmpeg is the tab recorder backend (frame-grab assembly / x11grab).
+    # Playwright's Firefox recordVideo path does not work on Camoufox.
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-bake Camoufox browser binary into image (downloaded at build time)
@@ -60,13 +70,14 @@ RUN case "${TARGETARCH}" in \
       arm64) CAMOUFOX_ARCH="arm64" ;; \
       *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && mkdir -p /root/.cache/camoufox \
+    && mkdir -p "$HOME/.cache/camoufox" \
     && curl -fL -o /tmp/camoufox.zip "https://github.com/daijro/camoufox/releases/download/v${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}/camoufox-${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}-lin.${CAMOUFOX_ARCH}.zip" \
-    && (unzip -q /tmp/camoufox.zip -d /root/.cache/camoufox || true) \
+    && (unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox" || true) \
     && rm /tmp/camoufox.zip \
-    && chmod -R 755 /root/.cache/camoufox \
-    && echo "{\"version\":\"${CAMOUFOX_VERSION}\",\"release\":\"${CAMOUFOX_RELEASE}\"}" > /root/.cache/camoufox/version.json \
-    && test -f /root/.cache/camoufox/camoufox-bin && echo "Camoufox installed successfully"
+    && chmod -R 755 "$HOME/.cache/camoufox" \
+    && echo "{\"version\":\"${CAMOUFOX_VERSION}\",\"release\":\"${CAMOUFOX_RELEASE}\"}" > "$HOME/.cache/camoufox/version.json" \
+    && test -f "$HOME/.cache/camoufox/camoufox-bin" && echo "Camoufox installed successfully" \
+    && chown -R 1001:1001 "$HOME/.cache"
 
 # yt-dlp is installed and verified by the enabled YouTube plugin hook below.
 
@@ -100,6 +111,10 @@ COPY scripts/ ./scripts/
 
 # Install default plugin dependencies (apt packages + post-install hooks)
 RUN sh scripts/install-plugin-deps.sh
+
+# Hand the runtime user the writable parts of $HOME (cookies, profile, Xvfb).
+RUN chown -R 1001:1001 /home/camofox
+USER camofox
 
 ENV NODE_ENV=production
 ENV CAMOFOX_PORT=9377
