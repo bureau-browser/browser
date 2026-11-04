@@ -163,7 +163,10 @@ export async function register(app, ctx, pluginConfig = {}) {
   events.on('session:destroying', async ({ userId, reason }) => {
     const context = activeSessions.get(userId);
     if (context) {
-      if (reason !== 'storage_reset') {
+      // jar_auth_gained closes a context that is stale on purpose so the
+      // fresh on-disk login can be restored. Checkpointing it would write the
+      // old JSESSIONID/ct0 back over the new jar.
+      if (reason !== 'storage_reset' && reason !== 'jar_auth_gained') {
         await checkpoint(userId, context, reason).catch(() => {});
       }
       activeSessions.delete(userId);

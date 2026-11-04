@@ -61,6 +61,24 @@ describe('Typing and Enter', () => {
     }
   });
   
+  test('keyboard mode with delay and no selector types into the focused field without clearing it', async () => {
+    const client = createClient(serverUrl);
+
+    try {
+      const { tabId } = await client.createTab(`${testSiteUrl}/typing`);
+      await client.type(tabId, { selector: '#input', text: 'Hello ' });
+      await client.evaluate(tabId, "(() => { const el = document.querySelector('#input'); el.focus(); el.setSelectionRange(el.value.length, el.value.length); return true; })()");
+
+      const result = await client.type(tabId, { mode: 'keyboard', delay: 10, text: 'World' });
+      expect(result.ok).toBe(true);
+
+      const snapshot = await client.waitForSnapshotContains(tabId, 'Preview: Hello World');
+      expect(snapshot.snapshot).toContain('Hello World');
+    } finally {
+      await client.cleanup();
+    }
+  });
+
   test('type and press Enter navigates page', async () => {
     const client = createClient(serverUrl);
     

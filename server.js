@@ -9,6 +9,8 @@ import path from 'path';
 import { x11GrabAvailable, startFrameRecorder, startX11Grab, stopFfmpegAndWait } from './lib/video-recorder.js';
 import { runTabReaperTick } from './lib/tab-reaper.js';
 import { createContextResilient } from './lib/new-context.js';
+import { resolveTypeMode } from './lib/type-mode.js';
+import { TabLock, acquireForOp } from './lib/tab-lock.js';
 import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
 import { getSearchFallbacks } from './lib/search-fallbacks.js';
@@ -536,61 +538,19 @@ const TAB_LOCK_TIMEOUT_MS = 35000; // Must be > HANDLER_TIMEOUT_MS so active op 
 
 
 
-// Proper mutex for tab serialization. The old Promise-chain lock on timeout proceeded
-// WITHOUT the lock, allowing concurrent Playwright operations that corrupt CDP state.
-class TabLock {
-  constructor() {
-    this.queue = [];
-    this.active = false;
-  }
-
-  acquire(timeoutMs) {
-    return new Promise((resolve, reject) => {
-      const entry = { resolve, reject, timer: null };
-      entry.timer = setTimeout(() => {
-        const idx = this.queue.indexOf(entry);
-        if (idx !== -1) this.queue.splice(idx, 1);
-        tabLockTimeoutsTotal.inc();
-        refreshTabLockQueueDepth();
-        reject(new Error('Tab lock queue timeout'));
-      }, timeoutMs);
-      this.queue.push(entry);
-      refreshTabLockQueueDepth();
-      this._tryNext();
-    });
-  }
-
-  release() {
-    this.active = false;
-    this._tryNext();
-    refreshTabLockQueueDepth();
-  }
-
-  _tryNext() {
-    if (this.active || this.queue.length === 0) return;
-    this.active = true;
-    const entry = this.queue.shift();
-    clearTimeout(entry.timer);
-    refreshTabLockQueueDepth();
-    entry.resolve();
-  }
-
-  drain() {
-    this.active = true;
-    for (const entry of this.queue) {
-      clearTimeout(entry.timer);
-      entry.reject(new Error('Tab destroyed'));
-    }
-    this.queue = [];
-    refreshTabLockQueueDepth();
-  }
-}
-
 // Per-tab locks to serialize operations on the same tab
 const tabLocks = new Map(); // tabId -> TabLock
 
 function getTabLock(tabId) {
-  if (!tabLocks.has(tabId)) tabLocks.set(tabId, new TabLock());
+  if (!tabLocks.has(tabId)) {
+    tabLocks.set(tabId, new TabLock({
+      onTimeout: () => {
+        tabLockTimeoutsTotal.inc();
+        refreshTabLockQueueDepth();
+      },
+      onDepthChange: refreshTabLockQueueDepth,
+    }));
+  }
   return tabLocks.get(tabId);
 }
 
@@ -636,9 +596,11 @@ function scheduleFlush(userId, delayMs = 2000) {
 // regardless of how long it waited in the queue.
 async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout) {
   const lock = getTabLock(tabId);
-  // A queued op must be allowed to wait as long as the op ahead of it may
-  // legitimately run (for example a long human-typed fill), not a flat 35 s.
-  await lock.acquire(Math.max(TAB_LOCK_TIMEOUT_MS, timeoutMs));
+  // Wait for the current holder's remaining budget plus this op's own budget
+  // (never less than the legacy 35 s floor). A long human-typed fill can hold
+  // the tab for over a minute without a queued click dying in the queue and
+  // tearing the tab down mid-typing.
+  const release = await acquireForOp(lock, timeoutMs, TAB_LOCK_TIMEOUT_MS);
   try {
     const result = await withTimeout(operation(), timeoutMs, 'action');
     const owner = userIdForTab(tabId);
@@ -651,7 +613,7 @@ async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onT
     }
     throw err;
   } finally {
-    lock.release();
+    release();
   }
 }
 
@@ -1491,6 +1453,7 @@ async function getSession(userId, { trace = false, storageState } = {}) {
       }
       const contextOptions = {
         viewport: null,
+        permissions: ['geolocation'],
         ...contextIdentityOptions({
           hasProxy: !!proxyPool,
           directIdentity: CONFIG.directIdentity,
@@ -1721,13 +1684,11 @@ function handleRouteError(err, req, res, extraFields = {}) {
       }
     }
   }
-  // Lock queue timeout = tab is stuck. Destroy immediately.
+  // Lock queue timeout means the tab is busy, not necessarily broken. Do NOT
+  // destroy it: the holder may still be making progress (for example a long
+  // human-typed fill). The caller can retry or wait.
   if (userId && isTabLockQueueTimeout(err)) {
-    const session = sessions.get(normalizeUserId(userId));
-    if (session && tabId) {
-      destroyTab(session, tabId, 'lock_queue', userId);
-    }
-    return res.status(503).json({ error: 'Tab unresponsive and has been destroyed. Open a new tab.', code: 'tab_unresponsive', retryable: true, recovery: 'create_new_tab', ...extraFields });
+    return res.status(503).json({ error: 'Tab is busy with another operation. Retry shortly.', code: 'tab_unresponsive', retryable: true, recovery: 'retry', ...extraFields });
   }
   // Tab was destroyed while this request was queued in the lock
   if (isTabDestroyedError(err)) {
@@ -4968,6 +4929,12 @@ app.post('/tabs/:tabId/type', async (req, res) => {
   
   try {
     const { userId, ref, selector, text, mode = 'fill', delay, human = false, submit = false, pressEnter = false } = req.body;
+    let modePlan;
+    try {
+      modePlan = resolveTypeMode({ mode, human, delay });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
@@ -4976,9 +4943,6 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
-    if (mode !== 'fill' && mode !== 'keyboard' && mode !== 'human') {
-      return res.status(400).json({ error: "mode must be 'fill', 'keyboard' or 'human'" });
-    }
     if (typeof text !== 'string') {
       return res.status(400).json({ error: 'text is required' });
     }
@@ -5001,7 +4965,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       Math.ceil(String(text).length * (baseDelay + 90 + 120) + 5000)
     );
     const typeCancelled = { value: false };
-    const wantsHuman = human || mode === 'human' || delay != null;
+    const wantsHuman = modePlan.useHuman;
     const typeHuman = async (target) => {
       const box = await target.boundingBox({ timeout: 5000 }).catch(() => null);
       if (box) {

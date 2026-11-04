@@ -109,6 +109,21 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('jar_auth_gained destroys the stale context without checkpointing it', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+
+    const mockContext = { storageState: jest.fn(async ({ path: p }) => {
+      await fs.writeFile(p, JSON.stringify({ cookies: [{ name: 'old', value: 'stale', domain: '.x.com', path: '/' }] }));
+    }) };
+    await events.emitAsync('session:created', { userId: 'user-gain', context: mockContext });
+    await events.emitAsync('session:destroying', { userId: 'user-gain', reason: 'jar_auth_gained' });
+
+    expect(mockContext.storageState).not.toHaveBeenCalled();
+    const { getUserPersistencePaths } = await import('../../lib/persistence.js');
+    const { storageStatePath } = getUserPersistencePaths(tmpDir, 'user-gain');
+    await expect(fs.access(storageStatePath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   test('DELETE storage_state destroys the live session without checkpointing and removes persisted state', async () => {
     await register(mockApp, ctx, { profileDir: tmpDir });
 

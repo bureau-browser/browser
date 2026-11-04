@@ -18,8 +18,4 @@ describe('human typing budget and cancellation', () => {
     expect(serverSource).toContain('if (typeCancelled.value) break;');
     expect(serverSource).toContain('typeCancelled.value = true;');
   });
-
-  test('a queued tab operation waits as long as the op ahead of it', () => {
-    expect(serverSource).toContain('await lock.acquire(Math.max(TAB_LOCK_TIMEOUT_MS, timeoutMs));');
-  });
 });
