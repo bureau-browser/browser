@@ -3,7 +3,10 @@ import { createPageWithSessionRecovery } from '../../lib/new-page-recovery.js';
 
 const isTimeoutError = err => err.code === 'timeout';
 const isDeadContextError = err => err.code === 'dead_context';
-const withTimeout = promise => promise;
+const withTimeout = (promise, ms, label) => Promise.race([
+  promise,
+  new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+]);
 const log = jest.fn();
 
 function recoveryOptions(overrides) {
@@ -40,6 +43,45 @@ describe('createPageWithSessionRecovery', () => {
     expect(getSession).toHaveBeenCalledWith('user-1', { trace: false });
     expect(result).toMatchObject({ session: replacement, page });
     expect(result.lease).toMatchObject({ page, released: false });
+  });
+
+  test('three concurrent creations whose window.open always fails do not destroy the session', async () => {
+    class FakePage {
+      constructor(name = '') { this.name = name; }
+      isClosed() { return false; }
+      async evaluate(fn, arg) {
+        if (typeof arg === 'string') return null; // window.open opens nothing
+        if (String(fn).includes('window.name')) return this.name;
+        return null;
+      }
+      waitForEvent(event, { timeout } = {}) {
+        return new Promise((_, reject) => setTimeout(() => reject(new Error('popup timeout')), timeout || 500));
+      }
+    }
+    class FakeContext {
+      constructor() { this.pagesList = []; }
+      pages() { return this.pagesList; }
+      async newPage() { const page = new FakePage(); this.pagesList.push(page); return page; }
+      waitForEvent() { return Promise.reject(new Error('unused')); }
+    }
+
+    const context = new FakeContext();
+    const session = { context, pageLeases: new Set(), tabGroups: new Map() };
+    const destroySession = jest.fn();
+    const getSession = jest.fn();
+
+    const results = await Promise.all([0, 1, 2].map(() => createPageWithSessionRecovery(recoveryOptions({
+      session,
+      timeoutMs: 800,
+      isTimeoutError: (err) => /timed out after/.test(err.message),
+      currentSession: () => session,
+      destroySession,
+      getSession,
+    }))));
+
+    expect(destroySession).not.toHaveBeenCalled();
+    expect(getSession).not.toHaveBeenCalled();
+    expect(new Set(results.map((r) => r.page)).size).toBe(3);
   });
 
   test('does not destroy a session another request already replaced', async () => {

@@ -698,10 +698,11 @@
           {
             "name": "userId",
             "in": "query",
+            "required": true,
             "schema": {
               "type": "string"
             },
-            "description": "Filter by session owner."
+            "description": "Session owner."
           }
         ],
         "responses": {
@@ -734,11 +735,24 @@
                           },
                           "listItemId": {
                             "type": "string"
+                          },
+                          "contextId": {
+                            "type": "string"
                           }
                         }
                       }
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing userId.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -2213,11 +2227,19 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "meta",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Return JSON with base64 data plus the real width and height instead of raw bytes."
           }
         ],
         "responses": {
           "200": {
-            "description": "Screenshot.",
+            "description": "Screenshot bytes, or a JSON metadata envelope when meta=1.",
             "content": {
               "application/json": {
                 "schema": {

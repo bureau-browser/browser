@@ -9,8 +9,12 @@ import path from 'path';
 import { x11GrabAvailable, startFrameRecorder, startX11Grab, stopFfmpegAndWait } from './lib/video-recorder.js';
 import { runTabReaperTick } from './lib/tab-reaper.js';
 import { createContextResilient } from './lib/new-context.js';
+import { imageSize } from './lib/image-size.js';
+import { fillLocator } from './lib/fill.js';
 import { resolveTypeMode } from './lib/type-mode.js';
 import { TabLock, acquireForOp, handleTabLockQueueTimeout } from './lib/tab-lock.js';
+import { TAB_OPEN_PREFS, createPageInContext, consumeProgrammaticPopupName, isAnchorPage, readWindowNameBounded } from './lib/tab-pages.js';
+import { initWindowTrace, traceContextCreated, traceContextClosed, traceAllContextsClosed, tracePageCreated } from './lib/window-trace.js';
 import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
 import { getSearchFallbacks } from './lib/search-fallbacks.js';
@@ -72,6 +76,7 @@ import {
 } from './lib/browser-errors.js';
 
 const CONFIG = loadConfig();
+initWindowTrace(CONFIG.traceWindows);
 
 // --- Crash reporter (opt-in, anonymized GitHub issues) ---
 import { readFileSync } from 'fs';
@@ -261,31 +266,6 @@ function selectorValidationError(selector) {
 
 function invalidSelectorError(message) {
   return Object.assign(new Error(message), { code: 'invalid_selector', statusCode: 400 });
-}
-
-const NON_FILLABLE_INPUT_TYPES = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit']);
-
-async function assertLocatorFillable(locator) {
-  const info = await locator.evaluate((el) => {
-    const tagName = el.tagName?.toLowerCase?.() || '';
-    const type = tagName === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : '';
-    const role = el.getAttribute?.('role') || '';
-    const contentEditable = el.isContentEditable;
-    return { tagName, type, role, contentEditable };
-  });
-  if (info.contentEditable || info.tagName === 'textarea') return;
-  if (info.tagName === 'input' && !NON_FILLABLE_INPUT_TYPES.has(info.type)) return;
-  if (info.role === 'textbox' || info.role === 'searchbox') return;
-  const target = info.type ? `${info.tagName}[type=${info.type}]` : (info.role ? `${info.tagName}[role=${info.role}]` : info.tagName || 'element');
-  throw Object.assign(new Error(`Element ${target} is not fillable. Use click for buttons and other controls.`), {
-    code: 'element_not_actionable',
-    statusCode: 422,
-  });
-}
-
-async function fillLocator(locator, text) {
-  await assertLocatorFillable(locator);
-  await locator.fill(text, { timeout: 10000 });
 }
 
 function safeError(err) {
@@ -509,6 +489,28 @@ const sessions = new Map();
 // findTab() falls through to this map, so every existing /tabs/:id/* route
 // works on dedicated tabs without call-site changes.
 const dedicatedTabs = new Map(); // tabId -> { tabState, context, userId, listItemId, ... }
+const contextIds = new WeakMap();
+let contextSeq = 0;
+function contextIdFor(context) {
+  if (!context) return null;
+  if (!contextIds.has(context)) contextIds.set(context, `ctx-${++contextSeq}`);
+  return contextIds.get(context);
+}
+
+// Top-level Firefox windows: one per session context (the anchor page is the
+// window) plus one per dedicated recording/viewport context. Approximate: a
+// window created by the newPage fallback inside a context that already has an
+// anchor is not tracked separately.
+function countTopLevelWindows() {
+  let windows = 0;
+  for (const session of sessions.values()) {
+    try {
+      if (session.context.pages().some((page) => isAnchorPage(page))) windows++;
+    } catch { /* dead context */ }
+  }
+  windows += dedicatedTabs.size;
+  return windows;
+}
 // Closed recordings whose .webm is still inside the grace window. Kept apart
 // from dedicatedTabs so a closed tab disappears from GET /tabs and stops
 // counting against MAX_TABS_GLOBAL immediately, while GET /video can still
@@ -874,9 +876,9 @@ function getTotalTabCount() {
   let total = dedicatedTabs.size;
   for (const session of sessions.values()) {
     try {
-      // Use real Playwright page count so leaked pages exert backpressure
-      // on MAX_TABS_GLOBAL, surfacing leaks before Firefox starves.
-      total += session.context.pages().length;
+      // Use the real Playwright page count so leaked pages exert backpressure
+      // on MAX_TABS_GLOBAL, but never count our internal about:blank anchor.
+      total += session.context.pages().filter((page) => !isAnchorPage(page)).length;
     } catch (_) {
       // Context is dead — fall back to bookkeeping count for this session.
       for (const group of session.tabGroups.values()) total += group.size;
@@ -982,6 +984,7 @@ function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
  */
 async function closeBrowserFully(reason) {
   if (_browserClosePromise) return _browserClosePromise;
+  traceAllContextsClosed(reason);
   _browserClosePromise = _closeBrowserFullyImpl(reason);
   try {
     return await _browserClosePromise;
@@ -1201,6 +1204,7 @@ async function launchBrowserInstance() {
         headless: useVirtualDisplay ? false : !useDesktopWindow,
         os: hostOS,
         humanize: true,
+        firefox_user_prefs: { ...TAB_OPEN_PREFS },
         enable_cache: true,
         proxy: launchProxy,
         geoip: !!launchProxy,
@@ -1357,6 +1361,7 @@ async function closeSession(userId, session, {
     }
   }
 
+  traceContextClosed(session.context, reason, { userId: key });
   await session.context.close().catch(() => {});
   sessions.delete(key);
   await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
@@ -1475,14 +1480,14 @@ async function getSession(userId, { trace = false, storageState } = {}) {
         log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
-      const context = await createContextResilient(contextOptions, {
+      const context = traceContextCreated(await createContextResilient(contextOptions, {
         ensureBrowser,
         restartBrowser,
         timeoutMs: CONFIG.newContextTimeoutMs,
         withTimeout,
         isTimeoutError,
         log,
-      });
+      }), 'session-create', { userId: key });
 
       let tracePath = null;
       if (trace) {
@@ -1505,7 +1510,7 @@ async function getSession(userId, { trace = false, storageState } = {}) {
         const saved = await readStorageStateFile(jarPath, persistenceLogger);
         authed = new Set(authedPlatforms(saved?.cookies || []));
       }
-      const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath, jarMtime, authed };
+      const created = { context, contextId: contextIdFor(context), tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath, jarMtime, authed };
       sessions.set(key, created);
       await pluginEvents.emitAsync('session:created', { userId: key, context });
       log('info', 'session created', {
@@ -1524,7 +1529,8 @@ async function getSession(userId, { trace = false, storageState } = {}) {
 async function createLeasedPage(session) {
   const lease = acquirePageLease(session);
   try {
-    const page = setLeasedPage(lease, await session.context.newPage());
+    const created = await createPageInContext(session.context, { reason: 'tab', log });
+    const page = setLeasedPage(lease, created.page);
     return { page, lease };
   } catch (err) {
     releasePageLease(session, lease);
@@ -1937,7 +1943,12 @@ function createTabState(page) {
  * and recursively attaches itself to the new page.
  */
 function attachPopupHandler(page, userId, sessionKey) {
-  page.on('popup', (popupPage) => {
+  page.on('popup', async (popupPage) => {
+    // A page we opened ourselves with window.open (to get a tab) is already
+    // registered by the caller. Match its unique window name so a site popup
+    // cannot consume another creation's token.
+    const popupName = await readWindowNameBounded(popupPage, 1000);
+    if (consumeProgrammaticPopupName(popupName)) return;
     const key = normalizeUserId(userId);
     const currentSession = sessions.get(key);
     if (!currentSession || currentSession._closing) return;
@@ -3043,6 +3054,7 @@ app.get('/health', (req, res) => {
     browserConnected: running,
     browserRunning: running,
     activeTabs: getTotalTabCount(),
+    windows: countTopLevelWindows(),
     activeSessions: sessions.size,
     consecutiveFailures: Array.from(userNavHealth.values())
       .reduce((sum, h) => sum + h.consecutiveNavFailures, 0),
@@ -3217,14 +3229,14 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     if (restoredStatePath) contextOptions.storageState = restoredStatePath;
   }
 
-  const context = await createContextResilient(contextOptions, {
+  const context = traceContextCreated(await createContextResilient(contextOptions, {
     ensureBrowser,
     restartBrowser,
     timeoutMs: CONFIG.newContextTimeoutMs,
     withTimeout,
     isTimeoutError,
     log,
-  });
+  }), 'dedicated-tab', { userId: recordKey, tabId, recorded: !!recordVideo });
   if (restoredStatePath) {
     try {
       const saved = JSON.parse(fs.readFileSync(restoredStatePath, 'utf8'));
@@ -3245,7 +3257,9 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     }
   }
 
-  const page = await context.newPage();
+  const page = tracePageCreated(await context.newPage(), context, 'dedicated-tab', {
+    userId: recordKey, tabId, recorded: !!recordVideo,
+  });
   const tabState = createTabState(page);
   attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
 
@@ -3294,6 +3308,7 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     ffmpegProcess,
     userId: recordKey,
     listItemId: resolvedSessionKey,
+    contextId: contextIdFor(context),
     createdAt: Date.now(),
     recorded: !!recordVideo,
   });
@@ -3340,6 +3355,7 @@ async function finalizeRecording(recorded, reason) {
     const out = await recorded.frameRecorder.stop();
     if (!out) recorded.videoPath = undefined;
   }
+  traceContextClosed(recorded.context, 'dedicated-tab-close', { closeReason: reason });
   await recorded.context.close().catch((err) =>
     log('warn', 'recorded context close failed', { reason, error: err.message })
   );
@@ -5009,7 +5025,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         if (locator) {
           await fillLocator(locator, text);
         } else {
-          await fillLocator(tabState.page.locator(selector), text);
+          await fillLocator(tabState.page.locator(selector).first(), text);
         }
       } else if (wantsHuman) {
         await typeHuman(locator || tabState.page.locator(selector).first());
@@ -6098,9 +6114,14 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *         in: query
  *         schema:
  *           type: boolean
+ *       - name: meta
+ *         in: query
+ *         schema:
+ *           type: boolean
+ *         description: Return JSON with base64 data plus the real width and height instead of raw bytes.
  *     responses:
  *       200:
- *         description: Screenshot.
+ *         description: Screenshot bytes, or a JSON metadata envelope when meta=1.
  *         content:
  *           application/json:
  *             schema:
@@ -6141,7 +6162,25 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
       ? await tabState.page.locator(selector).first().screenshot({ ...options, timeout: 10000 })
       : await tabState.page.screenshot({ ...options, fullPage });
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
-    res.set('Content-Type', format === 'jpeg' ? 'image/jpeg' : 'image/png');
+    const size = imageSize(buffer);
+    const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    if (size) {
+      res.set('X-Screenshot-Width', String(size.width));
+      res.set('X-Screenshot-Height', String(size.height));
+    }
+    if (req.query.meta === '1' || req.query.meta === 'true') {
+      return res.json({
+        screenshot: {
+          data: buffer.toString('base64'),
+          mimeType,
+          width: size?.width ?? null,
+          height: size?.height ?? null,
+        },
+        width: size?.width ?? null,
+        height: size?.height ?? null,
+      });
+    }
+    res.set('Content-Type', mimeType);
     res.send(buffer);
   } catch (err) {
     log('error', 'screenshot failed', { reqId: req.reqId, error: err.message });
@@ -7070,6 +7109,7 @@ setInterval(() => {
       for (const tabState of group.values()) registered.add(tabState.page);
     }
     for (const page of contextPages) {
+      if (isAnchorPage(page)) continue;
       if (!registered.has(page) && !isPageLeased(session, page)) {
         reaped++;
         page.removeAllListeners();
@@ -7178,10 +7218,17 @@ app.get('/', (req, res) => {
  *     parameters:
  *       - name: userId
  *         in: query
+ *         required: true
  *         schema:
  *           type: string
- *         description: Filter by session owner.
+ *         description: Session owner.
  *     responses:
+ *       400:
+ *         description: Missing userId.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       200:
  *         description: Tab list.
  *         content:
@@ -7206,15 +7253,20 @@ app.get('/', (req, res) => {
  *                         type: string
  *                       listItemId:
  *                         type: string
+ *                       contextId:
+ *                         type: string
  */
 app.get('/tabs', async (req, res) => {
   try {
     const userId = req.query.userId;
+    if (userId === undefined || userId === '') {
+      return res.status(400).json({ error: 'userId query parameter is required' });
+    }
     const key = normalizeUserId(userId);
-    const session = sessions.get(key);
 
     const tabs = [];
-    if (session) {
+    const sessionEntries = sessions.has(key) ? [[key, sessions.get(key)]] : [];
+    for (const [sessionUserId, session] of sessionEntries) {
       for (const [listItemId, group] of session.tabGroups) {
         for (const [tabId, tabState] of group) {
           tabs.push({
@@ -7223,6 +7275,7 @@ app.get('/tabs', async (req, res) => {
             url: tabState.page.url(),
             title: await tabState.page.title().catch(() => ''),
             listItemId,
+            contextId: session.contextId || contextIdFor(session.context),
           });
         }
       }
@@ -7237,6 +7290,7 @@ app.get('/tabs', async (req, res) => {
         url: entry.tabState.page.url(),
         title: await entry.tabState.page.title().catch(() => ''),
         listItemId: entry.listItemId,
+        contextId: entry.contextId || contextIdFor(entry.context),
       });
     }
 
@@ -7849,7 +7903,7 @@ app.post('/act', async (req, res) => {
             if (locator) {
               await fillLocator(locator, text);
             } else {
-              await fillLocator(tabState.page.locator(selector), text);
+              await fillLocator(tabState.page.locator(selector).first(), text);
             }
           } else {
             if (locator) {
@@ -7977,7 +8031,11 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await withTimeout(browser.newContext({ viewport: null }), 5000, 'health probe newContext');
+    testContext = traceContextCreated(
+      await withTimeout(browser.newContext({ viewport: null }), 5000, 'health probe newContext'),
+      'probe',
+      { probe: 'health' },
+    );
     // In headful mode a probe page is a real Firefox window: with no session
     // open, newPage() pops a visible window every ~2 min while idle. A context
     // round-trip is already a live protocol exchange (a hung browser never
@@ -7987,6 +8045,7 @@ setInterval(async () => {
       await page.goto('about:blank', { timeout: 5000 });
       await page.close();
     }
+    traceContextClosed(testContext, 'probe-done', { probe: 'health' });
     await testContext.close();
     healthState.lastSuccessfulNav = Date.now();
   } catch (err) {
