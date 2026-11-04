@@ -13,7 +13,7 @@ import { imageSize } from './lib/image-size.js';
 import { fillLocator } from './lib/fill.js';
 import { resolveTypeMode } from './lib/type-mode.js';
 import { TabLock, acquireForOp, handleTabLockQueueTimeout } from './lib/tab-lock.js';
-import { TAB_OPEN_PREFS, createPageInContext, consumeProgrammaticPopupName, isAnchorPage } from './lib/tab-pages.js';
+import { TAB_OPEN_PREFS, createPageInContext, consumeProgrammaticPopupName, isAnchorPage, readWindowNameBounded } from './lib/tab-pages.js';
 import { initWindowTrace, traceContextCreated, traceContextClosed, traceAllContextsClosed, tracePageCreated } from './lib/window-trace.js';
 import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
@@ -498,7 +498,9 @@ function contextIdFor(context) {
 }
 
 // Top-level Firefox windows: one per session context (the anchor page is the
-// window) plus one per dedicated recording/viewport context.
+// window) plus one per dedicated recording/viewport context. Approximate: a
+// window created by the newPage fallback inside a context that already has an
+// anchor is not tracked separately.
 function countTopLevelWindows() {
   let windows = 0;
   for (const session of sessions.values()) {
@@ -1945,7 +1947,7 @@ function attachPopupHandler(page, userId, sessionKey) {
     // A page we opened ourselves with window.open (to get a tab) is already
     // registered by the caller. Match its unique window name so a site popup
     // cannot consume another creation's token.
-    const popupName = await popupPage.evaluate(() => window.name, undefined, { timeout: 1000 }).catch(() => null);
+    const popupName = await readWindowNameBounded(popupPage, 1000);
     if (consumeProgrammaticPopupName(popupName)) return;
     const key = normalizeUserId(userId);
     const currentSession = sessions.get(key);

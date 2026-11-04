@@ -3,7 +3,10 @@ import { createPageWithSessionRecovery } from '../../lib/new-page-recovery.js';
 
 const isTimeoutError = err => err.code === 'timeout';
 const isDeadContextError = err => err.code === 'dead_context';
-const withTimeout = promise => promise;
+const withTimeout = (promise, ms, label) => Promise.race([
+  promise,
+  new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+]);
 const log = jest.fn();
 
 function recoveryOptions(overrides) {
@@ -69,7 +72,7 @@ describe('createPageWithSessionRecovery', () => {
 
     const results = await Promise.all([0, 1, 2].map(() => createPageWithSessionRecovery(recoveryOptions({
       session,
-      timeoutMs: 1500,
+      timeoutMs: 800,
       isTimeoutError: (err) => /timed out after/.test(err.message),
       currentSession: () => session,
       destroySession,

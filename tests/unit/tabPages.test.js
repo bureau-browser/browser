@@ -1,5 +1,5 @@
 import { describe, expect, test } from '@jest/globals';
-import { TAB_OPEN_PREFS, createPageInContext, isAnchorPage } from '../../lib/tab-pages.js';
+import { TAB_OPEN_PREFS, createPageInContext, isAnchorPage, readWindowNameBounded, consumeProgrammaticPopupName } from '../../lib/tab-pages.js';
 
 class FakePage {
   constructor(context, { name = '', failOpen = false } = {}) {
@@ -88,6 +88,17 @@ describe('tab page creation', () => {
     expect(b.page.name).toMatch(/^camofox-tab-/);
     expect(a.page.name).not.toBe(b.page.name);
     expect(context.pages().filter((page) => isAnchorPage(page))).toHaveLength(1);
+  });
+
+  test('a popup whose window.name evaluate never settles still registers as a site popup', async () => {
+    const hangingPage = { evaluate: () => new Promise(() => {}) };
+    const startedAt = Date.now();
+    const name = await readWindowNameBounded(hangingPage, 60);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(name).toBeNull();
+    // null is never one of our reserved names, so the handler takes the
+    // site-popup branch instead of returning early.
+    expect(consumeProgrammaticPopupName(name)).toBe(false);
   });
 
   test('falls back to newPage when window.open cannot open a page', async () => {

@@ -7,6 +7,11 @@
 
 import { detectYtDlp, hasYtDlp, ensureYtDlp, ytDlpTranscript, parseJson3, parseVtt, parseXml } from './youtube.js';
 import { classifyError } from '../../lib/request-utils.js';
+import { userPages } from '../../lib/tab-pages.js';
+
+export function shouldCloseTranscriptSession(session) {
+  return userPages(session.context).length === 0 && !session.pageLeases?.size;
+}
 
 export async function register(app, ctx, pluginConfig = {}) {
   const { log, config, sessions, ensureBrowser, getSession,
@@ -190,8 +195,7 @@ export async function register(app, ctx, pluginConfig = {}) {
         const ytSession = sessions.get(ytKey);
         if (ytSession && !ytSession._closing) {
           try {
-            const remainingPages = ytSession.context.pages();
-            if (remainingPages.length === 0 && !ytSession.pageLeases?.size) {
+            if (shouldCloseTranscriptSession(ytSession)) {
               ytSession._closing = true;
               ytSession.context.close().catch(() => {});
               sessions.delete(ytKey);

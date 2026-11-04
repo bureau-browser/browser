@@ -67,6 +67,12 @@ needed.
    also works as a tab; e2e covers it.
 8. `GET /tabs` without `userId` is a 400. Bureau's camofox client always passes
    `userId`, so nothing needs the all-users listing. E2E test.
+9. `/health` `windows` is approximate: a window opened by the newPage fallback
+   inside a context that already has an anchor is not counted separately.
+   Anchor creation and dedicated contexts are exact.
+10. The YouTube transcript plugin's session cleanup uses `userPages()`, which
+   excludes the anchor, so an anchor-only context is closed instead of leaking
+   a blank window. Test: `plugins/youtube/sessionCleanup.test.js`.
 9. LinkedIn interstitial: navigate does a single `goto` (`waitUntil: commit`)
    followed by a domcontentloaded wait; it does not reload, run a login-wall
    check, or auto-click. Google/Amazon are the only special navigation paths.
