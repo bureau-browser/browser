@@ -98,13 +98,13 @@ describe('launch compatibility source contract', () => {
     expect(launchBrowser).toContain('buildLaunchOptionsWithGeoipFallback');
   });
 
-  test('health probe context also uses a null viewport', () => {
+  test('health probe context is bounded and uses a null viewport', () => {
     const healthProbeOptions = sourceBetween(
-      'testContext = await browser.newContext(',
+      '// Active health probe',
       'const page = await testContext.newPage();'
     );
 
-    expect(healthProbeOptions).toContain('viewport: null');
+    expect(healthProbeOptions).toContain('browser.newContext({ viewport: null }), 5000');
   });
 
   test('uses the configured navigation timeout without racing its request deadline', () => {

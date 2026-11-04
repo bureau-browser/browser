@@ -50,25 +50,50 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow('PROXY_PROTOCOL must be http, https, socks4, or socks5');
   });
 
-  test('configures an optional direct browser identity and forwards it to subprocesses', () => {
-    process.env.CAMOFOX_LOCALE = 'en-AU';
-    process.env.CAMOFOX_TIMEZONE = 'Australia/Sydney';
+  test('defaults a direct browser identity to the fork FR fingerprint', () => {
+    delete process.env.CAMOFOX_LOCALE;
+    delete process.env.CAMOFOX_TIMEZONE;
+    delete process.env.CAMOFOX_TZ;
+    delete process.env.CAMOFOX_GEO;
+
+    expect(loadConfig().directIdentity).toEqual({
+      locale: 'fr-FR',
+      timezoneId: 'Europe/Paris',
+      geolocation: { latitude: 48.8566, longitude: 2.3522 },
+    });
+  });
+
+  test('accepts the fork CAMOFOX_TZ and CAMOFOX_GEO aliases and forwards them', () => {
+    process.env.CAMOFOX_TZ = 'Europe/Lisbon';
+    process.env.CAMOFOX_GEO = '38.7223,-9.1393';
 
     const config = loadConfig();
 
-    expect(config.directIdentity).toEqual({ locale: 'en-AU', timezoneId: 'Australia/Sydney' });
-    expect(config.serverEnv.CAMOFOX_LOCALE).toBe('en-AU');
-    expect(config.serverEnv.CAMOFOX_TIMEZONE).toBe('Australia/Sydney');
+    expect(config.directIdentity).toEqual({
+      locale: 'fr-FR',
+      timezoneId: 'Europe/Lisbon',
+      geolocation: { latitude: 38.7223, longitude: -9.1393 },
+    });
+    expect(config.serverEnv.CAMOFOX_TZ).toBe('Europe/Lisbon');
+    expect(config.serverEnv.CAMOFOX_GEO).toBe('38.7223,-9.1393');
   });
 
-  test('does not set a direct browser identity unless both values are configured', () => {
-    delete process.env.CAMOFOX_LOCALE;
+  test('setting only one of locale/timezone does not abort startup', () => {
     delete process.env.CAMOFOX_TIMEZONE;
-    expect(loadConfig().directIdentity).toBeNull();
-
+    delete process.env.CAMOFOX_TZ;
     process.env.CAMOFOX_LOCALE = 'en-AU';
-    expect(() => loadConfig()).toThrow('CAMOFOX_LOCALE and CAMOFOX_TIMEZONE must be set together');
+    const localeOnly = loadConfig().directIdentity;
+    expect(localeOnly.locale).toBe('en-AU');
+    expect(localeOnly.timezoneId).toBe('Europe/Paris');
 
+    delete process.env.CAMOFOX_LOCALE;
+    process.env.CAMOFOX_TIMEZONE = 'Australia/Sydney';
+    const zoneOnly = loadConfig().directIdentity;
+    expect(zoneOnly.locale).toBe('fr-FR');
+    expect(zoneOnly.timezoneId).toBe('Australia/Sydney');
+  });
+
+  test('rejects an invalid configured timezone', () => {
     process.env.CAMOFOX_TIMEZONE = 'Not/A_Timezone';
     expect(() => loadConfig()).toThrow('CAMOFOX_TIMEZONE must be a valid IANA timezone');
   });

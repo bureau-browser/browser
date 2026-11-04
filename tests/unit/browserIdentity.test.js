@@ -8,13 +8,13 @@ describe('browser identity options', () => {
   });
 
   test('uses a complete configured identity only for direct sessions', () => {
-    const directIdentity = { locale: 'en-AU', timezoneId: 'Australia/Sydney' };
+    const directIdentity = { locale: 'en-AU', timezoneId: 'Australia/Sydney', geolocation: { latitude: -33.86, longitude: 151.2 } };
     expect(contextIdentityOptions({ hasProxy: false, directIdentity })).toEqual(directIdentity);
     expect(launchLocale({ hasProxy: false, directIdentity })).toBe('en-AU');
   });
 
   test('leaves proxy identity to Camoufox GeoIP', () => {
-    const directIdentity = { locale: 'en-AU', timezoneId: 'Australia/Sydney' };
+    const directIdentity = { locale: 'en-AU', timezoneId: 'Australia/Sydney', geolocation: { latitude: -33.86, longitude: 151.2 } };
     expect(contextIdentityOptions({ hasProxy: true, directIdentity })).toEqual({ permissions: ['geolocation'] });
     expect(launchLocale({ hasProxy: true, directIdentity })).toBeUndefined();
   });

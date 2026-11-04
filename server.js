@@ -7,7 +7,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { x11GrabAvailable, startFrameRecorder, startX11Grab, stopFfmpegAndWait } from './lib/video-recorder.js';
-import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath } from './lib/persistence.js';
+import { runTabReaperTick } from './lib/tab-reaper.js';
+import { createContextResilient } from './lib/new-context.js';
+import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
 import { getSearchFallbacks } from './lib/search-fallbacks.js';
 import { hasGoogleOrganicResults } from './lib/google-serp.js';
@@ -505,6 +507,11 @@ const sessions = new Map();
 // findTab() falls through to this map, so every existing /tabs/:id/* route
 // works on dedicated tabs without call-site changes.
 const dedicatedTabs = new Map(); // tabId -> { tabState, context, userId, listItemId, ... }
+// Closed recordings whose .webm is still inside the grace window. Kept apart
+// from dedicatedTabs so a closed tab disappears from GET /tabs and stops
+// counting against MAX_TABS_GLOBAL immediately, while GET /video can still
+// stream the finalized file.
+const finalizedVideos = new Map(); // tabId -> { userId, videoPath, videoDir, tabState }
 const VIDEO_BASE_DIR = CONFIG.videoDir;
 const VIDEO_GRACE_WINDOW_MS = 5 * 60 * 1000;
 
@@ -587,13 +594,56 @@ function getTabLock(tabId) {
   return tabLocks.get(tabId);
 }
 
+// Which user session owns a tab, for checkpoint flushing after a page op.
+// Dedicated (recording / viewport) tabs carry their own userId.
+function userIdForTab(tabId) {
+  const dedicated = dedicatedTabs.get(tabId);
+  if (dedicated?.userId) return dedicated.userId;
+  for (const [userId, session] of sessions.entries()) {
+    for (const group of session.tabGroups.values()) {
+      if (group.has(tabId)) return userId;
+    }
+  }
+  return null;
+}
+
+// Debounced checkpoint: flush a session's jar ~2 s after the LAST successful
+// operation in a burst, instead of a blind tick that races navigation or a
+// logged-out bounce. Paired with /persist and the close/shutdown checkpoints.
+const flushTimers = new Map();
+function scheduleFlush(userId, delayMs = 2000) {
+  if (!CONFIG.profileDir) return;
+  const key = normalizeUserId(userId);
+  if (!sessions.get(key)?.context) return;
+  const existing = flushTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    flushTimers.delete(key);
+    const session = sessions.get(key);
+    if (!session?.context) return;
+    persistStorageState({
+      profileDir: CONFIG.profileDir,
+      userId: key,
+      context: session.context,
+      logger: persistenceLogger,
+    }).catch(() => {});
+  }, delayMs);
+  timer.unref?.();
+  flushTimers.set(key, timer);
+}
+
 // Timeout is INSIDE the lock so each operation gets its full budget
 // regardless of how long it waited in the queue.
 async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout) {
   const lock = getTabLock(tabId);
-  await lock.acquire(TAB_LOCK_TIMEOUT_MS);
+  // A queued op must be allowed to wait as long as the op ahead of it may
+  // legitimately run (for example a long human-typed fill), not a flat 35 s.
+  await lock.acquire(Math.max(TAB_LOCK_TIMEOUT_MS, timeoutMs));
   try {
-    return await withTimeout(operation(), timeoutMs, 'action');
+    const result = await withTimeout(operation(), timeoutMs, 'action');
+    const owner = userIdForTab(tabId);
+    if (owner) scheduleFlush(owner);
+    return result;
   } catch (err) {
     if (onTimeout && isTimeoutError(err)) {
       await onTimeout();
@@ -649,6 +699,7 @@ async function withUserLimit(userId, operation) {
   try {
     const result = await operation();
     healthState.lastSuccessfulNav = Date.now();
+    if (sessions.has(key)) scheduleFlush(key);
     return result;
   } finally {
     healthState.activeOps--;
@@ -1357,6 +1408,17 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
   }
 }
 
+function persistedJarPath(userId) {
+  if (!CONFIG.profileDir) return null;
+  const { storageStatePath } = getUserPersistencePaths(CONFIG.profileDir, userId);
+  if (fs.existsSync(storageStatePath)) return storageStatePath;
+  const legacy = legacyStorageStatePath(CONFIG.profileDir, userId);
+  if (legacy && fs.existsSync(legacy)) return legacy;
+  return null;
+}
+
+const persistenceLogger = { warn: (msg, fields = {}) => log('warn', msg, fields) };
+
 async function getSession(userId, { trace = false, storageState } = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
@@ -1378,6 +1440,30 @@ async function getSession(userId, { trace = false, storageState } = {}) {
     }
   }
   
+  // A live context built before a login keeps serving the old jar: restore
+  // only runs at context creation. If the on-disk jar has since gained auth
+  // for a platform this context was not built with (another instance wrote it
+  // via /persist), rebuild so the fresh login is restored. mtime-gated so
+  // routine checkpoint flushes with the same auth set never trigger it.
+  if (session) {
+    try {
+      const jarPath = persistedJarPath(key);
+      if (jarPath) {
+        const mtime = fs.statSync(jarPath).mtimeMs;
+        if (mtime !== session.jarMtime) {
+          session.jarMtime = mtime;
+          const saved = await readStorageStateFile(jarPath, persistenceLogger);
+          const gained = jarGainedAuth(session.authed, saved?.cookies || []);
+          if (gained.length) {
+            log('info', 'session jar gained auth, recreating to restore login', { userId: key, authed: gained });
+            await closeSession(key, session, { reason: 'jar_auth_gained', clearDownloads: true, clearLocks: true });
+            session = null;
+          }
+        }
+      }
+    } catch { /* no jar yet / unreadable - nothing to refresh from */ }
+  }
+
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
       if (sessions.size >= MAX_SESSIONS) {
@@ -1403,7 +1489,6 @@ async function getSession(userId, { trace = false, storageState } = {}) {
           );
         }
       }
-      const b = await ensureBrowser();
       const contextOptions = {
         viewport: null,
         ...contextIdentityOptions({
@@ -1426,7 +1511,14 @@ async function getSession(userId, { trace = false, storageState } = {}) {
         log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
-      const context = await b.newContext(contextOptions);
+      const context = await createContextResilient(contextOptions, {
+        ensureBrowser,
+        restartBrowser,
+        timeoutMs: CONFIG.newContextTimeoutMs,
+        withTimeout,
+        isTimeoutError,
+        log,
+      });
 
       let tracePath = null;
       if (trace) {
@@ -1441,7 +1533,15 @@ async function getSession(userId, { trace = false, storageState } = {}) {
         }
       }
 
-      const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
+      const jarPath = storageState || await loadPersistedStorageState(CONFIG.profileDir, key, persistenceLogger);
+      let jarMtime = 0;
+      let authed = new Set();
+      if (jarPath) {
+        try { jarMtime = fs.statSync(jarPath).mtimeMs; } catch { jarMtime = 0; }
+        const saved = await readStorageStateFile(jarPath, persistenceLogger);
+        authed = new Set(authedPlatforms(saved?.cookies || []));
+      }
+      const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath, jarMtime, authed };
       sessions.set(key, created);
       await pluginEvents.emitAsync('session:created', { userId: key, context });
       log('info', 'session created', {
@@ -1680,6 +1780,9 @@ function handleRouteError(err, req, res, extraFields = {}) {
 }
 
 function destroyTab(session, tabId, reason, userId) {
+  // A page crash can call this for a dedicated tab (or after its session was
+  // already torn down); there is no shared tabGroups map to mutate then.
+  if (!session || !session.tabGroups) return false;
   const lock = tabLocks.get(tabId);
   if (lock) {
     lock.drain();
@@ -1706,6 +1809,19 @@ async function destroyTimedOutTab(session, tabId, reason, userId) {
   const found = findTab(session, tabId);
   if (!found) return;
   const { tabState, group, listItemId } = found;
+  if (found.dedicated) {
+    await finalizeRecording(dedicatedTabs.get(tabId), reason).catch(() => {});
+    const dedicated = dedicatedTabs.get(tabId);
+    dedicatedTabs.delete(tabId);
+    if (dedicated?.videoDir) finalizedVideos.set(tabId, dedicated);
+    const lock = tabLocks.get(tabId);
+    if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+    scheduleDedicatedTabCleanup(tabId);
+    refreshActiveTabsGauge();
+    tabsDestroyedTotal.labels(reason).inc();
+    pluginEvents.emit('tab:destroyed', { userId: userId || null, tabId, reason });
+    return;
+  }
   log('warn', 'destroying timed-out tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason });
   try {
     await safePageClose(tabState.page);
@@ -1768,6 +1884,8 @@ async function destroySession(userId, { reason = 'destroy_session' } = {}) {
   for (const [tabId, entry] of Array.from(dedicatedTabs.entries())) {
     if (entry.userId !== key) continue;
     await finalizeRecording(entry, reason).catch(() => {});
+    dedicatedTabs.delete(tabId);
+    if (entry.videoDir) finalizedVideos.set(tabId, entry);
     const lock = tabLocks.get(tabId);
     if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
     scheduleDedicatedTabCleanup(tabId);
@@ -2914,10 +3032,14 @@ app.post('/sessions/:userId/persist', authMiddleware(), async (req, res) => {
 
     res.json({
       ok: true,
+      userId: String(key),
       written: result.persisted,
+      ...(result.persisted ? {} : { skipped: result.reason }),
       ...(result.reason ? { reason: result.reason } : {}),
       ...(result.lost ? { lost: result.lost } : {}),
       authed: result.authed || [],
+      cookieCount: names.length,
+      cookieNames: [...new Set(names)].sort(),
       cookies: names,
     });
   } catch (err) {
@@ -3089,7 +3211,6 @@ app.post('/pressure/cleanup', async (req, res) => {
 
 // Create a tab in its own Playwright context (recording and/or custom viewport).
 async function createDedicatedTab({ req, userId, resolvedSessionKey, url, recordVideo, viewport }) {
-  const b = await ensureBrowser();
   if (getTotalTabCount() >= MAX_TABS_GLOBAL) {
     throw Object.assign(new Error('Maximum tabs (global) reached'), { statusCode: 429 });
   }
@@ -3133,7 +3254,14 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     if (restoredStatePath) contextOptions.storageState = restoredStatePath;
   }
 
-  const context = await b.newContext(contextOptions);
+  const context = await createContextResilient(contextOptions, {
+    ensureBrowser,
+    restartBrowser,
+    timeoutMs: CONFIG.newContextTimeoutMs,
+    withTimeout,
+    isTimeoutError,
+    log,
+  });
   if (restoredStatePath) {
     try {
       const saved = JSON.parse(fs.readFileSync(restoredStatePath, 'utf8'));
@@ -3204,6 +3332,7 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     userId: recordKey,
     listItemId: resolvedSessionKey,
     createdAt: Date.now(),
+    recorded: !!recordVideo,
   });
   refreshActiveTabsGauge();
 
@@ -3256,14 +3385,15 @@ async function finalizeRecording(recorded, reason) {
 // Recording tabs keep their video dir for a grace window so a trailing
 // GET /video after DELETE still works. Viewport-only tabs have no file.
 function scheduleDedicatedTabCleanup(tabId) {
-  const entry = dedicatedTabs.get(tabId);
+  const entry = finalizedVideos.get(tabId) || dedicatedTabs.get(tabId);
   if (!entry) return;
   if (!entry.videoDir) {
+    finalizedVideos.delete(tabId);
     dedicatedTabs.delete(tabId);
     return;
   }
   setTimeout(() => {
-    const stillThere = dedicatedTabs.get(tabId);
+    const stillThere = finalizedVideos.get(tabId) || dedicatedTabs.get(tabId);
     if (!stillThere) return;
     try {
       fs.rmSync(stillThere.videoDir, { recursive: true, force: true });
@@ -3272,6 +3402,7 @@ function scheduleDedicatedTabCleanup(tabId) {
         tabId, dir: stillThere.videoDir, error: err.message,
       });
     }
+    finalizedVideos.delete(tabId);
     dedicatedTabs.delete(tabId);
   }, VIDEO_GRACE_WINDOW_MS).unref?.();
 }
@@ -4373,13 +4504,14 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         const x = box.x + box.width / 2;
         const y = box.y + box.height / 2;
         
-        // Move mouse to element (triggers mouseover/mouseenter)
-        await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
-        await tabState.page.waitForTimeout(50);
-        
+        // Move mouse to element (direct, a few steps, not a teleport and not a
+        // wiggle), then a natural click HOLD like a person.
+        await withTimeout(tabState.page.mouse.move(x, y, { steps: 4 }), Math.max(1, remainingBudget()), 'native mouse move');
+        await tabState.page.waitForTimeout(70 + Math.floor(Math.random() * 120));
+
         // Full click sequence
         await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
-        await tabState.page.waitForTimeout(50);
+        await tabState.page.waitForTimeout(60 + Math.floor(Math.random() * 90));
         await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
         
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
@@ -4403,14 +4535,21 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         // CSS selectors supplied by callers can match both the visible menu and
         // inactive template copies. Prefer one visible match when that is
         // unambiguous, while leaving selector lists untouched because appending
-        // :visible would change their meaning.
+        // :visible would change their meaning. When the visible match does not
+        // resolve it, fall back to .first() so duplicate-id pages do not trip
+        // Playwright strict mode.
         const visibleSelector = isLocator ? null : visibleSelectorCandidate(locatorOrSelector);
+        let constrained = false;
         if (visibleSelector) {
           const visibleLocator = tabState.page.locator(visibleSelector);
           if (await visibleLocator.count() === 1) {
             locator = visibleLocator;
+            constrained = true;
             log('info', 'click constrained selector to visible match', { selector: locatorOrSelector });
           }
+        }
+        if (!isLocator && !constrained) {
+          locator = tabState.page.locator(locatorOrSelector).first();
         }
         const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
         
@@ -4850,7 +4989,41 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
     const shouldSubmit = submit || pressEnter;
-    
+
+    // Human typing costs baseDelay + 0..90ms per character, plus an occasional
+    // think-pause. A flat handler budget aborts a long fill mid-type while the
+    // keystroke loop keeps running, so the caller sees a retryable failure and
+    // a retry types twice. Scale the budget with the text and cancel the loop
+    // if the route deadline still fires.
+    const baseDelay = typeof delay === 'number' ? delay : 75;
+    const typeBudgetMs = Math.max(
+      HANDLER_TIMEOUT_MS,
+      Math.ceil(String(text).length * (baseDelay + 90 + 120) + 5000)
+    );
+    const typeCancelled = { value: false };
+    const wantsHuman = human || mode === 'human' || delay != null;
+    const typeHuman = async (target) => {
+      const box = await target.boundingBox({ timeout: 5000 }).catch(() => null);
+      if (box) {
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        await tabState.page.mouse.move(cx, cy, { steps: 3 });
+        await tabState.page.waitForTimeout(80 + Math.floor(Math.random() * 120));
+        await tabState.page.mouse.down();
+        await tabState.page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+        await tabState.page.mouse.up();
+      } else {
+        await target.click({ timeout: 10000 }).catch(() => {});
+      }
+      await tabState.page.waitForTimeout(120 + Math.floor(Math.random() * 200));
+      await target.fill('').catch(() => {});
+      for (const ch of String(text)) {
+        if (typeCancelled.value) break;
+        await tabState.page.keyboard.type(ch, { delay: baseDelay + Math.floor(Math.random() * 90) });
+        if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500));
+      }
+    };
+
     await withTabLock(tabId, async () => {
       // Resolve and focus the target if ref/selector provided
       let locator = null;
@@ -4870,31 +5043,8 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         } else {
           await fillLocator(tabState.page.locator(selector), text);
         }
-      } else if (human || mode === 'human') {
-        // Human typing: glide the real pointer to the field, click it, then
-        // emit one real key event per character with jittered cadence and an
-        // occasional think-pause. DataDome and friends watch keystroke timing;
-        // an instant value-set looks nothing like a person.
-        const baseDelay = typeof delay === 'number' ? delay : 75;
-        const target = locator || tabState.page.locator(selector).first();
-        const box = await target.boundingBox({ timeout: 5000 }).catch(() => null);
-        if (box) {
-          const cx = box.x + box.width / 2;
-          const cy = box.y + box.height / 2;
-          await tabState.page.mouse.move(cx, cy, { steps: 3 });
-          await tabState.page.waitForTimeout(80 + Math.floor(Math.random() * 120));
-          await tabState.page.mouse.down();
-          await tabState.page.waitForTimeout(40 + Math.floor(Math.random() * 60));
-          await tabState.page.mouse.up();
-        } else {
-          await target.click({ timeout: 10000 }).catch(() => {});
-        }
-        await tabState.page.waitForTimeout(120 + Math.floor(Math.random() * 200));
-        await target.fill('').catch(() => {});
-        for (const ch of String(text)) {
-          await tabState.page.keyboard.type(ch, { delay: baseDelay + Math.floor(Math.random() * 90) });
-          if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500));
-        }
+      } else if (wantsHuman) {
+        await typeHuman(locator || tabState.page.locator(selector).first());
       } else {
         // keyboard mode -- char-by-char real key events (required for Ember/contenteditable)
         if (locator) {
@@ -4905,6 +5055,9 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         await tabState.page.keyboard.type(text, { delay: delay ?? 30 });
       }
       if (shouldSubmit) await tabState.page.keyboard.press('Enter');
+    }, typeBudgetMs).catch((err) => {
+      typeCancelled.value = true;
+      throw err;
     });
     
     pluginEvents.emit('tab:type', typeEventPayload({ userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode }));
@@ -6429,11 +6582,11 @@ app.get('/tabs/:tabId/video', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const tabId = req.params.tabId;
-    const recorded = dedicatedTabs.get(tabId);
+    const recorded = dedicatedTabs.get(tabId) || finalizedVideos.get(tabId);
     if (!recorded || recorded.userId !== normalizeUserId(userId)) {
       return res.status(404).json({ error: 'recorded tab not found' });
     }
-    if (!recorded.ffmpegProcess && !recorded.frameRecorder && !recorded.videoPath) {
+    if (!recorded.recorded) {
       return res.status(400).json({
         error: 'this tab was not opened with recordVideo - no video to fetch.',
       });
@@ -6493,6 +6646,8 @@ app.delete('/tabs/:tabId', async (req, res) => {
       if (dedicated.tabState.navigateAbort) dedicated.tabState.navigateAbort.abort();
       await clearTabDownloads(dedicated.tabState);
       await finalizeRecording(dedicated, 'delete');
+      dedicatedTabs.delete(tabId);
+      if (dedicated.videoDir) finalizedVideos.set(tabId, dedicated);
       const lock = tabLocks.get(tabId);
       if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
       scheduleDedicatedTabCleanup(tabId);
@@ -6905,46 +7060,27 @@ if (FLY_MACHINE_ID) {
 
 // Per-tab inactivity reaper — close tabs idle for TAB_INACTIVITY_MS
 setInterval(() => {
-  const now = Date.now();
-  for (const [userId, session] of sessions) {
-    // TAB_INACTIVITY_MS=0 disables reaping entirely (a human signing in makes no
-    // API calls). keepAlive marks a session whose tabs must survive idle time.
-    if (TAB_INACTIVITY_MS <= 0 || session.keepAlive) continue;
-    for (const [listItemId, group] of session.tabGroups) {
-      for (const [tabId, tabState] of group) {
-        if (!tabState._lastReaperCheck) {
-          tabState._lastReaperCheck = now;
-          tabState._lastReaperToolCalls = tabState.toolCalls;
-          continue;
-        }
-        if (tabState.toolCalls === tabState._lastReaperToolCalls) {
-          const idleMs = now - tabState._lastReaperCheck;
-          if (idleMs >= TAB_INACTIVITY_MS) {
-            tabsReapedTotal.inc();
-            log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
-            safePageClose(tabState.page);
-            group.delete(tabId);
-            { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
-            refreshTabLockQueueDepth();
-            refreshActiveTabsGauge();
-          }
-        } else {
-          tabState._lastReaperCheck = now;
-          tabState._lastReaperToolCalls = tabState.toolCalls;
-        }
-      }
-      if (group.size === 0) {
-        session.tabGroups.delete(listItemId);
-      }
-    }
-    // Clean up sessions with zero tabs remaining -- free browser context memory
-    if (session.tabGroups.size === 0 && !hasActivePageLeases(session)) {
-      session._closing = true;
+  runTabReaperTick({
+    sessions,
+    tabInactivityMs: TAB_INACTIVITY_MS,
+    now: Date.now(),
+    hasActivePageLeases,
+    onTabReaped: ({ userId, tabId, listItemId, idleMs, tabState }) => {
+      tabsReapedTotal.inc();
+      log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
+      safePageClose(tabState.page);
+      { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
+      refreshTabLockQueueDepth();
+      refreshActiveTabsGauge();
+    },
+    onSessionEmpty: (userId) => {
+      const session = sessions.get(userId);
+      if (!session) return;
       log('info', 'session empty after tab reaper, closing', { userId });
       closeSession(userId, session, { reason: 'tab_reaper_empty_session', clearDownloads: true, clearLocks: true }).catch(() => {});
       sessionsExpiredTotal.inc();
-    }
-  }
+    },
+  });
   if (sessions.size === 0) scheduleBrowserIdleShutdown();
 }, 60_000);
 
@@ -7873,10 +8009,16 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await browser.newContext({ viewport: null });
-    const page = await testContext.newPage();
-    await page.goto('about:blank', { timeout: 5000 });
-    await page.close();
+    testContext = await withTimeout(browser.newContext({ viewport: null }), 5000, 'health probe newContext');
+    // In headful mode a probe page is a real Firefox window: with no session
+    // open, newPage() pops a visible window every ~2 min while idle. A context
+    // round-trip is already a live protocol exchange (a hung browser never
+    // answers it), so headful stops there; headless keeps the page probe.
+    if (!CONFIG.headful) {
+      const page = await testContext.newPage();
+      await page.goto('about:blank', { timeout: 5000 });
+      await page.close();
+    }
     await testContext.close();
     healthState.lastSuccessfulNav = Date.now();
   } catch (err) {

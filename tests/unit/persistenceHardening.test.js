@@ -65,7 +65,7 @@ describe('persistence hardening', () => {
     expect(saved.cookies.map((c) => c.name)).toContain('li_at');
   });
 
-  test('refuses to overwrite an authed jar with a logged-out one', async () => {
+  test('a fresh login elsewhere still writes: the merged jar keeps prior auth', async () => {
     const liAt = cookie('li_at', '.linkedin.com', { httpOnly: true });
     const first = await persistStorageState({
       profileDir: dir,
@@ -75,17 +75,39 @@ describe('persistence hardening', () => {
     });
     expect(first.persisted).toBe(true);
 
+    // Another instance logged into X and wrote the file; this context's live
+    // jar has only the X cookie. Comparing live against prior would refuse the
+    // write for the missing (but still carried-over) li_at.
     const second = await persistStorageState({
+      profileDir: dir,
+      userId: 'main',
+      context: fakeContext({ liveCookies: [cookie('auth_token', '.x.com')] }),
+      logger,
+    });
+    expect(second.persisted).toBe(true);
+    expect(second.authed).toEqual(expect.arrayContaining(['linkedin', 'x']));
+
+    const saved = await readStorageStateFile(getUserPersistencePaths(dir, 'main').storageStatePath, logger);
+    expect(saved.cookies.map((c) => c.name)).toContain('li_at');
+    expect(saved.cookies.map((c) => c.name)).toContain('auth_token');
+  });
+
+  test('refuses to write a jar whose prior auth cookie has expired and is gone', async () => {
+    // Prior has li_at but already expired, so the merge drops it and the live
+    // jar does not replace it.
+    const expired = cookie('li_at', '.linkedin.com', { httpOnly: true, expires: 1 });
+    const { userDir, storageStatePath } = getUserPersistencePaths(dir, 'main');
+    await fs.mkdir(userDir, { recursive: true });
+    await fs.writeFile(storageStatePath, JSON.stringify({ cookies: [expired] }));
+
+    const result = await persistStorageState({
       profileDir: dir,
       userId: 'main',
       context: fakeContext({ liveCookies: [cookie('JSESSIONID', '.linkedin.com')] }),
       logger,
     });
-    expect(second.persisted).toBe(false);
-    expect(second.reason).toBe('auth-downgrade');
-
-    const saved = await readStorageStateFile(getUserPersistencePaths(dir, 'main').storageStatePath, logger);
-    expect(saved.cookies.map((c) => c.name)).toContain('li_at');
+    expect(result.persisted).toBe(false);
+    expect(result.reason).toBe('auth-downgrade');
   });
 
   test('caps non-auth cookies but keeps auth cookies verbatim', async () => {
