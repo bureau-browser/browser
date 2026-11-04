@@ -496,6 +496,19 @@ function contextIdFor(context) {
   if (!contextIds.has(context)) contextIds.set(context, `ctx-${++contextSeq}`);
   return contextIds.get(context);
 }
+
+// Top-level Firefox windows: one per session context (the anchor page is the
+// window) plus one per dedicated recording/viewport context.
+function countTopLevelWindows() {
+  let windows = 0;
+  for (const session of sessions.values()) {
+    try {
+      if (session.context.pages().some((page) => isAnchorPage(page))) windows++;
+    } catch { /* dead context */ }
+  }
+  windows += dedicatedTabs.size;
+  return windows;
+}
 // Closed recordings whose .webm is still inside the grace window. Kept apart
 // from dedicatedTabs so a closed tab disappears from GET /tabs and stops
 // counting against MAX_TABS_GLOBAL immediately, while GET /video can still
@@ -861,9 +874,9 @@ function getTotalTabCount() {
   let total = dedicatedTabs.size;
   for (const session of sessions.values()) {
     try {
-      // Use real Playwright page count so leaked pages exert backpressure
-      // on MAX_TABS_GLOBAL, surfacing leaks before Firefox starves.
-      total += session.context.pages().length;
+      // Use the real Playwright page count so leaked pages exert backpressure
+      // on MAX_TABS_GLOBAL, but never count our internal about:blank anchor.
+      total += session.context.pages().filter((page) => !isAnchorPage(page)).length;
     } catch (_) {
       // Context is dead — fall back to bookkeeping count for this session.
       for (const group of session.tabGroups.values()) total += group.size;
@@ -1932,7 +1945,7 @@ function attachPopupHandler(page, userId, sessionKey) {
     // A page we opened ourselves with window.open (to get a tab) is already
     // registered by the caller. Match its unique window name so a site popup
     // cannot consume another creation's token.
-    const popupName = await popupPage.evaluate(() => window.name).catch(() => null);
+    const popupName = await popupPage.evaluate(() => window.name, undefined, { timeout: 1000 }).catch(() => null);
     if (consumeProgrammaticPopupName(popupName)) return;
     const key = normalizeUserId(userId);
     const currentSession = sessions.get(key);
@@ -3039,6 +3052,7 @@ app.get('/health', (req, res) => {
     browserConnected: running,
     browserRunning: running,
     activeTabs: getTotalTabCount(),
+    windows: countTopLevelWindows(),
     activeSessions: sessions.size,
     consecutiveFailures: Array.from(userNavHealth.values())
       .reduce((sum, h) => sum + h.consecutiveNavFailures, 0),

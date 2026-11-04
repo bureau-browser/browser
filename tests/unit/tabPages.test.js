@@ -58,24 +58,24 @@ describe('tab page creation', () => {
     expect(TAB_OPEN_PREFS['browser.link.open_newwindow.restriction']).toBe(0);
   });
 
-  test('the first page uses newPage and later pages use window.open from an anchor', async () => {
+  test('the anchor is never returned and every user page opens from it', async () => {
     const context = new FakeContext();
     const first = await createPageInContext(context, { reason: 'tab' });
     const second = await createPageInContext(context, { reason: 'tab' });
 
-    expect(first.openedVia).toBe('newPage');
+    expect(first.openedVia).toBe('window.open');
     expect(second.openedVia).toBe('window.open');
     expect(second.page).not.toBe(first.page);
-    const anchor = context.pages().find((page) => isAnchorPage(page));
-    expect(anchor).toBeTruthy();
-    expect(anchor.name).toMatch(/^camofox-anchor-/);
+    const anchors = context.pages().filter((page) => isAnchorPage(page));
+    expect(anchors).toHaveLength(1);
+    expect(anchors[0]).not.toBe(first.page);
+    expect(anchors[0].name).toBe('');
+    expect(first.page.name).toMatch(/^camofox-tab-/);
     expect(second.page.name).toMatch(/^camofox-tab-/);
   });
 
   test('concurrent creations get distinct pages even when every waiter would see the first popup', async () => {
     const context = new FakeContext();
-    await createPageInContext(context, { reason: 'tab' }); // first page / window
-
     const [a, b] = await Promise.all([
       createPageInContext(context, { reason: 'tab' }),
       createPageInContext(context, { reason: 'tab' }),
@@ -87,12 +87,15 @@ describe('tab page creation', () => {
     expect(a.page.name).toMatch(/^camofox-tab-/);
     expect(b.page.name).toMatch(/^camofox-tab-/);
     expect(a.page.name).not.toBe(b.page.name);
+    expect(context.pages().filter((page) => isAnchorPage(page))).toHaveLength(1);
   });
 
   test('falls back to newPage when window.open cannot open a page', async () => {
     const context = new FakeContext({ failOpen: true });
-    await createPageInContext(context);
-    const fallback = await createPageInContext(context);
-    expect(fallback.openedVia).toBe('newPage-fallback');
+    const first = await createPageInContext(context, { timeoutMs: 300 });
+    expect(first.openedVia).toBe('newPage-fallback');
+    const second = await createPageInContext(context, { timeoutMs: 300 });
+    expect(second.openedVia).toBe('newPage-fallback');
+    expect(context.pages().filter((page) => isAnchorPage(page))).toHaveLength(1);
   });
 });

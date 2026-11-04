@@ -27,9 +27,10 @@ describe('C3 tabs and contexts', () => {
     expect(body.error).toContain('userId');
   });
 
-  test('two concurrent cold POST /tabs for one user share one context', async () => {
+  test('two concurrent cold POST /tabs for one user share one context and one window', async () => {
     const client = createClient(serverUrl);
     try {
+      const before = await client.health();
       const [a, b] = await Promise.all([
         client.createTab(`${testSiteUrl}/pageA`),
         client.createTab(`${testSiteUrl}/pageB`),
@@ -41,6 +42,22 @@ describe('C3 tabs and contexts', () => {
       expect(mine).toHaveLength(2);
       expect(mine[0].contextId).toBeTruthy();
       expect(mine[0].contextId).toBe(mine[1].contextId);
+
+      const after = await client.health();
+      expect(after.windows - before.windows).toBe(1);
+      expect(after.activeTabs - before.activeTabs).toBe(2);
+    } finally {
+      await client.cleanup();
+    }
+  });
+
+  test('the anchor page is not counted as a tab', async () => {
+    const client = createClient(serverUrl);
+    try {
+      const before = await client.health();
+      await client.createTab(`${testSiteUrl}/pageA`);
+      const after = await client.health();
+      expect(after.activeTabs - before.activeTabs).toBe(1);
     } finally {
       await client.cleanup();
     }
@@ -67,10 +84,12 @@ describe('C3 tabs and contexts', () => {
       });
       expect(JSON.parse(evaluated.body.result)).toEqual({ w: 400, h: 300 });
 
+      const healthWithDedicated = await client.health();
       const deleted = await json('DELETE', `/tabs/${tabId}?userId=${encodeURIComponent(client.userId)}`);
       expect(deleted.status).toBe(200);
       const after = await json('GET', `/tabs?userId=${encodeURIComponent(client.userId)}`);
       expect(after.body.tabs.some((tab) => tab.tabId === tabId)).toBe(false);
+      expect((await client.health()).windows).toBe(healthWithDedicated.windows - 1);
     } finally {
       await client.cleanup();
     }
