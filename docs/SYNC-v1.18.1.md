@@ -56,6 +56,15 @@ that failed before it.
 `tests/unit/sessionCleanup.test.js` now imports and exercises the real
 `runTabReaperTick` the server calls (`lib/tab-reaper.js`), not a copied loop.
 
+## CI: ClawHub publish is upstream-only
+
+`.github/workflows/clawhub-publish.yml` validates and publishes the OpenClaw
+plugin to ClawHub. On PR #1 its `dry-run / publish` check failed because it
+requires Node.js 22.13+. The fork must never publish there, so every job in the
+workflow is guarded with `github.repository == 'jo-inc/camofox-browser'`. On the
+fork the jobs are skipped; an upstream sync keeps the workflow intact. No other
+workflow was changed.
+
 ## Tests
 
 All on the final tree after the review fixes.

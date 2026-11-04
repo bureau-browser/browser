@@ -14,13 +14,15 @@ permissions:
 
 jobs:
   dry-run:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    # Upstream-only: the fork must never validate or publish to ClawHub.
+    if: github.repository == 'jo-inc/camofox-browser' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     uses: openclaw/clawhub/.github/workflows/package-publish.yml@main
     with:
       dry_run: true
 
   publish:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    # Upstream-only: the fork must never validate or publish to ClawHub.
+    if: github.repository == 'jo-inc/camofox-browser' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/'))
     uses: openclaw/clawhub/.github/workflows/package-publish.yml@main
     with:
       dry_run: false
@@ -29,7 +31,7 @@ jobs:
 
   notify-agenthook:
     needs: [dry-run, publish]
-    if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/'))
+    if: always() && github.repository == 'jo-inc/camofox-browser' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/'))
     uses: ./.github/workflows/agenthook-notify.yml
     with:
       kind: release
