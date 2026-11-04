@@ -10,7 +10,7 @@ import { x11GrabAvailable, startFrameRecorder, startX11Grab, stopFfmpegAndWait }
 import { runTabReaperTick } from './lib/tab-reaper.js';
 import { createContextResilient } from './lib/new-context.js';
 import { resolveTypeMode } from './lib/type-mode.js';
-import { TabLock, acquireForOp } from './lib/tab-lock.js';
+import { TabLock, acquireForOp, handleTabLockQueueTimeout } from './lib/tab-lock.js';
 import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
 import { getSearchFallbacks } from './lib/search-fallbacks.js';
@@ -594,13 +594,14 @@ function scheduleFlush(userId, delayMs = 2000) {
 
 // Timeout is INSIDE the lock so each operation gets its full budget
 // regardless of how long it waited in the queue.
-async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout) {
+async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout, { maxQueueWaitMs } = {}) {
   const lock = getTabLock(tabId);
   // Wait for the current holder's remaining budget plus this op's own budget
   // (never less than the legacy 35 s floor). A long human-typed fill can hold
   // the tab for over a minute without a queued click dying in the queue and
-  // tearing the tab down mid-typing.
-  const release = await acquireForOp(lock, timeoutMs, TAB_LOCK_TIMEOUT_MS);
+  // tearing the tab down mid-typing. `maxQueueWaitMs` lets a caller with an
+  // outer request deadline cap that wait so the entry expires with the request.
+  const release = await acquireForOp(lock, timeoutMs, TAB_LOCK_TIMEOUT_MS, maxQueueWaitMs);
   try {
     const result = await withTimeout(operation(), timeoutMs, 'action');
     const owner = userIdForTab(tabId);
@@ -1688,7 +1689,8 @@ function handleRouteError(err, req, res, extraFields = {}) {
   // destroy it: the holder may still be making progress (for example a long
   // human-typed fill). The caller can retry or wait.
   if (userId && isTabLockQueueTimeout(err)) {
-    return res.status(503).json({ error: 'Tab is busy with another operation. Retry shortly.', code: 'tab_unresponsive', retryable: true, recovery: 'retry', ...extraFields });
+    handleTabLockQueueTimeout({ res, extraFields });
+    return;
   }
   // Tab was destroyed while this request was queued in the lock
   if (isTabDestroyedError(err)) {
@@ -3712,6 +3714,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     if (!found) return tabNotFoundResponse(res, tabId);
     if (session) session.lastAccess = Date.now();
 
+    const navigateTimeoutMs = navigationRequestTimeoutMs();
+    const navigateDeadline = Date.now() + navigateTimeoutMs;
     const result = await withUserLimit(userId, () => withTimeout((async () => {
       await ensureBrowser();
       const resolvedSessionKey = sessionKey || listItemId || found.listItemId || 'default';
@@ -4044,8 +4048,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           navigationOk: navigationHttpStatus === null || navigationHttpStatus < 400,
           ...searchFallback,
         };
-      }, navigationRequestTimeoutMs());
-    })(), navigationRequestTimeoutMs(), 'navigate'));
+      }, navigateTimeoutMs, undefined, { maxQueueWaitMs: navigateDeadline - Date.now() });
+    })(), navigateTimeoutMs, 'navigate'));
     
     log('info', 'navigated', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:navigated', { userId: req.body.userId, tabId, url: result.url, prevUrl: null });

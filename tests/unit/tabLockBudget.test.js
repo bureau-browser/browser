@@ -1,5 +1,5 @@
 import { describe, expect, test } from '@jest/globals';
-import { TabLock, acquireForOp } from '../../lib/tab-lock.js';
+import { TabLock, acquireForOp, handleTabLockQueueTimeout } from '../../lib/tab-lock.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -23,6 +23,42 @@ describe('tab lock holder-aware queue budget', () => {
     // plus 40 ms is fine); the point is it resolves right after release.
     expect(acquiredAt - startedAt).toBeLessThan(500);
     releaseQueued();
+  });
+
+  test('a caller deadline removes the queued entry so it never runs later', async () => {
+    const lock = new TabLock();
+    const releaseHolder = await acquireForOp(lock, 300, 0);
+    let ran = false;
+
+    const queued = acquireForOp(lock, 35, 0, 40).then((release) => {
+      ran = true;
+      release();
+    });
+
+    await expect(queued).rejects.toThrow('Tab lock queue timeout');
+    await sleep(60);
+    releaseHolder();
+    await sleep(80);
+    expect(ran).toBe(false);
+  });
+
+  test('a queue timeout on the server path returns 503 and leaves the tab alive', () => {
+    const sessions = new Map([['user-1', { tabGroups: new Map([['list', new Map([['tab-1', {}]])]]) }]]);
+    const res = {
+      statusCode: null,
+      payload: null,
+      status(code) { this.statusCode = code; return this; },
+      json(payload) { this.payload = payload; return this; },
+    };
+
+    handleTabLockQueueTimeout({ res, extraFields: { reqId: 'r1' } });
+
+    expect(res.statusCode).toBe(503);
+    expect(res.payload.code).toBe('tab_unresponsive');
+    expect(res.payload.retryable).toBe(true);
+    expect(res.payload.reqId).toBe('r1');
+    // The handler must not remove the tab from the session.
+    expect(sessions.get('user-1').tabGroups.get('list').has('tab-1')).toBe(true);
   });
 
   test('holderRemainingMs shrinks and clears on release', async () => {

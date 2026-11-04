@@ -72,6 +72,12 @@ case prove delay does not turn keyboard mode into human fill, and
 `tests/unit/tabLockBudget.test.js` proves a queued op waits for the holder's
 remaining budget. The lock also no longer destroys a tab on a queue timeout.
 
+A third review round capped navigate's queue wait at its outer request
+deadline (`withTabLock` `maxQueueWaitMs`), so a navigate queued behind a long
+fill expires with the request and never runs later. Test:
+`tests/e2e/navigateQueueDeadline.test.js`. A queue timeout still returns 503
+without destroying the tab (unit-tested against the server handler).
+
 ### Known follow-up
 
 The jar-change login pickup runs only in `getSession`. An already-listed tab
@@ -92,7 +98,7 @@ All on the final tree after the review fixes.
 ```
 npm run test:unit
   Test Suites: 87 passed, 87 total
-  Tests:       2 skipped, 920 passed, 922 total
+  Tests:       2 skipped, 922 passed, 924 total
 
 npm run test:plugins
   Test Suites: 7 passed, 7 total
@@ -100,7 +106,7 @@ npm run test:plugins
 
 CAMOFOX_PROFILE_DIR=<tmp> CAMOUFOX_INSTALL_DIR=<tmp cache> npm run test:e2e
   Test Suites: 16 passed, 16 total
-  Tests:       83 passed, 83 total
+  Tests:       84 passed, 84 total
 ```
 
 E2E uses only the local Express test site (no external network, no credentials).

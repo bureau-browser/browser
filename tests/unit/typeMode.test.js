@@ -7,7 +7,7 @@ describe('resolveTypeMode', () => {
   });
 
   test('keyboard mode with delay and a selector stays keyboard', () => {
-    expect(resolveTypeMode({ mode: 'keyboard', delay: 90 })).toEqual({ mode: 'keyboard', useHuman: false });
+    expect(resolveTypeMode({ mode: 'keyboard', delay: 90, selector: '#input' })).toEqual({ mode: 'keyboard', useHuman: false });
   });
 
   test('fill mode with delay still uses human typing', () => {
