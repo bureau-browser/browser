@@ -200,6 +200,9 @@ app.use('/tabs/:tabId', fly.replayMiddleware(log));
 app.use(accessKeyMiddleware(CONFIG));
 
 const ALLOWED_URL_SCHEMES = ['http:', 'https:'];
+// Only the blank page is allowed from the about: scheme. about:config and the
+// other privileged pages must stay unreachable through the HTTP API.
+const ALLOWED_ABOUT_URL = 'about:blank';
 
 // Accessible control roles are defined in lib/interactive-roles.js.
 
@@ -306,8 +309,11 @@ function sendError(res, err, extraFields = {}) {
 function validateUrl(url) {
   try {
     const parsed = new URL(url);
+    if (parsed.protocol === 'about:' && parsed.href === ALLOWED_ABOUT_URL) {
+      return null;
+    }
     if (!ALLOWED_URL_SCHEMES.includes(parsed.protocol)) {
-      return `Blocked URL scheme: ${parsed.protocol} (only http/https allowed)`;
+      return `Blocked URL scheme: ${parsed.protocol} (only http/https and about:blank allowed)`;
     }
     return null;
   } catch {
