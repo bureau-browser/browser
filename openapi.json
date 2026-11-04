@@ -698,10 +698,11 @@
           {
             "name": "userId",
             "in": "query",
+            "required": true,
             "schema": {
               "type": "string"
             },
-            "description": "Filter by session owner."
+            "description": "Session owner."
           }
         ],
         "responses": {
@@ -737,15 +738,21 @@
                           },
                           "contextId": {
                             "type": "string"
-                          },
-                          "userId": {
-                            "type": "string",
-                            "description": "Present when the request omitted userId (all users)."
                           }
                         }
                       }
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing userId.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }

@@ -21,22 +21,10 @@ describe('C3 tabs and contexts', () => {
     return { status: res.status, body: text ? JSON.parse(text) : {}, headers: res.headers };
   }
 
-  test('GET /tabs without userId lists every user\'s tabs', async () => {
-    const client1 = createClient(serverUrl);
-    const client2 = createClient(serverUrl);
-    try {
-      await client1.createTab(`${testSiteUrl}/pageA`);
-      await client2.createTab(`${testSiteUrl}/pageB`);
-
-      const { status, body } = await json('GET', '/tabs');
-      expect(status).toBe(200);
-      const userIds = new Set(body.tabs.map((tab) => tab.userId));
-      expect(userIds.has(client1.userId)).toBe(true);
-      expect(userIds.has(client2.userId)).toBe(true);
-    } finally {
-      await client1.cleanup();
-      await client2.cleanup();
-    }
+  test('GET /tabs without userId is a 400', async () => {
+    const { status, body } = await json('GET', '/tabs');
+    expect(status).toBe(400);
+    expect(body.error).toContain('userId');
   });
 
   test('two concurrent cold POST /tabs for one user share one context', async () => {
@@ -83,6 +71,24 @@ describe('C3 tabs and contexts', () => {
       expect(deleted.status).toBe(200);
       const after = await json('GET', `/tabs?userId=${encodeURIComponent(client.userId)}`);
       expect(after.body.tabs.some((tab) => tab.tabId === tabId)).toBe(false);
+    } finally {
+      await client.cleanup();
+    }
+  });
+
+  test('a popup login flow posts back to the opener and closes as a tab', async () => {
+    const client = createClient(serverUrl);
+    try {
+      const { tabId } = await client.createTab(`${testSiteUrl}/popup-login-parent`);
+      await client.click(tabId, { selector: '#open' });
+      let result = '';
+      for (let i = 0; i < 30; i++) {
+        const evaluated = await client.evaluate(tabId, 'document.getElementById("result").textContent');
+        result = evaluated.result;
+        if (result.startsWith('received:')) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(result).toBe('received:hello');
     } finally {
       await client.cleanup();
     }

@@ -368,6 +368,37 @@ function createTestApp() {
     `);
   });
 
+  app.get('/popup-login-parent', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Popup Login Parent</title></head>
+      <body>
+        <h1>Popup Login Parent</h1>
+        <button id="open" onclick="window.open('/popup-login-child', 'loginChild', 'width=420,height=320')">Open login</button>
+        <p id="result">waiting</p>
+        <script>
+          window.addEventListener('message', (event) => {
+            document.getElementById('result').textContent = 'received:' + event.data;
+          });
+        </script>
+      </body></html>
+    `);
+  });
+
+  app.get('/popup-login-child', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Popup Login Child</title></head>
+      <body>
+        <h1>Popup Login Child</h1>
+        <script>
+          if (window.opener) window.opener.postMessage('hello', '*');
+          setTimeout(() => window.close(), 800);
+        </script>
+      </body></html>
+    `);
+  });
+
   app.get('/popup-target', (req, res) => {
     res.send(`
       <!DOCTYPE html>

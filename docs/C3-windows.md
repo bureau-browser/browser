@@ -13,23 +13,38 @@ plus `context.waitForEvent("page")`, so Firefox applies its own tab policy and
 the page becomes a tab of the existing window. `GET /tabs` now exposes
 `contextId`, so a test can prove two tabs share one context.
 
-Headful trace with `CAMOFOX_TRACE_WINDOWS=1`, one user, two `POST /tabs`:
+Creation is serialised per context. The first page is `newPage`; when the
+second page is requested an about:blank anchor tab is opened once from the
+first page, and every later tab is opened from that anchor with a unique
+window name and `noopener`. The new page's name is checked before it is used,
+so concurrent creations cannot receive each other's page, and the opener is
+null before any site code runs.
+
+Headful trace with `CAMOFOX_TRACE_WINDOWS=1`, one user, three `POST /tabs`
+(page-1 is the first page, page-2 and page-3 are tabs; the anchor is not a
+managed tab):
 
 ```json
 {"event":"context_created","contextId":"ctx-1","reason":"session-create","userId":"main"}
 {"event":"page_created","pageId":"page-1","contextId":"ctx-1","reason":"tab","openedVia":"newPage"}
 {"event":"page_created","pageId":"page-2","contextId":"ctx-1","reason":"tab","openedVia":"window.open"}
+{"event":"page_created","pageId":"page-3","contextId":"ctx-1","reason":"tab","openedVia":"window.open"}
 ```
 
-Both pages share `ctx-1`; the second is `window.open`, whose opener is the
-existing page (`window.opener !== null`), which Firefox only does for a tab or
-popup inside that window. The page screenshot reported real dimensions
-`1728x999`.
+Firefox window count from `System Events`: 0 before the first page, 1 after the
+first page, and still 1 after the second and third tabs. The page screenshot
+reported real dimensions `1728x999`.
+
+Background-tab check: after opening a second tab, `document.visibilityState`
+stayed `visible`, `document.hidden` stayed `false`, and `requestAnimationFrame`
+ticked 61 times in 1 s both headless and headful. No bringToFront change was
+needed.
 
 ## Item status
 
-1. Tabs not windows: `lib/tab-pages.js` plus launch prefs. Unit test
-   `tests/unit/tabPages.test.js`; headful trace above.
+1. Tabs not windows: `lib/tab-pages.js` plus launch prefs, an owned about:blank
+   anchor tab, per-context serialisation and unique window names. Unit test
+   `tests/unit/tabPages.test.js`; headful trace and window counts above.
 2. Click/fill fallback: already fixed by the v1.18.1 sync. Click on Wikipedia
    `#searchInput` took 2.0 s and never entered the mouse fallback; its mouse
    calls are bounded by the remaining handler budget in `server.js`.
@@ -45,9 +60,10 @@ popup inside that window. The page screenshot reported real dimensions
 7. Wikipedia fill: `assertLocatorFillable` called `locator.evaluate()` without a
    timeout, inheriting Playwright's 30 s default. `lib/fill.js` bounds the probe
    to 5 s and selector fills use `.first()`. Wikipedia `#searchInput` now fills
-   in 0.5 s.
-8. `GET /tabs` without `userId` now lists every user's tabs and includes
-   `userId`; with a `userId` it stays scoped. E2E test.
+   in 0.5 s. A popup login-like flow (child posts a message back and closes)
+   also works as a tab; e2e covers it.
+8. `GET /tabs` without `userId` is a 400. Bureau's camofox client always passes
+   `userId`, so nothing needs the all-users listing. E2E test.
 9. LinkedIn interstitial: navigate does a single `goto` (`waitUntil: commit`)
    followed by a domcontentloaded wait; it does not reload, run a login-wall
    check, or auto-click. Google/Amazon are the only special navigation paths.

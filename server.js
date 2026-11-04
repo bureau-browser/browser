@@ -13,7 +13,7 @@ import { imageSize } from './lib/image-size.js';
 import { fillLocator } from './lib/fill.js';
 import { resolveTypeMode } from './lib/type-mode.js';
 import { TabLock, acquireForOp, handleTabLockQueueTimeout } from './lib/tab-lock.js';
-import { TAB_OPEN_PREFS, createPageInContext, consumeExpectedPopup } from './lib/tab-pages.js';
+import { TAB_OPEN_PREFS, createPageInContext, consumeProgrammaticPopupName, isAnchorPage } from './lib/tab-pages.js';
 import { initWindowTrace, traceContextCreated, traceContextClosed, traceAllContextsClosed, tracePageCreated } from './lib/window-trace.js';
 import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
@@ -1928,10 +1928,12 @@ function createTabState(page) {
  * and recursively attaches itself to the new page.
  */
 function attachPopupHandler(page, userId, sessionKey) {
-  page.on('popup', (popupPage) => {
+  page.on('popup', async (popupPage) => {
     // A page we opened ourselves with window.open (to get a tab) is already
-    // registered by the caller; do not create a second managed tab for it.
-    if (consumeExpectedPopup(page)) return;
+    // registered by the caller. Match its unique window name so a site popup
+    // cannot consume another creation's token.
+    const popupName = await popupPage.evaluate(() => window.name).catch(() => null);
+    if (consumeProgrammaticPopupName(popupName)) return;
     const key = normalizeUserId(userId);
     const currentSession = sessions.get(key);
     if (!currentSession || currentSession._closing) return;
@@ -7091,6 +7093,7 @@ setInterval(() => {
       for (const tabState of group.values()) registered.add(tabState.page);
     }
     for (const page of contextPages) {
+      if (isAnchorPage(page)) continue;
       if (!registered.has(page) && !isPageLeased(session, page)) {
         reaped++;
         page.removeAllListeners();
@@ -7199,10 +7202,17 @@ app.get('/', (req, res) => {
  *     parameters:
  *       - name: userId
  *         in: query
+ *         required: true
  *         schema:
  *           type: string
- *         description: Filter by session owner.
+ *         description: Session owner.
  *     responses:
+ *       400:
+ *         description: Missing userId.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       200:
  *         description: Tab list.
  *         content:
@@ -7229,20 +7239,17 @@ app.get('/', (req, res) => {
  *                         type: string
  *                       contextId:
  *                         type: string
- *                       userId:
- *                         type: string
- *                         description: Present when the request omitted userId (all users).
  */
 app.get('/tabs', async (req, res) => {
   try {
     const userId = req.query.userId;
-    const allUsers = userId === undefined || userId === '';
-    const key = allUsers ? null : normalizeUserId(userId);
+    if (userId === undefined || userId === '') {
+      return res.status(400).json({ error: 'userId query parameter is required' });
+    }
+    const key = normalizeUserId(userId);
 
     const tabs = [];
-    const sessionEntries = allUsers
-      ? [...sessions.entries()]
-      : (sessions.has(key) ? [[key, sessions.get(key)]] : []);
+    const sessionEntries = sessions.has(key) ? [[key, sessions.get(key)]] : [];
     for (const [sessionUserId, session] of sessionEntries) {
       for (const [listItemId, group] of session.tabGroups) {
         for (const [tabId, tabState] of group) {
@@ -7253,7 +7260,6 @@ app.get('/tabs', async (req, res) => {
             title: await tabState.page.title().catch(() => ''),
             listItemId,
             contextId: session.contextId || contextIdFor(session.context),
-            ...(allUsers ? { userId: sessionUserId } : {}),
           });
         }
       }
@@ -7261,7 +7267,7 @@ app.get('/tabs', async (req, res) => {
     // Dedicated-context tabs (recording / custom viewport) belong to the same
     // user but live outside session.tabGroups.
     for (const [tabId, entry] of dedicatedTabs) {
-      if (!allUsers && entry.userId !== key) continue;
+      if (entry.userId !== key) continue;
       tabs.push({
         targetId: tabId,
         tabId,
@@ -7269,7 +7275,6 @@ app.get('/tabs', async (req, res) => {
         title: await entry.tabState.page.title().catch(() => ''),
         listItemId: entry.listItemId,
         contextId: entry.contextId || contextIdFor(entry.context),
-        ...(allUsers ? { userId: entry.userId } : {}),
       });
     }
 
