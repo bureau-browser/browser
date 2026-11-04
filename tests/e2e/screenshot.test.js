@@ -1,23 +1,17 @@
-import { startServer, stopServer, getServerUrl } from '../helpers/startServer.js';
-import { startTestSite, stopTestSite, getTestSiteUrl } from '../helpers/testSite.js';
 import { createClient } from '../helpers/client.js';
+import { getSharedEnv } from './sharedEnv.js';
 
 describe('Screenshot', () => {
   let serverUrl;
   let testSiteUrl;
 
-  beforeAll(async () => {
-    const port = await startServer(9379);
-    serverUrl = getServerUrl();
+  beforeAll(() => {
+    const env = getSharedEnv();
+    serverUrl = env.serverUrl;
+    testSiteUrl = env.testSiteUrl;
+  });
 
-    const testPort = await startTestSite();
-    testSiteUrl = getTestSiteUrl();
-  }, 120000);
-
-  afterAll(async () => {
-    await stopTestSite();
-    await stopServer();
-  }, 30000);
+  // Server lifecycle managed by globalSetup/globalTeardown
 
   test('screenshot returns raw PNG binary with correct magic bytes', async () => {
     const client = createClient(serverUrl);
@@ -141,15 +135,15 @@ describe('Screenshot', () => {
     }
   });
 
-  test('screenshot of non-existent tab returns 404 JSON error', async () => {
+  test('screenshot of non-existent tab returns 410 JSON error', async () => {
     const client = createClient(serverUrl);
 
     try {
       const res = await fetch(
-        `${serverUrl}/tabs/non-existent-tab/screenshot?userId=${client.userId}`
+        `${serverUrl}/tabs/00000000-0000-0000-0000-000000000000/screenshot?userId=${client.userId}`
       );
 
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(410);
       expect(res.headers.get('content-type')).toContain('application/json');
 
       const data = await res.json();

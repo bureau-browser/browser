@@ -1,23 +1,17 @@
-import { startServer, stopServer, getServerUrl } from '../helpers/startServer.js';
-import { startTestSite, stopTestSite, getTestSiteUrl } from '../helpers/testSite.js';
 import { createClient } from '../helpers/client.js';
+import { getSharedEnv } from './sharedEnv.js';
 
 describe('Snapshot and Links', () => {
   let serverUrl;
   let testSiteUrl;
   
-  beforeAll(async () => {
-    const port = await startServer();
-    serverUrl = getServerUrl();
-    
-    const testPort = await startTestSite();
-    testSiteUrl = getTestSiteUrl();
-  }, 120000);
+  beforeAll(() => {
+    const env = getSharedEnv();
+    serverUrl = env.serverUrl;
+    testSiteUrl = env.testSiteUrl;
+  });
   
-  afterAll(async () => {
-    await stopTestSite();
-    await stopServer();
-  }, 30000);
+  // Server lifecycle managed by globalSetup/globalTeardown
   
   test('get snapshot returns page content', async () => {
     const client = createClient(serverUrl);
@@ -37,6 +31,44 @@ describe('Snapshot and Links', () => {
     }
   });
   
+  test('snapshot includes bounded, redacted page structure without changing the AX snapshot field', async () => {
+    const client = createClient(serverUrl);
+
+    try {
+      const { tabId } = await client.createTab(`${testSiteUrl}/structure`);
+      const snapshot = await client.getSnapshot(tabId);
+
+      expect(snapshot.snapshot).toContain('Yoga ball');
+      expect(snapshot.snapshot).not.toContain('"forms"');
+      expect(snapshot.structure).toMatchObject({
+        forms: [expect.objectContaining({
+          id: 'report-filters',
+          method: 'get',
+          fields: expect.arrayContaining([
+            expect.objectContaining({ id: 'period', name: 'period', value: 'year', role: 'combobox', ref: expect.any(String) }),
+            expect.objectContaining({ id: 'from', name: 'from', value: '2022-01-01', role: 'textbox', ref: expect.any(String) }),
+          ]),
+        })],
+        tables: [expect.objectContaining({
+          id: 'sales',
+          headers: ['Product', 'Quantity'],
+          columns: ['Product', 'Quantity'],
+          rows: [['Yoga ball', '7']],
+        })],
+        evidenceLimits: [expect.objectContaining({
+          source: 'table',
+          tableId: 'sales',
+          availableDimensions: ['Product', 'Quantity'],
+        })],
+      });
+      const token = snapshot.structure.forms[0].fields.find((field) => field.id === 'api_token');
+      expect(token).toBeDefined();
+      expect(token.value).toBeUndefined();
+    } finally {
+      await client.cleanup();
+    }
+  });
+
   test('snapshot contains element refs', async () => {
     const client = createClient(serverUrl);
     
@@ -127,12 +159,12 @@ describe('Snapshot and Links', () => {
     }
   });
   
-  test('snapshot for non-existent tab returns 404', async () => {
+  test('snapshot for non-existent tab returns 410', async () => {
     const client = createClient(serverUrl);
     
     try {
-      await expect(client.getSnapshot('non-existent-tab-id')).rejects.toMatchObject({
-        status: 404
+      await expect(client.getSnapshot('00000000-0000-0000-0000-000000000000')).rejects.toMatchObject({
+        status: 410
       });
     } finally {
       await client.cleanup();

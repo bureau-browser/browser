@@ -1,23 +1,17 @@
-import { startServer, stopServer, getServerUrl } from '../helpers/startServer.js';
-import { startTestSite, stopTestSite, getTestSiteUrl } from '../helpers/testSite.js';
 import { createClient } from '../helpers/client.js';
+import { getSharedEnv } from './sharedEnv.js';
 
 describe('Downloads and Images', () => {
   let serverUrl;
   let testSiteUrl;
 
-  beforeAll(async () => {
-    await startServer();
-    serverUrl = getServerUrl();
+  beforeAll(() => {
+    const env = getSharedEnv();
+    serverUrl = env.serverUrl;
+    testSiteUrl = env.testSiteUrl;
+  });
 
-    await startTestSite();
-    testSiteUrl = getTestSiteUrl();
-  }, 120000);
-
-  afterAll(async () => {
-    await stopTestSite();
-    await stopServer();
-  }, 30000);
+  // Server lifecycle managed by globalSetup/globalTeardown
 
   test('GET /tabs/:tabId/images returns image sources', async () => {
     const client = createClient(serverUrl);
@@ -72,6 +66,22 @@ describe('Downloads and Images', () => {
       const empty = await client.getDownloads(tabId, { includeData: false, consume: false });
       expect(Array.isArray(empty.downloads)).toBe(true);
       expect(empty.downloads.length).toBe(0);
+    } finally {
+      await client.cleanup();
+    }
+  });
+  test('POST /tabs/:tabId/fetch-current-resource saves an inline PDF as a download', async () => {
+    const client = createClient(serverUrl);
+    try {
+      const { tabId } = await client.createTab(`${testSiteUrl}/inline-document.pdf`);
+      const result = await client.fetchCurrentResource(tabId);
+      expect(result.download.mimeType).toBe('application/pdf');
+      expect(result.download.suggestedFilename).toBe('inline-document.pdf');
+      expect(result.download.bytes).toBeGreaterThan(0);
+
+      const downloads = await client.getDownloads(tabId, { includeData: true, maxBytes: 1024 * 1024 });
+      expect(downloads.downloads).toHaveLength(1);
+      expect(Buffer.from(downloads.downloads[0].dataBase64, 'base64').subarray(0, 5).toString()).toBe('%PDF-');
     } finally {
       await client.cleanup();
     }

@@ -38,7 +38,7 @@ describe('Tab Recycling', () => {
         await client.getSnapshot(tabs[0]);
         fail('Oldest tab should have been recycled');
       } catch (err) {
-        expect(err.status).toBe(404);
+        expect(err.status).toBe(410);
       }
 
       // The new tab should work
@@ -88,7 +88,7 @@ describe('Tab Recycling', () => {
         await client.getSnapshot(tabs[i]);
       }
 
-      // Create a 6th tab — should recycle tabs[0] (fewest toolCalls)
+      // Create a 6th tab -- should recycle tabs[0] (fewest toolCalls)
       const result = await client.createTab(`${testSiteUrl}/pageB`);
       expect(result.tabId).toBeDefined();
 
@@ -97,7 +97,7 @@ describe('Tab Recycling', () => {
         await client.getSnapshot(tabs[0]);
         fail('Least-used tab should have been recycled');
       } catch (err) {
-        expect(err.status).toBe(404);
+        expect(err.status).toBe(410);
       }
 
       // tabs[1] should still exist (it had more toolCalls)
@@ -108,7 +108,7 @@ describe('Tab Recycling', () => {
     }
   }, 120000);
 
-  test('navigate auto-creates with recycling when tab not found and limit reached', async () => {
+  test('navigate returns 404 for unknown tab (no auto-create)', async () => {
     const client = createClient(serverUrl);
     try {
       const tabs = [];
@@ -117,10 +117,14 @@ describe('Tab Recycling', () => {
         tabs.push(result.tabId);
       }
 
-      // Navigate with a non-existent tabId — should recycle and auto-create
+      // Navigate with a non-existent tabId -- should return stale-tab error
       const fakeTabId = 'nonexistent-tab-id';
-      const result = await client.navigate(fakeTabId, `${testSiteUrl}/pageC`);
-      expect(result.url).toContain('/pageC');
+      try {
+        await client.navigate(fakeTabId, `${testSiteUrl}/pageC`);
+        fail('Should have thrown 404');
+      } catch (err) {
+        expect(err.status).toBe(404);
+      }
     } finally {
       await client.cleanup();
     }

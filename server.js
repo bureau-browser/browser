@@ -3,34 +3,121 @@ import { VirtualDisplay } from 'camoufox-js/dist/virtdisplay.js';
 import { firefox } from 'playwright-core';
 import express from 'express';
 import crypto from 'crypto';
-import os from 'os';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
-import { spawn as ffmpegSpawn } from 'child_process';
+import { x11GrabAvailable, startFrameRecorder, startX11Grab, stopFfmpegAndWait } from './lib/video-recorder.js';
+import { runTabReaperTick } from './lib/tab-reaper.js';
+import { createContextResilient } from './lib/new-context.js';
+import { resolveTypeMode } from './lib/type-mode.js';
+import { TabLock, acquireForOp, handleTabLockQueueTimeout } from './lib/tab-lock.js';
+import { persistStorageState, loadPersistedStorageState, getUserPersistencePaths, legacyStorageStatePath, readStorageStateFile, authedPlatforms, jarGainedAuth } from './lib/persistence.js';
 import { expandMacro } from './lib/macros.js';
+import { getSearchFallbacks } from './lib/search-fallbacks.js';
+import { hasGoogleOrganicResults } from './lib/google-serp.js';
 import { loadConfig } from './lib/config.js';
+import { contextIdentityOptions, launchLocale } from './lib/browser-identity.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
 import { createFlyHelpers } from './lib/fly.js';
+import { createPluginEvents, loadPlugins, typeEventPayload } from './lib/plugins.js';
+import { requireAuth, accessKeyMiddleware, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
 import { windowSnapshot } from './lib/snapshot.js';
+import { extractPageStructure, attachStructureRefs } from './lib/page-structure.js';
 import {
   MAX_DOWNLOAD_INLINE_BYTES,
   clearTabDownloads,
   clearSessionDownloads,
   attachDownloadListener,
+  attachNavigationResponseTracker,
+  readInlinePdfResponse,
+  clickWithDownloadGuard,
+  captureFetchedResource,
+  MAX_FETCHED_RESOURCE_BYTES,
   getDownloadsList,
 } from './lib/downloads.js';
 import { extractPageImages } from './lib/images.js';
-import { detectYtDlp, hasYtDlp, ensureYtDlp, ytDlpTranscript, parseJson3, parseVtt, parseXml } from './lib/youtube.js';
+import { extractDeterministic, validateSchema as validateExtractSchema } from './lib/extract.js';
 import {
-  initMetrics, getRegister, isMetricsEnabled,
+  ensureTracesDir, resolveTracePath, tracePathFor, makeTraceFilename,
+  listUserTraces, statTrace, deleteTrace, sweepOldTraces,
+} from './lib/tracing.js';
+
+import {
+  initMetrics, getRegister, isMetricsEnabled, createMetric,
   startMemoryReporter, stopMemoryReporter,
 } from './lib/metrics.js';
 import { actionFromReq, classifyError } from './lib/request-utils.js';
+import { cleanupOrphanedTempFiles, cleanupStaleFirefoxProfiles, removeXvfbDisplayFiles } from './lib/tmp-cleanup.js';
+import { coalesceInflight } from './lib/inflight.js';
+import { INTERACTIVE_ROLES } from './lib/interactive-roles.js';
+import { selectOption } from './lib/select-option.js';
+import { visibleSelectorCandidate } from './lib/visible-selector.js';
+import { normalizeBrowserKey } from './lib/browser-key.js';
+import { createPageWithSessionRecovery } from './lib/new-page-recovery.js';
+import { resolveUploadPaths } from './lib/upload-paths.js';
+import { acquirePageLease, hasActivePageLeases, isPageLeased, releasePageLease, setLeasedPage } from './lib/page-lease.js';
+import { createReporter, createTabHealthTracker, collectResourceSnapshot, classifyProxyError, browserProcessTreeRssMb, browserProcessNameRssMb } from './lib/reporter.js';
+import { mountDocs } from './lib/openapi.js';
+import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
+import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
+import { createVirtualDisplayRegistry } from './lib/plugin-capabilities.js';
+import { killProcessIds } from './lib/browser-processes.js';
+import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses, profilePathsFromProcessSnapshot } from './lib/process-ownership.js';
+import { killWindowsProcessTree, refreshWindowsProcesses } from './lib/windows-processes.js';
+import {
+  safePageUrl, urlDomain, hashIdentifier,
+  isDeadContextError, isPageCrashedError, isTimeoutError,
+  isTabLockQueueTimeout, isTabDestroyedError,
+  browserErrorStatus, browserErrorCode, browserErrorRecovery, isRetryableBrowserError,
+} from './lib/browser-errors.js';
 
 const CONFIG = loadConfig();
 
+// --- Crash reporter (opt-in, anonymized GitHub issues) ---
+import { readFileSync } from 'fs';
+const _pkgVersion = (() => { try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version; } catch { return 'unknown'; } })();
+
+// --- Sentry error tracking ---
+initSentry({ ...CONFIG, version: _pkgVersion });
+const reporter = createReporter({ ...CONFIG, version: _pkgVersion });
+function _countTabs() {
+  let total = dedicatedTabs.size;
+  for (const session of sessions.values()) {
+    for (const group of session.tabGroups.values()) total += group.size;
+  }
+  return total;
+}
+function _browserPid() {
+  try { return browser?.process?.()?.pid ?? null; } catch { return null; }
+}
+function _resourceOpts() {
+  return { sessionCount: sessions.size, tabCount: _countTabs(), browserPid: _browserPid() };
+}
+reporter.startWatchdog(30_000, () => {
+  const summary = [];
+  for (const [sid, session] of sessions) {
+    const tabUrls = [];
+    for (const group of session.tabGroups.values()) {
+      for (const tab of group.values()) {
+        try {
+          const url = tab.page?.url?.() || 'unknown';
+          tabUrls.push(url);
+        } catch { tabUrls.push('error'); }
+      }
+    }
+    if (tabUrls.length > 0) summary.push({ session: sid, tabs: tabUrls.length, urls: tabUrls });
+  }
+  return { resourceOpts: _resourceOpts(), sessions: summary.length, summary };
+});
+
+// --- Plugin event bus ---
+const pluginEvents = createPluginEvents();
+
+// --- Shared auth middleware ---
+const authMiddleware = () => requireAuth(CONFIG);
+
 const {
-  requestsTotal, requestDuration, pageLoadDuration,
+  requestsTotal, requestDuration, pageLoadDuration, snapshotBytes,
   activeTabsGauge, tabLockQueueDepth,
   tabLockTimeoutsTotal,
   failuresTotal, browserRestartsTotal, tabsDestroyedTotal,
@@ -54,7 +141,13 @@ function log(level, msg, fields = {}) {
 }
 
 const app = express();
-app.use(express.json({ limit: '100kb' }));
+const globalJsonParser = express.json({ limit: '100kb' });
+app.use((req, res, next) => {
+  if (req.method === 'POST' && /^\/tabs\/[^/]+\/evaluate$/.test(req.path)) {
+    return next();
+  }
+  return globalJsonParser(req, res, next);
+});
 
 // Request logging + metrics middleware
 app.use((req, res, next) => {
@@ -68,6 +161,7 @@ app.use((req, res, next) => {
   }
 
   const action = actionFromReq(req);
+  reporter.trackRoute(`${req.method} ${req.route?.path || '[unmatched]'}`);
   const done = requestDuration.startTimer({ action });
 
   const origEnd = res.end.bind(res);
@@ -94,33 +188,43 @@ const FLY_MACHINE_ID = fly.machineId;
 // Route tab requests to the owning machine via fly-replay header.
 app.use('/tabs/:tabId', fly.replayMiddleware(log));
 
+// Access-key middleware: gates every route when CAMOFOX_ACCESS_KEY is set.
+// Exempts /health (Docker healthcheck) and routes that have their own
+// dedicated keys (cookie import -> CAMOFOX_API_KEY, /stop -> CAMOFOX_ADMIN_KEY)
+// so each key gates a distinct surface. When unset, behavior is unchanged.
+app.use(accessKeyMiddleware(CONFIG));
+
 const ALLOWED_URL_SCHEMES = ['http:', 'https:'];
 
-// Interactive roles to include - exclude combobox to avoid opening complex widgets
-// (date pickers, dropdowns) that can interfere with navigation
-const INTERACTIVE_ROLES = [
-  'button', 'link', 'textbox', 'checkbox', 'radio',
-  'menuitem', 'tab', 'searchbox', 'slider', 'spinbutton', 'switch'
-  // 'combobox' excluded - can trigger date pickers and complex dropdowns
-];
+// Accessible control roles are defined in lib/interactive-roles.js.
 
-// Patterns to skip (date pickers, calendar widgets)
+// Patterns to skip (date pickers, calendar widgets -- NOT expiration/expiry fields)
 const SKIP_PATTERNS = [
-  /date/i, /calendar/i, /picker/i, /datepicker/i
+  /datepicker/i, /date.?picker/i, /calendar/i, /^date$/i
 ];
 
-function timingSafeCompare(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) {
-    crypto.timingSafeEqual(bufA, bufA);
-    return false;
-  }
-  return crypto.timingSafeEqual(bufA, bufB);
-}
+// Iframe support: URL patterns to SKIP (tracking, analytics, pixels)
+const IFRAME_SKIP_PATTERNS = [
+  /web-pixel/i, /analytics/i, /tracking/i, /gtm/i, /facebook/i,
+  /doubleclick/i, /google.*tag/i, /hotjar/i, /segment/i, /sentry/i,
+  /recaptcha/i, /gstatic/i, /app-bridge/i, /extensions\.shopifycdn/i,
+  // Bot-detection / anti-automation frames. These are short-lived and frequently
+  // DETACH mid-ariaSnapshot, which hangs buildRefs until the handler timeout (30s)
+  // and surfaces as a spurious 500 on the click/snapshot that triggered the rebuild.
+  // e.g. LinkedIn injects PerimeterX (px-iframe-*/px-captcha) on authenticated
+  // actions such as the connection-invite modal, so skipping these is required for
+  // those write flows to work.
+  /px-iframe/i, /px-captcha/i, /perimeterx/i, /\bcaptcha\b/i, /hcaptcha/i,
+  /arkose/i, /funcaptcha/i, /datadome/i,
+];
+const MAX_IFRAMES_TO_PROCESS = 8;
+const IFRAME_SNAPSHOT_TIMEOUT_MS = 3000;
 
-// Custom error for stale/unknown element refs — returned as 422 instead of 500
+// timingSafeCompare and isLoopbackAddress imported from lib/auth.js
+const timingSafeCompare = _timingSafeCompare;
+const isLoopbackAddress = _isLoopbackAddress;
+
+// Custom error for stale/unknown element refs -- returned as 422 instead of 500
 class StaleRefsError extends Error {
   constructor(ref, maxRef, totalRefs) {
     super(`Unknown ref: ${ref} (valid refs: e1-${maxRef}, ${totalRefs} total). Refs reset after navigation - call snapshot first.`);
@@ -128,6 +232,60 @@ class StaleRefsError extends Error {
     this.code = 'stale_refs';
     this.ref = ref;
   }
+}
+
+function selectorValidationError(selector) {
+  if (selector === undefined || selector === null) return null;
+  if (typeof selector !== 'string' || selector.trim() === '') return 'selector must be a non-empty string';
+  if (/^text\s*\(/i.test(selector)) return 'Invalid text selector syntax. Use text=... or a valid CSS selector.';
+  const stack = [];
+  let quote = null;
+  let escaped = false;
+  const pairs = { ')': '(', ']': '[', '}': '{' };
+  for (const ch of selector) {
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') stack.push(ch);
+    if (ch === ')' || ch === ']' || ch === '}') {
+      if (stack.pop() !== pairs[ch]) return `Invalid selector syntax: ${selector}`;
+    }
+  }
+  if (quote || stack.length) return `Invalid selector syntax: ${selector}`;
+  return null;
+}
+
+function invalidSelectorError(message) {
+  return Object.assign(new Error(message), { code: 'invalid_selector', statusCode: 400 });
+}
+
+const NON_FILLABLE_INPUT_TYPES = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit']);
+
+async function assertLocatorFillable(locator) {
+  const info = await locator.evaluate((el) => {
+    const tagName = el.tagName?.toLowerCase?.() || '';
+    const type = tagName === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : '';
+    const role = el.getAttribute?.('role') || '';
+    const contentEditable = el.isContentEditable;
+    return { tagName, type, role, contentEditable };
+  });
+  if (info.contentEditable || info.tagName === 'textarea') return;
+  if (info.tagName === 'input' && !NON_FILLABLE_INPUT_TYPES.has(info.type)) return;
+  if (info.role === 'textbox' || info.role === 'searchbox') return;
+  const target = info.type ? `${info.tagName}[type=${info.type}]` : (info.role ? `${info.tagName}[role=${info.role}]` : info.tagName || 'element');
+  throw Object.assign(new Error(`Element ${target} is not fillable. Use click for buttons and other controls.`), {
+    code: 'element_not_actionable',
+    statusCode: 422,
+  });
+}
+
+async function fillLocator(locator, text) {
+  await assertLocatorFillable(locator);
+  await locator.fill(text, { timeout: 10000 });
 }
 
 function safeError(err) {
@@ -138,13 +296,29 @@ function safeError(err) {
   return err.message;
 }
 
-// Send error response with appropriate status code (422 for stale refs, 500 otherwise)
 function sendError(res, err, extraFields = {}) {
-  const status = err instanceof StaleRefsError ? 422 : (err.statusCode || 500);
-  const body = { error: safeError(err), ...extraFields };
-  if (err instanceof StaleRefsError) {
-    body.code = 'stale_refs';
-    body.ref = err.ref;
+  const status = browserErrorStatus(err) || 500;
+  const code = browserErrorCode(err);
+  const recovery = browserErrorRecovery(err);
+  const body = {
+    error: safeError(err),
+    retryable: isRetryableBrowserError(err),
+    ...extraFields,
+  };
+  if (code) body.code = code;
+  if (recovery) body.recovery = recovery;
+  if (err instanceof StaleRefsError) body.ref = err.ref;
+  if (status >= 500 && !err.statusCode && !recovery) {
+    const req = res.req;
+    const userId = req?.query?.userId || req?.body?.userId;
+    sentryCaptureException(err, {
+      path: req?.originalUrl,
+      route: req?.route?.path,
+      method: req?.method,
+      action: req ? actionFromReq(req) : undefined,
+      userIdHash: hashIdentifier(userId),
+      reqId: req?.reqId,
+    });
   }
   res.status(status).json(body);
 }
@@ -161,20 +335,88 @@ function validateUrl(url) {
   }
 }
 
-function isLoopbackAddress(address) {
-  if (!address) return false;
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-}
+// isLoopbackAddress -- now imported from lib/auth.js (see top of file)
 
 // Import cookies into a user's browser context (Playwright cookies format)
 // POST /sessions/:userId/cookies { cookies: Cookie[] }
 //
 // SECURITY:
 // Cookie injection moves this from "anonymous browsing" to "authenticated browsing".
-// By default, this endpoint is protected by CAMOFOX_API_KEY.
-// For local development convenience, when CAMOFOX_API_KEY is NOT set, we allow
-// unauthenticated cookie import ONLY from loopback (127.0.0.1 / ::1) and ONLY
-// when NODE_ENV != production.
+/**
+ * @openapi
+ * /sessions/{userId}/cookies:
+ *   post:
+ *     tags: [Sessions]
+ *     summary: Import cookies into a user session
+ *     description: Import cookies for authenticated browsing. Requires BearerAuth in production.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Session owner identifier.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [cookies]
+ *             properties:
+ *               cookies:
+ *                 type: array
+ *                 maxItems: 500
+ *                 items:
+ *                   type: object
+ *                   required: [name, value, domain]
+ *                   properties:
+ *                     name:
+ *                       type: string
+ *                     value:
+ *                       type: string
+ *                     domain:
+ *                       type: string
+ *                     path:
+ *                       type: string
+ *                     expires:
+ *                       type: number
+ *                     httpOnly:
+ *                       type: boolean
+ *                     secure:
+ *                       type: boolean
+ *                     sameSite:
+ *                       type: string
+ *                       enum: [Strict, Lax, None]
+ *     responses:
+ *       200:
+ *         description: Cookies imported.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 userId:
+ *                   type: string
+ *                 count:
+ *                   type: integer
+ *       400:
+ *         description: Invalid cookie data.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (req, res) => {
   try {
     if (CONFIG.apiKey) {
@@ -241,6 +483,7 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
     await session.context.addCookies(sanitized);
     const result = { ok: true, userId: String(userId), count: sanitized.length };
     log('info', 'cookies imported', { reqId: req.reqId, userId: String(userId), count: sanitized.length });
+    pluginEvents.emit('session:cookies:import', { userId: String(userId), count: sanitized.length });
     res.json(result);
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'set_cookies').inc();
@@ -250,280 +493,28 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
 });
 
 let browser = null;
+let _lastBrowserPid = null; // Track PID independently for force-kill after close
+let _browserClosePromise = null; // Shared promise for concurrent close serialization
+let _lastBrowserRestartAt = 0; // Timestamp of last browser relaunch (for stale tab detection)
 // userId -> { context, tabGroups: Map<sessionKey, Map<tabId, TabState>>, lastAccess }
 // TabState = { page, refs: Map<refId, {role, name, nth}>, visitedUrls: Set, downloads: Array, toolCalls: number }
 // Note: sessionKey was previously called listItemId - both are accepted for backward compatibility
 const sessions = new Map();
 
-// ── Persistent sessions (CAMOFOX_PROFILE_DIR) ────────────────────────
-// When set, each userId's cookies + localStorage are saved to disk and
-// restored on the next context, so logins (X, TikTok, …) survive restarts.
-// Off by default → ephemeral, as before.
-const PROFILE_DIR = process.env.CAMOFOX_PROFILE_DIR || null;
-if (PROFILE_DIR) { try { fs.mkdirSync(PROFILE_DIR, { recursive: true }); } catch {} }
-const stateFile = (userId) => path.join(PROFILE_DIR, `${String(userId).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
-function loadStorageState(userId) {
-  if (!PROFILE_DIR) return undefined;
-  try { const f = stateFile(userId); if (fs.existsSync(f)) return f; } catch {}
-  return undefined;
-}
-// Re-inject a persisted jar into a fresh context. storageState restore skips
-// PARTITIONED cookies (the same reason saveStorageState merges them), so a
-// partitioned auth cookie like LinkedIn's `li_at` wouldn't load and the context
-// would be unauthenticated. addCookies honours partitionKey. Best-effort
-// per-cookie; logs only the actionable case (a cookie on disk that didn't make
-// it back into the context). Shared by the session path and recorded tabs so
-// both restore auth identically.
-async function restorePartitionedCookies(context, key, stateFilePath) {
-  try {
-    const saved = JSON.parse(fs.readFileSync(stateFilePath, 'utf8'));
-    if (Array.isArray(saved.cookies) && saved.cookies.length) {
-      await context.addCookies(saved.cookies).catch(async (e) => {
-        log('warn', 'addCookies batch failed, per-cookie fallback', { userId: key, error: e.message });
-        // a malformed cookie aborts the batch — fall back to one-by-one
-        for (const c of saved.cookies) await context.addCookies([c]).catch((err) => log('warn', 'addCookie skipped', { name: c.name, error: err.message }));
-      });
-      const restoredNames = new Set((await context.cookies().catch(() => [])).map(c => c.name));
-      const dropped = saved.cookies.filter(c => !restoredNames.has(c.name)).map(c => c.name);
-      if (dropped.length) log('warn', 'cookies not restored into context', { userId: key, dropped: [...new Set(dropped)] });
-    }
-  } catch (e) { log('warn', 'cookie restore failed', { userId: key, error: e.message }); }
-}
-const cookieKey = (c) => `${c.name}|${c.domain}|${c.path || '/'}|${c.partitionKey || ''}`;
-
-// Per-platform auth-cookie registry. A jar is "authed for" a platform when every
-// listed cookie name is present on a cookie whose domain matches. This gates
-// persistence (see saveStorageState) so a transiently logged-out jar can never
-// overwrite a known-good authed one on disk. Adding a platform = one entry, no
-// call-site edits.
-const AUTH_COOKIE_REGISTRY = [
-  { platform: 'linkedin',  domain: /(^|\.)linkedin\.com$/,         required: ['li_at'] },
-  { platform: 'x',         domain: /(^|\.)(x|twitter)\.com$/,      required: ['auth_token'] },
-  { platform: 'instagram', domain: /(^|\.)instagram\.com$/,        required: ['sessionid'] },
-  { platform: 'tiktok',    domain: /(^|\.)tiktok\.com$/,           required: ['sessionid'] },
-  { platform: 'facebook',  domain: /(^|\.)facebook\.com$/,         required: ['c_user', 'xs'] },
-  { platform: 'reddit',    domain: /(^|\.)reddit\.com$/,           required: ['reddit_session'] },
-  { platform: 'youtube',   domain: /(^|\.)(youtube|google)\.com$/, required: ['SID'] },
-];
-
-// Set of platform ids a cookie jar carries a complete auth set for.
-function authedPlatforms(cookies) {
-  const out = new Set();
-  for (const entry of AUTH_COOKIE_REGISTRY) {
-    const names = new Set(
-      (cookies || []).filter((c) => entry.domain.test(c.domain || '')).map((c) => c.name)
-    );
-    if (entry.required.every((n) => names.has(n))) out.add(entry.platform);
-  }
-  return out;
-}
-
-// Persist a session's cookie jar + origins to disk. `context.cookies()` is the
-// jar authority — it returns the FULL jar incl httpOnly and PARTITIONED (CHIPS)
-// cookies that storageState() silently drops (e.g. LinkedIn's partitioned
-// `li_at`); storageState() is consulted only for its origins/localStorage. Still-
-// valid cookies from the prior file are carried over (live wins on conflict) so a
-// value that transiently vanished mid-navigation isn't dropped. Returns a result
-// describing what happened; never throws.
-async function saveStorageState(userId, context) {
-  if (!PROFILE_DIR || !context) return { written: false, reason: 'no-profile-dir' };
-  try {
-    const state = await context.storageState();
-    let live = [];
-    try { live = await context.cookies(); } catch {}
-
-    let prior = null;
-    try { prior = JSON.parse(fs.readFileSync(stateFile(userId), 'utf8')); } catch {}
-
-    const now = Date.now() / 1000;
-    const map = new Map();
-    for (const c of prior?.cookies || []) {
-      if (c.expires === undefined || c.expires === -1 || c.expires > now) map.set(cookieKey(c), c);
-    }
-    for (const c of state.cookies || []) map.set(cookieKey(c), c);
-    for (const c of live) map.set(cookieKey(c), c);
-
-    // Jar slimming — the merge above only ever GROWS (live wins on conflict,
-    // expired priors are dropped but a jar that carried hundreds of third-party
-    // sites' cookies keeps them until they expire, and localStorage accumulates
-    // one entry per site visited). A 2.8MB jar made every newContext injection
-    // blow past its timeout ("browser connected but wedged"). The caps below
-    // bound what restore has to inject; auth cookies for every registered
-    // platform are ALWAYS kept, so no identity is ever trimmed.
-    const authCookies = [...map.values()].filter((c) => isAuthCookie(c));
-    const nonAuth = [...map.values()].filter((c) => !isAuthCookie(c));
-    let merged = [...authCookies, ...nonAuth];
-    if (merged.length > MAX_JAR_COOKIES) {
-      // Non-auth cookies beyond the cap are dropped least-recently-set first
-      // (expires as a recency proxy for session jars, longest-lived last).
-      const byExpiry = [...nonAuth].sort((a, b) => (b.expires || -1) - (a.expires || -1));
-      const keepNonAuth = byExpiry.slice(0, Math.max(0, MAX_JAR_COOKIES - authCookies.length));
-      merged = [...authCookies, ...keepNonAuth];
-    }
-
-    // Auth-gate: refuse to write a jar that has LOST auth for a platform the prior
-    // file held. Carry-over already protects against a transient blink; this is
-    // the belt to that suspenders — a genuinely expired/cleared auth cookie would
-    // otherwise persist a dead session over the last good one. Skip instead, so
-    // disk stays authed until a real re-login produces a fresh authed jar.
-    if (prior) {
-      const after = authedPlatforms(merged);
-      const lost = [...authedPlatforms(prior.cookies)].filter((p) => !after.has(p));
-      if (lost.length) return { written: false, reason: 'auth-downgrade', lost };
-    }
-
-    state.cookies = merged;
-    state.origins = slimOrigins(prior, state);
-    fs.writeFileSync(stateFile(userId), JSON.stringify(state));
-    return { written: true, authed: [...authedPlatforms(merged)] };
-  } catch {
-    return { written: false, reason: 'error' };
-  }
-}
-
-// A cookie is "auth" when it belongs to a platform the AUTH_COOKIE_REGISTRY
-// tracks AND carries one of that platform's required names — the same rule
-// authedPlatforms uses, per cookie.
-function isAuthCookie(c) {
-  for (const entry of AUTH_COOKIE_REGISTRY) {
-    if (!entry.domain.test(c.domain || '')) continue;
-    if (entry.required.includes(c.name)) return true;
-  }
-  return false;
-}
-
-// Caps for the persisted localStorage. localStorage is conveniences, never
-// identity: any site re-derives it on the next visit. Per-origin entries over
-// the per-origin budget are dropped (largest first), and whole origins beyond
-// the origin budget are skipped (smallest first — keep the ones that carry
-// real state).
-const MAX_JAR_COOKIES = 120;
-const MAX_ORIGIN_LOCALSTORAGE_BYTES = 64 * 1024;
-const MAX_ORIGINS = 60;
-
-function slimOrigins(prior, state) {
-  const measured = (state.origins || []).map((o) => ({
-    origin: o.origin,
-    localStorage: o.localStorage || [],
-    bytes: (o.localStorage || []).reduce((sum, e) => sum + (e.value ? e.value.length : 0) + (e.name ? e.name.length : 0), 0),
-  }));
-  // Carry over prior origins the live state didn't report, so a site not
-  // visited this run doesn't lose its small-but-useful state.
-  const seen = new Set(measured.map((o) => o.origin));
-  for (const o of prior?.origins || []) {
-    if (!seen.has(o.origin)) measured.push({ origin: o.origin, localStorage: o.localStorage || [], bytes: 0, carried: true });
-  }
-  const kept = [];
-  for (const o of measured) {
-    if (o.localStorage.length > 0) {
-      // Drop individual entries until the origin fits its budget (largest first).
-      const entries = [...o.localStorage].sort((a, b) => (b.value ? b.value.length : 0) - (a.value ? a.value.length : 0));
-      let bytes = entries.reduce((sum, e) => sum + (e.value ? e.value.length : 0) + (e.name ? e.name.length : 0), 0);
-      while (bytes > MAX_ORIGIN_LOCALSTORAGE_BYTES && entries.length > 0) {
-        const e = entries.shift();
-        bytes -= (e.value ? e.value.length : 0) + (e.name ? e.name.length : 0);
-      }
-      o.localStorage = entries;
-      o.bytes = bytes;
-    }
-    if (o.localStorage.length > 0 || o.carried) kept.push(o);
-  }
-  kept.sort((a, b) => b.bytes - a.bytes);
-  return kept.slice(0, MAX_ORIGINS).map((o) => ({ origin: o.origin, localStorage: o.localStorage }));
-}
-
-// Checkpoint persistence — flush a session's jar shortly after the LAST of a burst
-// of successful operations (debounced per user), instead of on a blind global
-// timer that could catch a mid-navigation/logged-out jar. Paired with the explicit
-// flushes on login (/persist) and shutdown, this covers durability without a tick
-// that races auth.
-const flushTimers = new Map();
-function scheduleFlush(userId, delayMs = 2000) {
-  if (!PROFILE_DIR) return;
-  const key = normalizeUserId(userId);
-  const existing = flushTimers.get(key);
-  if (existing) clearTimeout(existing);
-  const t = setTimeout(() => {
-    flushTimers.delete(key);
-    const s = sessions.get(key);
-    if (s?.context) saveStorageState(key, s.context).catch(() => {});
-  }, delayMs);
-  t.unref?.();
-  flushTimers.set(key, t);
-}
-
-// POST /sessions/:userId/persist — force-flush this session's storageState to
-// disk NOW (the periodic flush is every 20s), so a login is durable before any
-// restart. Returns a NAME-level cookie diagnostic (never values) so a caller can
-// confirm auth cookies landed. Loopback-only when no API key (mirrors /cookies).
-app.post('/sessions/:userId/persist', async (req, res) => {
-  try {
-    if (CONFIG.apiKey) {
-      const m = String(req.headers['authorization'] || '').match(/^Bearer\s+(.+)$/i);
-      if (!m || !timingSafeCompare(m[1], CONFIG.apiKey)) return res.status(403).json({ error: 'Forbidden' });
-    } else if (!(CONFIG.nodeEnv !== 'production' && isLoopbackAddress(req.socket?.remoteAddress || ''))) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    if (!PROFILE_DIR) return res.status(409).json({ error: 'CAMOFOX_PROFILE_DIR not set — sessions are ephemeral' });
-    const key = normalizeUserId(req.params.userId);
-    const session = sessions.get(key);
-    if (!session) return res.status(404).json({ error: 'No such session' });
-    const result = await saveStorageState(key, session.context);
-    let names = [];
-    try { names = (await session.context.cookies()).map(c => c.name); } catch {}
-    res.json({
-      ok: true,
-      userId: key,
-      written: result.written,
-      authed: result.authed || [],
-      ...(result.written ? {} : { skipped: result.reason, lost: result.lost }),
-      cookieCount: names.length,
-      cookieNames: [...new Set(names)].sort(),
-    });
-  } catch (err) {
-    res.status(500).json({ error: safeError(err) });
-  }
-});
-
-// ── Dedicated-context tabs (agstudio/native-video branch) ────────────
-//
-// Tabs created with `recordVideo` OR `viewport` in the POST /tabs body
-// get their own Playwright context (not the shared session context) so
-// they're isolated from other tabs in the same user's session.
-//
-// Two reasons to need a dedicated context:
-//   1. `recordVideo` — an ffmpeg x11grab subprocess records the Xvfb
-//      display for the lifetime of this tab, into a .webm that the
-//      downstream fetches via GET /tabs/:tabId/video.
-//   2. `viewport` — the caller wants a specific viewport width/height.
-//      Playwright's viewport is a per-context option locked at
-//      newContext() time (no hot resize), so different sizes need
-//      different contexts. No ffmpeg, no video file — just isolation.
-//
-// Entries live in this top-level map instead of `session.tabGroups`,
-// and `findTab` falls through to check it — so existing routes
-// /navigate, /snapshot, /click, /type, /evaluate etc. all keep working
-// with zero modification.
-//
-// Lifecycle:
-//   POST /tabs + (recordVideo|viewport) → fresh context + entry in map
-//   any /tabs/:tabId/* route → findTab() resolves from dedicatedTabs
-//   GET  /tabs/:tabId/video  → only valid on recordVideo entries;
-//                              400 for viewport-only tabs
-//   DELETE /tabs/:tabId      → close context; if recordVideo, schedule
-//                              grace-window video-dir cleanup; otherwise
-//                              evict immediately (nothing to fetch)
-//
-// tabId -> {
-//   tabState, context, userId, listItemId, createdAt,
-//   // recordVideo-only:
-//   ffmpegProcess?, videoDir?, videoPath?, videoSettled?,
-// }
-const dedicatedTabs = new Map();
-const VIDEO_BASE_DIR = process.env.CAMOFOX_VIDEO_DIR || '/tmp/camofox-videos';
-// How long the .webm stays on disk after the tab is closed. A client that
-// did `DELETE /tabs/:tabId` before `GET /tabs/:tabId/video` has this window
-// to come back and fetch the video.
+// Tabs that need their own Playwright context, outside the shared per-user one:
+//  - recordVideo: ffmpeg/frame-grab capture is per tab, and the recorded tab
+//    must not drag the user's other tabs into the video.
+//  - viewport: Playwright locks the viewport at newContext() time, so a
+//    custom-size tab needs a fresh context.
+// findTab() falls through to this map, so every existing /tabs/:id/* route
+// works on dedicated tabs without call-site changes.
+const dedicatedTabs = new Map(); // tabId -> { tabState, context, userId, listItemId, ... }
+// Closed recordings whose .webm is still inside the grace window. Kept apart
+// from dedicatedTabs so a closed tab disappears from GET /tabs and stops
+// counting against MAX_TABS_GLOBAL immediately, while GET /video can still
+// stream the finalized file.
+const finalizedVideos = new Map(); // tabId -> { userId, videoPath, videoDir, tabState }
+const VIDEO_BASE_DIR = CONFIG.videoDir;
 const VIDEO_GRACE_WINDOW_MS = 5 * 60 * 1000;
 
 const SESSION_TIMEOUT_MS = CONFIG.sessionTimeoutMs;
@@ -533,100 +524,97 @@ const MAX_SESSIONS = CONFIG.maxSessions;
 const MAX_TABS_PER_SESSION = CONFIG.maxTabsPerSession;
 const MAX_TABS_GLOBAL = CONFIG.maxTabsGlobal;
 const HANDLER_TIMEOUT_MS = CONFIG.handlerTimeoutMs;
+const NEW_PAGE_TIMEOUT_MS = CONFIG.newPageTimeoutMs;
 const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
+const PAGE_FORCE_CLOSE_TIMEOUT_MS = 1000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
 const BUILDREFS_TIMEOUT_MS = CONFIG.buildrefsTimeoutMs;
+const NATIVE_MEM_RESTART_THRESHOLD_MB = CONFIG.nativeMemRestartThresholdMb;
+let _nativeMemBaseline = null; // RSS - heapUsed at first idle measurement
 const FAILURE_THRESHOLD = 3;
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
 const TAB_LOCK_TIMEOUT_MS = 35000; // Must be > HANDLER_TIMEOUT_MS so active op times out first
 
 
 
-// Proper mutex for tab serialization. The old Promise-chain lock on timeout proceeded
-// WITHOUT the lock, allowing concurrent Playwright operations that corrupt CDP state.
-class TabLock {
-  constructor() {
-    this.queue = [];
-    this.active = false;
-  }
-
-  acquire(timeoutMs) {
-    return new Promise((resolve, reject) => {
-      const entry = { resolve, reject, timer: null };
-      entry.timer = setTimeout(() => {
-        const idx = this.queue.indexOf(entry);
-        if (idx !== -1) this.queue.splice(idx, 1);
-        tabLockTimeoutsTotal.inc();
-        refreshTabLockQueueDepth();
-        reject(new Error('Tab lock queue timeout'));
-      }, timeoutMs);
-      this.queue.push(entry);
-      refreshTabLockQueueDepth();
-      this._tryNext();
-    });
-  }
-
-  release() {
-    this.active = false;
-    this._tryNext();
-    refreshTabLockQueueDepth();
-  }
-
-  _tryNext() {
-    if (this.active || this.queue.length === 0) return;
-    this.active = true;
-    const entry = this.queue.shift();
-    clearTimeout(entry.timer);
-    refreshTabLockQueueDepth();
-    entry.resolve();
-  }
-
-  drain() {
-    this.active = true;
-    for (const entry of this.queue) {
-      clearTimeout(entry.timer);
-      entry.reject(new Error('Tab destroyed'));
-    }
-    this.queue = [];
-    refreshTabLockQueueDepth();
-  }
-}
-
 // Per-tab locks to serialize operations on the same tab
 const tabLocks = new Map(); // tabId -> TabLock
 
 function getTabLock(tabId) {
-  if (!tabLocks.has(tabId)) tabLocks.set(tabId, new TabLock());
+  if (!tabLocks.has(tabId)) {
+    tabLocks.set(tabId, new TabLock({
+      onTimeout: () => {
+        tabLockTimeoutsTotal.inc();
+        refreshTabLockQueueDepth();
+      },
+      onDepthChange: refreshTabLockQueueDepth,
+    }));
+  }
   return tabLocks.get(tabId);
 }
 
-// Timeout is INSIDE the lock so each operation gets its full budget
-// regardless of how long it waited in the queue.
-// Which user session owns a tab — for checkpoint flushing after a page op.
-// Dedicated/recorded tabs carry their userId; session tabs live in tabGroups.
+// Which user session owns a tab, for checkpoint flushing after a page op.
+// Dedicated (recording / viewport) tabs carry their own userId.
 function userIdForTab(tabId) {
-  const rec = dedicatedTabs.get(tabId);
-  if (rec?.userId) return rec.userId;
-  for (const [userId, s] of sessions.entries()) {
-    for (const group of s.tabGroups.values()) if (group.has(tabId)) return userId;
+  const dedicated = dedicatedTabs.get(tabId);
+  if (dedicated?.userId) return dedicated.userId;
+  for (const [userId, session] of sessions.entries()) {
+    for (const group of session.tabGroups.values()) {
+      if (group.has(tabId)) return userId;
+    }
   }
   return null;
 }
 
-async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS) {
+// Debounced checkpoint: flush a session's jar ~2 s after the LAST successful
+// operation in a burst, instead of a blind tick that races navigation or a
+// logged-out bounce. Paired with /persist and the close/shutdown checkpoints.
+const flushTimers = new Map();
+function scheduleFlush(userId, delayMs = 2000) {
+  if (!CONFIG.profileDir) return;
+  const key = normalizeUserId(userId);
+  if (!sessions.get(key)?.context) return;
+  const existing = flushTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    flushTimers.delete(key);
+    const session = sessions.get(key);
+    if (!session?.context) return;
+    persistStorageState({
+      profileDir: CONFIG.profileDir,
+      userId: key,
+      context: session.context,
+      logger: persistenceLogger,
+    }).catch(() => {});
+  }, delayMs);
+  timer.unref?.();
+  flushTimers.set(key, timer);
+}
+
+// Timeout is INSIDE the lock so each operation gets its full budget
+// regardless of how long it waited in the queue.
+async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout, { maxQueueWaitMs } = {}) {
   const lock = getTabLock(tabId);
-  // Queue wait scales with the op's own budget: a long human-typed fill
-  // legitimately holds the tab for minutes, so a queued op must not die on
-  // the flat 35s cap while the holder is still doing real work.
-  await lock.acquire(Math.max(TAB_LOCK_TIMEOUT_MS, timeoutMs));
+  // Wait for the current holder's remaining budget plus this op's own budget
+  // (never less than the legacy 35 s floor). A long human-typed fill can hold
+  // the tab for over a minute without a queued click dying in the queue and
+  // tearing the tab down mid-typing. `maxQueueWaitMs` lets a caller with an
+  // outer request deadline cap that wait so the entry expires with the request.
+  const release = await acquireForOp(lock, timeoutMs, TAB_LOCK_TIMEOUT_MS, maxQueueWaitMs);
   try {
     const result = await withTimeout(operation(), timeoutMs, 'action');
     const owner = userIdForTab(tabId);
     if (owner) scheduleFlush(owner);
     return result;
+  } catch (err) {
+    if (onTimeout && isTimeoutError(err)) {
+      await onTimeout();
+      throw Object.assign(err, { code: 'tab_timeout', statusCode: 410 });
+    }
+    throw err;
   } finally {
-    lock.release();
+    release();
   }
 }
 
@@ -641,6 +629,17 @@ function withTimeout(promise, ms, label) {
 
 function requestTimeoutMs(baseMs = HANDLER_TIMEOUT_MS) {
   return proxyPool?.canRotateSessions ? Math.max(baseMs, 180000) : baseMs;
+}
+
+function navigationRequestTimeoutMs() {
+  return Math.max(requestTimeoutMs(), NAVIGATE_TIMEOUT_MS + 5000);
+}
+
+// A tab creation can make one bounded new-page attempt, rebuild the browser
+// session, then make one more. Keep the route deadline outside that recovery
+// budget so a healthy replacement session can return its tab.
+function tabCreateRequestTimeoutMs() {
+  return Math.max(requestTimeoutMs(), (NEW_PAGE_TIMEOUT_MS * 2) + 5000);
 }
 
 const userConcurrency = new Map();
@@ -679,13 +678,21 @@ async function withUserLimit(userId, operation) {
 }
 
 async function safePageClose(page) {
+  if (!page || page.isClosed()) return;
   try {
     await Promise.race([
-      page.close(),
-      new Promise(resolve => setTimeout(resolve, PAGE_CLOSE_TIMEOUT_MS))
+      page.close({ runBeforeUnload: false }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('page close timed out')), PAGE_CLOSE_TIMEOUT_MS)),
     ]);
   } catch (e) {
-    log('warn', 'page close failed', { error: e.message });
+    log('warn', 'page close timed out or failed, force-closing', { error: e.message });
+    try {
+      await Promise.race([
+        page.close({ runBeforeUnload: false }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('page force-close timed out')), PAGE_FORCE_CLOSE_TIMEOUT_MS)),
+      ]);
+    } catch (_) {}
+    page.removeAllListeners();
   }
 }
 
@@ -719,25 +726,20 @@ let browserIdleTimer = null;
 let browserLaunchPromise = null;
 let browserWarmRetryTimer = null;
 
+// Tracks why the browser was last stopped. Intentional reasons (idle_shutdown, admin_stop)
+// keep /health returning 200. Unexpected reasons trigger 503 + warm retry.
+let _lastBrowserStopReason = null;
+const INTENTIONAL_STOP_REASONS = new Set(['idle_shutdown', 'admin_stop']);
+
 function scheduleBrowserIdleShutdown() {
-  // Idempotent: the 60s cleanup tick calls this on every pass while idle. It
-  // used to clear-and-rearm each time, so the timer was reset before it could
-  // ever expire and the browser never idled out. Keep a pending timer; it
-  // re-checks `sessions.size` when it fires, and `ensureBrowser()` (any real
-  // request) clears it.
-  if (browserIdleTimer) return;
-  if (BROWSER_IDLE_TIMEOUT_MS <= 0) return;
-  if (sessions.size === 0 && browser) {
-    browserIdleTimer = setTimeout(async () => {
-      browserIdleTimer = null;
-      if (sessions.size === 0 && browser) {
-        log('info', 'browser idle shutdown (no sessions)');
-        const b = browser;
-        browser = null;
-        await b.close().catch(() => {});
-      }
-    }, BROWSER_IDLE_TIMEOUT_MS);
-  }
+  if (browserIdleTimer || sessions.size > 0 || !browser || BROWSER_IDLE_TIMEOUT_MS <= 0) return;
+  browserIdleTimer = setTimeout(async () => {
+    browserIdleTimer = null;
+    if (sessions.size === 0 && browser) {
+      log('info', 'browser idle shutdown (no sessions)');
+      await closeBrowserFully('idle_shutdown');
+    }
+  }, BROWSER_IDLE_TIMEOUT_MS);
 }
 
 function clearBrowserIdleTimer() {
@@ -745,6 +747,27 @@ function clearBrowserIdleTimer() {
     clearTimeout(browserIdleTimer);
     browserIdleTimer = null;
   }
+}
+
+// Detects errors that retrying cannot recover from (e.g., Camoufox binary
+// missing because postinstall was skipped). The user must run
+// `npx camoufox-js fetch` and restart; looping on this wastes resources
+// and buries the actionable error under noise.
+//
+// Sentinel: matches the human-readable message thrown by camoufox-js's
+// FileNotFoundError in dist/pkgman.js (Version.fromPath). FileNotFoundError
+// is not exported from the public API, so substring matching is the only
+// available hook. If the upstream message changes, this regex needs an
+// update; the dependency range in package.json controls exposure.
+function isFatalInstallError(err) {
+  return /Version information not found/i.test(err?.message || '');
+}
+
+function camoufoxInstallRemediation() {
+  if (CONFIG.camoufoxExecutablePath) {
+    return 'verify CAMOUFOX_EXECUTABLE points to a Camoufox bundle with properties.json, version.json, and fontconfig/';
+  }
+  return 'run `npx camoufox-js fetch` then restart the server';
 }
 
 function scheduleBrowserWarmRetry(delayMs = 5000) {
@@ -756,6 +779,13 @@ function scheduleBrowserWarmRetry(delayMs = 5000) {
       await ensureBrowser();
       log('info', 'background browser warm retry succeeded', { ms: Date.now() - start });
     } catch (err) {
+      if (isFatalInstallError(err)) {
+        log('error', 'browser unavailable: Camoufox binaries are not installed; aborting retry loop', {
+          error: err.message,
+          remediation: camoufoxInstallRemediation(),
+        });
+        return;
+      }
       log('warn', 'background browser warm retry failed', { error: err.message, nextDelayMs: delayMs });
       scheduleBrowserWarmRetry(Math.min(delayMs * 2, 30000));
     }
@@ -763,42 +793,74 @@ function scheduleBrowserWarmRetry(delayMs = 5000) {
 }
 
 // --- Browser health tracking ---
+// Per-user navigation health. Each user gets an independent failure counter so
+// interleaved failures from different users don't corrupt each other's
+// recovery state. Process-global fields (activeOps, isRecovering,
+// lastSuccessfulNav) remain on the shared object for the health probe and
+// /health endpoint.
+const userNavHealth = new Map();
 const healthState = {
-  consecutiveNavFailures: 0,
-  lastSuccessfulNav: Date.now(),
   isRecovering: false,
   activeOps: 0,
+  lastSuccessfulNav: Date.now(),
 };
 
-function recordNavSuccess() {
-  healthState.consecutiveNavFailures = 0;
+function getUserNavHealth(userId) {
+  const key = normalizeUserId(userId);
+  let h = userNavHealth.get(key);
+  if (!h) {
+    h = { consecutiveNavFailures: 0 };
+    userNavHealth.set(key, h);
+  }
+  return h;
+}
+
+function deleteUserNavHealth(userId) {
+  userNavHealth.delete(normalizeUserId(userId));
+}
+
+function recordNavSuccess(userId) {
+  if (userId) {
+    const h = getUserNavHealth(userId);
+    h.consecutiveNavFailures = 0;
+  }
   healthState.lastSuccessfulNav = Date.now();
 }
 
-function recordNavFailure() {
-  healthState.consecutiveNavFailures++;
-  return healthState.consecutiveNavFailures >= FAILURE_THRESHOLD;
+function recordNavFailure(userId) {
+  if (!userId) return false;
+  const h = getUserNavHealth(userId);
+  h.consecutiveNavFailures++;
+  return h.consecutiveNavFailures >= FAILURE_THRESHOLD;
+}
+
+async function recoverUserSession(userId, reason) {
+  const key = normalizeUserId(userId);
+  log('warn', 'recovering user session after nav failure threshold', {
+    userId: key, reason, failures: getUserNavHealth(key).consecutiveNavFailures,
+  });
+  browserRestartsTotal.labels('nav_failure_recovery').inc();
+  await destroySession(key, { reason: `nav_failure_recovery:${reason}` });
+  deleteUserNavHealth(key);
 }
 
 async function restartBrowser(reason) {
   if (healthState.isRecovering) return;
   healthState.isRecovering = true;
   browserRestartsTotal.labels(reason).inc();
-  log('error', 'restarting browser', { reason, failures: healthState.consecutiveNavFailures });
+  const totalFailures = Array.from(userNavHealth.values())
+    .reduce((sum, h) => sum + h.consecutiveNavFailures, 0);
+  log('error', 'restarting browser', { reason, totalFailures });
+  pluginEvents.emit('browser:restart', { reason });
   try {
-    for (const [, session] of sessions) {
-      await session.context.close().catch(() => {});
-    }
-    sessions.clear();
-    if (browser) {
-      // close() can itself hang on a wedged browser — bound it, then abandon
-      // the (possibly orphaned) process and relaunch rather than block recovery.
-      await withTimeout(browser.close(), 10000, 'browser.close').catch(() => {});
-      browser = null;
-    }
-    browserLaunchPromise = null;
+    await closeAllSessions(`browser_restart:${reason}`, { clearDownloads: true, clearLocks: true });
+    userNavHealth.clear();
+    await closeBrowserFully(`browser_restart:${reason}`);
+    pluginEvents.emit('browser:closed', { reason });
+    // Do NOT clear browserLaunchPromise here — ensureBrowser() owns the
+    // single-flight primitive. Clearing it manually opens a window where a
+    // concurrent request can start a second launch. See #8554.
     await ensureBrowser();
-    healthState.consecutiveNavFailures = 0;
     healthState.lastSuccessfulNav = Date.now();
     log('info', 'browser restarted successfully');
   } catch (err) {
@@ -809,10 +871,15 @@ async function restartBrowser(reason) {
 }
 
 function getTotalTabCount() {
-  let total = 0;
+  let total = dedicatedTabs.size;
   for (const session of sessions.values()) {
-    for (const group of session.tabGroups.values()) {
-      total += group.size;
+    try {
+      // Use real Playwright page count so leaked pages exert backpressure
+      // on MAX_TABS_GLOBAL, surfacing leaks before Firefox starves.
+      total += session.context.pages().length;
+    } catch (_) {
+      // Context is dead — fall back to bookkeeping count for this session.
+      for (const group of session.tabGroups.values()) total += group.size;
     }
   }
   return total;
@@ -820,16 +887,60 @@ function getTotalTabCount() {
 
 // Virtual display for WebGL support and anti-detection.
 // Xvfb gives Firefox a real X display with GLX, enabling software-rendered WebGL
-// via Mesa llvmpipe. Without this, WebGL returns "no context" — a massive bot signal.
+// via Mesa llvmpipe. Without this, WebGL returns "no context" -- a massive bot signal.
+const DEFAULT_VIRTUAL_DISPLAY_RESOLUTION = '1280x720x24';
+
+class DefaultVirtualDisplay extends VirtualDisplay {
+  get xvfb_args() {
+    const args = super.xvfb_args;
+    const idx = args.indexOf('0');
+    if (idx > 0 && args[idx - 1] === '-screen') {
+      const patched = [...args];
+      patched[idx + 1] = DEFAULT_VIRTUAL_DISPLAY_RESOLUTION;
+      return patched;
+    }
+    return args;
+  }
+
+  kill() {
+    const proc = this.proc;
+    if (!proc || this.xvfbDisplayFilesCleanupRegistered) return super.kill();
+
+    this.xvfbDisplayFilesCleanupRegistered = true;
+    const cleanup = () => removeXvfbDisplayFiles(this.display);
+    if (proc.exitCode === null) proc.once('exit', cleanup);
+    else cleanup();
+    return super.kill();
+  }
+}
+
 let virtualDisplay = null;
 let browserLaunchProxy = null;
+let externalCamoufoxLaunch = null;
+
+function getExternalCamoufoxLaunch() {
+  if (!CONFIG.camoufoxExecutablePath) return null;
+  if (!externalCamoufoxLaunch) {
+    externalCamoufoxLaunch = prepareExternalCamoufoxExecutable(CONFIG.camoufoxExecutablePath, {
+      cacheDir: CONFIG.camoufoxCacheDir,
+    });
+    log('info', 'using external camoufox executable', {
+      executablePath: externalCamoufoxLaunch.executablePath,
+      resourceDir: externalCamoufoxLaunch.resourceDir,
+    });
+  }
+  return externalCamoufoxLaunch;
+}
 
 async function probeGoogleSearch(candidateBrowser) {
   let context = null;
   try {
     context = await candidateBrowser.newContext({
-      viewport: { width: 1280, height: 720 },
-      permissions: ['geolocation'],
+      viewport: null,
+      ...contextIdentityOptions({
+        hasProxy: !!proxyPool,
+        directIdentity: CONFIG.directIdentity,
+      }),
     });
     const page = await context.newPage();
     await page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -860,10 +971,190 @@ function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
   };
 }
 
+/**
+ * Close browser with full process-tree cleanup. Handles the race where
+ * browser.close() fails/hangs but process tree survives.
+ *
+ * Serialized: concurrent callers await the same promise (no double-close).
+ *
+ * Order: capture PID -> close browser -> force-kill survivors ->
+ * clean temp profiles -> verify FD/handle drop.
+ */
+async function closeBrowserFully(reason) {
+  if (_browserClosePromise) return _browserClosePromise;
+  _browserClosePromise = _closeBrowserFullyImpl(reason);
+  try {
+    return await _browserClosePromise;
+  } finally {
+    _browserClosePromise = null;
+  }
+}
+
+async function _closeBrowserFullyImpl(reason) {
+  const b = browser;
+  if (!b) return;
+  clearBrowserIdleTimer();
+
+  // Capture PID/process snapshot before nulling browser ref.
+  const pid = _lastBrowserPid;
+  // Capture ownership before Playwright closes and reparents its children.
+  // Multiple scoped servers may share a host, so a later /proc name scan must
+  // never treat another server's browser as one of our survivors.
+  const ownedBrowserProcesses = snapshotOwnedBrowserProcesses(process.pid);
+  const preCloseFds = _countOpenFds();
+  const preCloseHandles = _countActiveHandles();
+
+  // Track stop reason for health semantics
+  _lastBrowserStopReason = reason;
+
+  // Null the ref so new requests don't use a dying browser
+  browser = null;
+  _lastBrowserPid = null;
+
+  // Close through Playwright (sends CDP Browser.close, then SIGKILL process group)
+  let closeTimer;
+  try {
+    await Promise.race([
+      b.close(),
+      new Promise((_, reject) => { closeTimer = setTimeout(() => reject(new Error('browser.close() timeout')), 10000); }),
+    ]);
+  } catch (err) {
+    log('warn', 'browser.close() failed or timed out', { reason, error: err.message, pid });
+  } finally {
+    clearTimeout(closeTimer);
+  }
+
+  // Force-kill only survivors captured before this close began.
+  if (pid) {
+    await _forceKillProcessTree(pid, reason, ownedBrowserProcesses);
+  }
+  await _forceKillBrowserProcesses(reason, ownedBrowserProcesses);
+
+  // Clean up stale Firefox temp profiles (enable_cache: true accumulates data)
+  try {
+    const cleaned = cleanupStaleFirefoxProfiles();
+    if (cleaned.removed > 0) {
+      log('info', 'cleaned stale firefox profiles after browser close', cleaned);
+    }
+  } catch { /* best effort */ }
+
+  // Reset native memory baseline so next browser measures from fresh
+  reporter.resetNativeMemBaseline();
+  _nativeMemBaseline = null;
+
+  // Verify cleanup: check FD/handle counts dropped (after force-kill completes)
+  const postCloseFds = _countOpenFds();
+  const postCloseHandles = _countActiveHandles();
+  if (postCloseFds !== null && preCloseFds !== null) {
+    const fdDelta = postCloseFds - preCloseFds;
+    // After close we expect fewer FDs. If more leaked, warn.
+    if (fdDelta > 10) {
+      log('warn', 'FD leak detected after browser close', {
+        reason, preCloseFds, postCloseFds, delta: fdDelta,
+        preCloseHandles, postCloseHandles,
+      });
+    }
+  }
+  log('info', 'browser closed fully', {
+    reason, pid, preCloseFds, postCloseFds, preCloseHandles, postCloseHandles,
+  });
+}
+
+/**
+ * Force-kill a browser process tree by PID. On Linux, kills the process group
+ * (SIGKILL -pid). Orphan cleanup is deliberately left to the ownership
+ * snapshot captured before browser.close(), below.
+ */
+async function _forceKillProcessTree(pid, reason, ownedBrowserProcesses = []) {
+  if (!pid || pid <= 1) return;
+
+  if (process.platform === 'win32') {
+    const rootSnapshot = ownedBrowserProcesses.find((proc) => proc.pid === pid);
+    if (rootSnapshot && killWindowsProcessTree(pid, { expectedStartTime: rootSnapshot.startTime })) {
+      log('info', 'killed browser process tree', { pid, reason });
+    }
+    await new Promise(r => setTimeout(r, 500));
+    return;
+  }
+
+  // Kill the specific browser process first (positive PID = single process)
+  try {
+    process.kill(pid, 'SIGKILL');
+    log('info', 'sent SIGKILL to browser process', { pid, reason });
+  } catch (err) {
+    if (err.code !== 'ESRCH') {
+      log('warn', 'failed to kill browser process', { pid, error: err.message });
+    }
+  }
+
+  // Then try the process group (Playwright launches with detached:true on Linux,
+  // making the browser a process group leader)
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // ESRCH = group doesn't exist (browser wasn't a group leader), which is fine
+  }
+
+  // Give the group kill time to complete. Any descendants that escaped it are
+  // selected later only from the pre-close, starttime-safe ownership snapshot.
+  await new Promise(r => setTimeout(r, 200));
+
+  // Give the OS a moment to reclaim resources
+  await new Promise(r => setTimeout(r, 300));
+}
+
+async function _forceKillBrowserProcesses(reason, ownedBrowserProcesses = []) {
+  try {
+    const survivors = survivingOwnedBrowserProcesses(ownedBrowserProcesses);
+    const victims = survivors.map(proc => proc.pid);
+    if (victims.length > 0) {
+      log('warn', 'killing browser survivor processes', { reason, victims });
+      await killProcessIds(victims, { signal: 'SIGKILL', delayMs: 300, processSnapshots: survivors });
+    }
+  } catch (err) {
+    log('warn', 'failed to scan for browser survivor processes', { reason, error: err.message });
+  }
+}
+
+function _countOpenFds() {
+  try {
+    if (process.platform === 'linux') return fs.readdirSync('/proc/self/fd').length;
+  } catch { /* unavailable */ }
+  return null;
+}
+
+function _countActiveHandles() {
+  try { return process._getActiveHandles().length; } catch { return null; }
+}
+
+const GEOIP_SETUP_TIMEOUT_MS = 10000;
+
+function isCamoufoxGeoipError(err) {
+  return /Invalid locale:|GeoLite|MaxMind|geolocation|public proxy IP address|GeoIP setup timed out/i.test(err?.message || String(err || ''));
+}
+
+const virtualDisplayRegistry = createVirtualDisplayRegistry(() => new DefaultVirtualDisplay());
+
+async function buildLaunchOptionsWithGeoipFallback(baseOptions, attemptMeta) {
+  try {
+    return await withTimeout(launchOptions(baseOptions), GEOIP_SETUP_TIMEOUT_MS, 'GeoIP setup');
+  } catch (err) {
+    if (!baseOptions.geoip || !isCamoufoxGeoipError(err)) {
+      throw err;
+    }
+    log('warn', 'camoufox geoip setup failed; retrying launch options without geoip', {
+      ...attemptMeta,
+      error: err.message,
+    });
+    return await launchOptions({ ...baseOptions, geoip: false });
+  }
+}
+
 async function launchBrowserInstance() {
   const hostOS = getHostOS();
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
+  const externalCamoufox = getExternalCamoufoxLaunch();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const launchProxy = proxyPool
@@ -872,16 +1163,12 @@ async function launchBrowserInstance() {
 
     let localVirtualDisplay = null;
     let vdDisplay = undefined;
+    const useDesktopWindow = CONFIG.interactiveMode === 'desktop' || CONFIG.headful;
     let candidateBrowser = null;
-
     try {
-      if (os.platform() === 'linux') {
-        localVirtualDisplay = new VirtualDisplay();
-        vdDisplay = localVirtualDisplay.get();
-        // camoufox passes the display to Firefox via launch env but does NOT
-        // export DISPLAY to this process — record the active display ourselves so
-        // x11grab targets the real Xvfb (e.g. :99) instead of a stale guess.
-        activeDisplay = vdDisplay;
+      if (os.platform() === 'linux' && !useDesktopWindow) {
+        localVirtualDisplay = virtualDisplayRegistry.create();
+        vdDisplay = await localVirtualDisplay.get();
         log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
       }
     } catch (err) {
@@ -900,25 +1187,42 @@ async function launchBrowserInstance() {
       proxySession: launchProxy?.sessionId || null,
       proxyPoolSize: proxyPool?.size || 0,
       virtualDisplay: useVirtualDisplay,
+      interactiveMode: CONFIG.interactiveMode,
     });
 
     try {
-      const options = await launchOptions({
-        // CAMOFOX_HEADFUL=true → real visible window (e.g. macOS, no Xvfb) for
-        // interactive use / solving captchas; otherwise headless.
-        headless: (useVirtualDisplay || process.env.CAMOFOX_HEADFUL === 'true') ? false : true,
+      if (CONFIG.disableDefaultAddons) {
+        log('info', 'excluding default UBO addon from launch', {
+          excludeAddons: ['UBO'],
+        });
+      }
+      const options = await buildLaunchOptionsWithGeoipFallback({
+        executable_path: externalCamoufox?.executablePath,
+        headless: useVirtualDisplay ? false : !useDesktopWindow,
         os: hostOS,
         humanize: true,
-        // set navigator.languages / Intl at the browser level too (not just the
-        // context's Accept-Language) so locale is consistent end-to-end. FR by
-        // default; geoip overrides when a proxy is configured.
-        ...(launchProxy ? {} : { locale: (process.env.CAMOFOX_LOCALE || 'fr-FR').split(',') }),
         enable_cache: true,
         proxy: launchProxy,
         geoip: !!launchProxy,
+        locale: launchLocale({ hasProxy: !!proxyPool, directIdentity: CONFIG.directIdentity }),
         virtual_display: vdDisplay,
+        exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
+      }, {
+        attempt,
+        proxyServer: launchProxy?.server || null,
+        proxySession: launchProxy?.sessionId || null,
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
+      // Playwright's launcher defaults handleSIGTERM/SIGINT/SIGHUP to true,
+      // registering its own process signal handlers that send Browser.close
+      // straight to Firefox over its debug transport the instant a signal
+      // arrives -- independent of and racing ahead of our own gracefulShutdown()
+      // sequencing (including the persistence plugin's shutdown checkpoint).
+      // Disable them so gracefulShutdown() is the sole authority over shutdown.
+      options.handleSIGTERM = false;
+      options.handleSIGINT = false;
+      options.handleSIGHUP = false;
+      await pluginEvents.emitAsync('browser:launching', { options });
 
       candidateBrowser = await firefox.launch(options);
 
@@ -947,13 +1251,18 @@ async function launchBrowserInstance() {
 
       virtualDisplay = localVirtualDisplay;
       browserLaunchProxy = launchProxy;
-      browser = candidateBrowser;
+      _lastBrowserPid = candidateBrowser.process?.()?.pid ?? null;
+      browser = candidateBrowser; // publish AFTER PID is captured
+      _lastBrowserStopReason = null; // clear — browser is healthy
+      _lastBrowserRestartAt = Date.now();
       attachBrowserCleanup(browser, localVirtualDisplay);
+      pluginEvents.emit('browser:launched', { browser, display: vdDisplay });
 
       log('info', 'camoufox launched', {
         attempt,
         maxAttempts,
         virtualDisplay: useVirtualDisplay,
+        interactiveMode: CONFIG.interactiveMode,
         proxyMode: proxyPool?.mode || null,
         proxyServer: launchProxy?.server || null,
         proxySession: launchProxy?.sessionId || null,
@@ -977,22 +1286,16 @@ async function launchBrowserInstance() {
 
 async function ensureBrowser() {
   clearBrowserIdleTimer();
+  if (_browserClosePromise) {
+    await _browserClosePromise;
+  }
   if (browser && !browser.isConnected()) {
     failuresTotal.labels('browser_disconnected', 'internal').inc();
     log('warn', 'browser disconnected, clearing dead sessions and relaunching', {
       deadSessions: sessions.size,
     });
-    for (const [userId, session] of sessions) {
-      await session.context.close().catch(() => {});
-    }
-    sessions.clear();
-    // Clean up virtual display from dead browser before relaunching
-    if (virtualDisplay) {
-      virtualDisplay.kill();
-      virtualDisplay = null;
-    }
-    browserLaunchProxy = null;
-    browser = null;
+    await closeAllSessions('browser_disconnected', { clearDownloads: true, clearLocks: true });
+    await closeBrowserFully('browser_disconnected');
   }
   if (browser) return browser;
   if (browserLaunchPromise) return browserLaunchPromise;
@@ -1004,129 +1307,254 @@ async function ensureBrowser() {
   return browserLaunchPromise;
 }
 
-// newContext on a "connected" browser can still hang indefinitely: a wedged
-// camoufox process keeps the CDP/Juggler connection alive (isConnected() ===
-// true) yet stops answering commands, so ensureBrowser hands back a zombie and
-// the await never settles. Bound it, and on timeout force a full recycle and
-// retry once — connectivity is necessary but not sufficient for liveness.
-const NEW_CONTEXT_TIMEOUT_MS = Number(process.env.CAMOFOX_NEWCONTEXT_TIMEOUT_MS || 20000);
-
-async function createContextResilient(contextOptions) {
-  let b = await ensureBrowser();
-  try {
-    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext');
-  } catch (err) {
-    if (!isTimeoutError(err)) throw err;
-    log('warn', 'newContext timed out — browser connected but wedged, recycling', { error: err.message });
-    await restartBrowser('newcontext_timeout');
-    b = await ensureBrowser();
-    return await withTimeout(b.newContext(contextOptions), NEW_CONTEXT_TIMEOUT_MS, 'newContext(retry)');
-  }
-}
-
 // Helper to normalize userId to string (JSON body may parse as number)
 function normalizeUserId(userId) {
   return String(userId);
 }
 
-async function getSession(userId) {
+const sessionCreations = new Map();
+
+function clearSessionLocks(session) {
+  if (!session?.tabGroups) return;
+  for (const [, group] of session.tabGroups) {
+    for (const tabId of group.keys()) {
+      const lock = tabLocks.get(tabId);
+      if (lock) {
+        lock.drain();
+        tabLocks.delete(tabId);
+      }
+    }
+  }
+  refreshTabLockQueueDepth();
+}
+
+async function closeSession(userId, session, {
+  reason = 'session_closed',
+  clearDownloads = true,
+  clearLocks = true,
+} = {}) {
+  if (!session) return;
+
+  const key = normalizeUserId(userId);
+
+  // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
+  // (410) instead of messy "Target page closed" (500) errors.
+  if (clearLocks) {
+    clearSessionLocks(session);
+  }
+
+  if (clearDownloads) {
+    await clearSessionDownloads(session).catch(() => {});
+  }
+
+  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
+  if (session.tracePath) {
+    try {
+      await session.context.tracing.stop({ path: session.tracePath });
+      log('info', 'tracing saved', { userId: key, path: session.tracePath });
+    } catch (err) {
+      log('warn', 'tracing.stop failed', { userId: key, error: err.message });
+    }
+  }
+
+  await session.context.close().catch(() => {});
+  sessions.delete(key);
+  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+
+  refreshActiveTabsGauge();
+}
+
+async function closeAllSessions(reason, { clearDownloads = true, clearLocks = true } = {}) {
+  const openSessions = Array.from(sessions.entries());
+  for (const [userId, session] of openSessions) {
+    await closeSession(userId, session, { reason, clearDownloads, clearLocks });
+  }
+}
+
+function persistedJarPath(userId) {
+  if (!CONFIG.profileDir) return null;
+  const { storageStatePath } = getUserPersistencePaths(CONFIG.profileDir, userId);
+  if (fs.existsSync(storageStatePath)) return storageStatePath;
+  const legacy = legacyStorageStatePath(CONFIG.profileDir, userId);
+  if (legacy && fs.existsSync(legacy)) return legacy;
+  return null;
+}
+
+const persistenceLogger = { warn: (msg, fields = {}) => log('warn', msg, fields) };
+
+async function getSession(userId, { trace = false, storageState } = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
   
   // Check if existing session's context is still alive
   if (session) {
-    try {
-      // Lightweight probe: pages() is synchronous-ish and throws if context is dead
-      session.context.pages();
-    } catch (err) {
-      log('warn', 'session context dead, recreating', { userId: key, error: err.message });
-      session.context.close().catch(() => {});
-      sessions.delete(key);
+    if (session._closing) {
+      // Session is being torn down by reaper/expiry -- treat as dead
       session = null;
+    } else {
+      try {
+        // Lightweight probe: pages() is synchronous-ish and throws if context is dead
+        session.context.pages();
+      } catch (err) {
+        log('warn', 'session context dead, recreating', { userId: key, error: err.message });
+        await closeSession(key, session, { reason: 'dead_context', clearDownloads: true, clearLocks: true });
+        session = null;
+      }
     }
   }
-
-  // Stale-auth refresh: a live context built BEFORE a login keeps serving the old
-  // (unauthed) jar — restore only runs on context CREATION. So if the on-disk jar
-  // has since GAINED auth for a platform this context wasn't created with (a
-  // `/persist` from a login landed after), recreate so the fresh login is
-  // restored. mtime-gated (one stat/op; re-read only when the jar changed) and
-  // gated on a platform GAIN, so routine checkpoint flushes (same auth set) never
-  // trigger it. This is the "logged in but the daemon kept serving a stale
-  // context" fix.
+  
+  // A live context built before a login keeps serving the old jar: restore
+  // only runs at context creation. If the on-disk jar has since gained auth
+  // for a platform this context was not built with (another instance wrote it
+  // via /persist), rebuild so the fresh login is restored. mtime-gated so
+  // routine checkpoint flushes with the same auth set never trigger it.
   if (session) {
     try {
-      const f = stateFile(key);
-      const m = fs.statSync(f).mtimeMs;
-      if (m !== session.jarMtime) {
-        session.jarMtime = m;
-        const diskAuth = authedPlatforms(JSON.parse(fs.readFileSync(f, 'utf8')).cookies);
-        if ([...diskAuth].some((p) => !session.authed?.has(p))) {
-          log('info', 'session jar gained auth, recreating to restore login', { userId: key, authed: [...diskAuth] });
-          session.context.close().catch(() => {});
-          sessions.delete(key);
-          session = null;
+      const jarPath = persistedJarPath(key);
+      if (jarPath) {
+        const mtime = fs.statSync(jarPath).mtimeMs;
+        if (mtime !== session.jarMtime) {
+          session.jarMtime = mtime;
+          const saved = await readStorageStateFile(jarPath, persistenceLogger);
+          const gained = jarGainedAuth(session.authed, saved?.cookies || []);
+          if (gained.length) {
+            log('info', 'session jar gained auth, recreating to restore login', { userId: key, authed: gained });
+            await closeSession(key, session, { reason: 'jar_auth_gained', clearDownloads: true, clearLocks: true });
+            session = null;
+          }
         }
       }
-    } catch { /* no jar yet / unreadable — nothing to refresh from */ }
+    } catch { /* no jar yet / unreadable - nothing to refresh from */ }
   }
 
   if (!session) {
-    if (sessions.size >= MAX_SESSIONS) {
-      throw new Error('Maximum concurrent sessions reached');
-    }
-    const b = await ensureBrowser();
-    const contextOptions = {
-      // null = use the real browser window. Camoufox sizes the window from the
-      // host screen (anti-detection) and IGNORES a fixed viewport for rendering,
-      // but Playwright still clips screenshots to a declared viewport — so a
-      // fixed 1280x720 here renders at (say) 1728x933 yet captures only the
-      // top-left 1280x720. null keeps render and capture in sync (full window).
-      viewport: null,
-      permissions: ['geolocation'],
-    };
-    // When geoip is active (proxy configured), camoufox auto-configures
-    // locale/timezone/geolocation from the proxy IP. Without proxy, use defaults
-    // — keep locale/timezone/geo CONSISTENT (an en-US locale + LA timezone on a
-    // .fr site is exactly the cross-signal mismatch anti-bots flag). Default FR;
-    // override via CAMOFOX_LOCALE / CAMOFOX_TZ / CAMOFOX_GEO="lat,lng".
-    if (!CONFIG.proxy.host) {
-      const [glat, glng] = (process.env.CAMOFOX_GEO || '48.8566,2.3522').split(',').map(Number);
-      contextOptions.locale = process.env.CAMOFOX_LOCALE || 'fr-FR';
-      contextOptions.timezoneId = process.env.CAMOFOX_TZ || 'Europe/Paris';
-      contextOptions.geolocation = { latitude: glat, longitude: glng };
-    }
-    let sessionProxy = null;
-    if (proxyPool?.canRotateSessions) {
-      sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
-      contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
-      log('info', 'session proxy assigned', { userId: key, sessionId: sessionProxy.sessionId });
-    } else if (proxyPool) {
-      sessionProxy = proxyPool.getNext();
-      contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
-      log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
-    }
-    const restored = loadStorageState(key);
-    if (restored) contextOptions.storageState = restored;
-    const context = await createContextResilient(contextOptions);
+    session = await coalesceInflight(sessionCreations, key, async () => {
+      if (sessions.size >= MAX_SESSIONS) {
+        throw Object.assign(
+          new Error('Maximum concurrent sessions reached'),
+          { statusCode: 503, code: 'admission_rejected' }
+        );
+      }
+      // Memory admission control (Fly.io only) — reject new sessions when
+      // system memory is critically low. 503 tells Fly Proxy to try another machine.
+      if (FLY_MACHINE_ID) {
+        const freeMem = os.freemem();
+        const totalMem = os.totalmem();
+        if ((1 - freeMem / totalMem) >= 0.90) {
+          log('warn', 'memory admission rejected', {
+            usedPct: ((1 - freeMem / totalMem) * 100).toFixed(1),
+            freeMb: Math.round(freeMem / 1048576),
+            sessions: sessions.size,
+          });
+          throw Object.assign(
+            new Error('Server memory pressure — try again shortly'),
+            { statusCode: 503, code: 'admission_rejected' }
+          );
+        }
+      }
+      const contextOptions = {
+        viewport: null,
+        permissions: ['geolocation'],
+        ...contextIdentityOptions({
+          hasProxy: !!proxyPool,
+          directIdentity: CONFIG.directIdentity,
+        }),
+      };
+      // A caller-supplied storageState (browser-profiles passes one on first
+      // tab create) seeds a brand-new context. The persistence plugin may also
+      // set contextOptions.storageState via session:creating.
+      if (storageState) contextOptions.storageState = storageState;
+      let sessionProxy = null;
+      if (proxyPool?.canRotateSessions) {
+        sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
+        contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
+        log('info', 'session proxy assigned', { userId: key, sessionId: sessionProxy.sessionId });
+      } else if (proxyPool) {
+        sessionProxy = proxyPool.getNext();
+        contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
+        log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
+      }
+      await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
+      const context = await createContextResilient(contextOptions, {
+        ensureBrowser,
+        restartBrowser,
+        timeoutMs: CONFIG.newContextTimeoutMs,
+        withTimeout,
+        isTimeoutError,
+        log,
+      });
 
-    if (restored) await restorePartitionedCookies(context, key, restored);
+      let tracePath = null;
+      if (trace) {
+        const traceDir = ensureTracesDir(CONFIG.tracesDir, key);
+        tracePath = tracePathFor(CONFIG.tracesDir, key, makeTraceFilename());
+        try {
+          await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+          log('info', 'tracing enabled for session', { userId: key, traceDir, tracePath });
+        } catch (err) {
+          log('warn', 'tracing.start failed; session will not be traced', { userId: key, error: err.message });
+          tracePath = null;
+        }
+      }
 
-    // Record what this context was built authed-for + the jar's mtime, so a later
-    // login (which writes a newer, more-authed jar) is detected on reuse above.
-    let jarMtime = 0;
-    try { jarMtime = fs.statSync(stateFile(key)).mtimeMs; } catch {}
-    session = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, authed: authedPlatforms(restored?.cookies || []), jarMtime };
-    sessions.set(key, session);
-    log('info', 'session created', {
-      userId: key,
-      proxyMode: proxyPool?.mode || null,
-      proxyServer: sessionProxy?.server || browserLaunchProxy?.server || null,
-      proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
+      const jarPath = storageState || await loadPersistedStorageState(CONFIG.profileDir, key, persistenceLogger);
+      let jarMtime = 0;
+      let authed = new Set();
+      if (jarPath) {
+        try { jarMtime = fs.statSync(jarPath).mtimeMs; } catch { jarMtime = 0; }
+        const saved = await readStorageStateFile(jarPath, persistenceLogger);
+        authed = new Set(authedPlatforms(saved?.cookies || []));
+      }
+      const created = { context, tabGroups: new Map(), pageLeases: new Set(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath, jarMtime, authed };
+      sessions.set(key, created);
+      await pluginEvents.emitAsync('session:created', { userId: key, context });
+      log('info', 'session created', {
+        userId: key,
+        proxyMode: proxyPool?.mode || null,
+        proxyServer: sessionProxy?.server || browserLaunchProxy?.server || null,
+        proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
+      });
+      return created;
     });
   }
   session.lastAccess = Date.now();
   return session;
+}
+
+async function createLeasedPage(session) {
+  const lease = acquirePageLease(session);
+  try {
+    const page = setLeasedPage(lease, await session.context.newPage());
+    return { page, lease };
+  } catch (err) {
+    releasePageLease(session, lease);
+    throw err;
+  }
+}
+
+async function closeLeasedPage(session, page, lease) {
+  try {
+    await safePageClose(page);
+  } finally {
+    releasePageLease(session, lease);
+  }
+}
+
+async function createPageWithRecoveryForUser(userId, session, { trace = false } = {}) {
+  const key = normalizeUserId(userId);
+  return createPageWithSessionRecovery({
+    userId: key,
+    session,
+    trace,
+    timeoutMs: NEW_PAGE_TIMEOUT_MS,
+    withTimeout,
+    isTimeoutError,
+    isDeadContextError,
+    currentSession: () => sessions.get(key),
+    destroySession,
+    getSession,
+    log,
+  });
 }
 
 function getTabGroup(session, listItemId) {
@@ -1138,26 +1566,13 @@ function getTabGroup(session, listItemId) {
   return group;
 }
 
-function isDeadContextError(err) {
-  const msg = err && err.message || '';
-  return msg.includes('Target page, context or browser has been closed') ||
-         msg.includes('browser has been closed') ||
-         msg.includes('Context closed') ||
-         msg.includes('Browser closed');
-}
-
-function isTimeoutError(err) {
-  const msg = err && err.message || '';
-  return msg.includes('timed out after') ||
-         (msg.includes('Timeout') && msg.includes('exceeded'));
-}
-
-function isTabLockQueueTimeout(err) {
-  return err && err.message === 'Tab lock queue timeout';
-}
-
-function isTabDestroyedError(err) {
-  return err && err.message === 'Tab destroyed';
+// Drop an emptied group only while its key still maps to it. A cleanup that
+// awaited page close can resume after another cleanup dropped the group and a
+// new tab registered a replacement group under the same key.
+function dropEmptyTabGroup(session, listItemId, group) {
+  if (group.size === 0 && session.tabGroups.get(listItemId) === group) {
+    session.tabGroups.delete(listItemId);
+  }
 }
 
 // Centralized error handler for route catch blocks.
@@ -1165,7 +1580,9 @@ function isTabDestroyedError(err) {
 function isProxyError(err) {
   if (!err) return false;
   const msg = err.message || '';
-  return msg.includes('NS_ERROR_PROXY') || msg.includes('proxy connection') || msg.includes('Proxy connection');
+  return msg.includes('NS_ERROR_PROXY') || msg.includes('proxy connection') || msg.includes('Proxy connection') ||
+    msg.includes('NS_ERROR_CONNECTION_REFUSED') || msg.includes('NS_ERROR_NET_RESET') ||
+    msg.includes('NS_ERROR_NET_TIMEOUT') || msg.includes('NS_ERROR_UNKNOWN_HOST');
 }
 
 function handleRouteError(err, req, res, extraFields = {}) {
@@ -1174,20 +1591,87 @@ function handleRouteError(err, req, res, extraFields = {}) {
   failuresTotal.labels(failureType, action).inc();
 
   const userId = req.body?.userId || req.query?.userId;
-  if (userId && isDeadContextError(err)) {
-    destroySession(userId);
+  const tabId = req.body?.tabId || req.query?.tabId || req.params?.tabId;
+  let foundForContext = null;
+  if (userId && tabId) {
+    const session = sessions.get(normalizeUserId(userId));
+    foundForContext = findTab(session, tabId);
   }
-  // Proxy errors mean the session is dead — rotate at context level.
+  const pageUrl = safePageUrl(foundForContext?.tabState?.page);
+  const sentryContext = {
+    route: req.route?.path,
+    path: req.originalUrl,
+    method: req.method,
+    action,
+    reqId: req.reqId,
+    tabId,
+    userIdHash: hashIdentifier(userId),
+    urlDomain: urlDomain(pageUrl),
+    browserHealth: {
+      sessions: sessions.size,
+      tabs: _countTabs(),
+      browserPid: _browserPid(),
+      pageClosed: Boolean(foundForContext?.tabState?.page?.isClosed?.()),
+      pageCrashed: Boolean(foundForContext?.tabState?.crashed),
+    },
+    tabHealth: foundForContext?.tabState?.healthTracker?.snapshot?.(),
+  };
+  if (tabId) {
+    pluginEvents.emit('tab:error', { userId, tabId, error: err, ...sentryContext });
+  }
+  if (isPageCrashedError(err)) {
+    if (foundForContext) destroyTab(sessions.get(normalizeUserId(userId)), tabId, 'page_crashed', userId);
+    return res.status(410).json({ error: 'Page crashed. Open a new tab.', code: 'page_crashed', retryable: true, recovery: 'create_new_tab', ...extraFields });
+  }
+  if (userId && isDeadContextError(err)) {
+    destroySession(userId).catch(() => {});
+  }
+  // Proxy errors mean the session is dead -- rotate at context level.
   // Destroy the user's session so the next request gets a fresh context with a new proxy.
   if (isProxyError(err) && proxyPool?.canRotateSessions && userId) {
     log('warn', 'proxy error detected, destroying user session for fresh proxy on next request', {
       action, userId, error: err.message,
     });
     browserRestartsTotal.labels('proxy_error').inc();
-    destroySession(userId);
+    destroySession(userId).catch(() => {});
+  }
+  // Navigation-related timeouts can poison the proxy session (e.g., Cloudflare holding
+  // the connection open for 30s). The browser context shares a single proxy session, so
+  // one poisoned page kills all subsequent navigations in that context. Destroy the
+  // entire session so the next request gets a fresh BrowserContext + proxy.
+  //
+  // Guarded on proxyPool?.canRotateSessions, exactly as the proxy-error branch above
+  // is. Proxy poisoning is the whole justification for destroying a session here, so
+  // when no proxy is configured there is nothing to rotate and the teardown costs
+  // every tab under that userId for no benefit -- subsequent calls get 404 "Tab not
+  // found". #8559 reported that blast radius: one caller's timeout killing every
+  // concurrent tab, because parallel callers share a userId. v1.14.0 fixed the
+  // trigger described there (bare image URLs now complete at commit) but left the
+  // radius, so any other timeout -- a slow page, a hung connection -- still takes the
+  // whole session.
+  //
+  // Without a proxy, the per-tab consecutive-timeout reaper below is the right
+  // granularity and still collects a genuinely stuck tab. recordNavFailure is kept on
+  // both paths so session health tracking is unchanged either way.
+  const NAVIGATION_TIMEOUT_ACTIONS = new Set(['click', 'navigate', 'open_url']);
+  const isNavigationTimeout =
+    isTimeoutError(err) && err.code !== 'tab_timeout' && userId && NAVIGATION_TIMEOUT_ACTIONS.has(action);
+  if (isNavigationTimeout && proxyPool?.canRotateSessions) {
+    log('warn', 'navigation timeout — destroying session for fresh proxy', {
+      action, userId, error: err.message,
+    });
+    browserRestartsTotal.labels('navigation_timeout').inc();
+    recordNavFailure(userId);
+    destroySession(userId).catch(() => {});
+  } else if (isNavigationTimeout) {
+    log('warn', 'navigation timeout — no proxy to rotate, leaving the session up', {
+      action, userId, error: err.message,
+    });
+    recordNavFailure(userId);
   }
   // Track consecutive timeouts per tab and auto-destroy stuck tabs
-  if (userId && isTimeoutError(err)) {
+  // (for non-navigation timeouts like type, scroll that don't poison the proxy)
+  if (userId && isTimeoutError(err) && !NAVIGATION_TIMEOUT_ACTIONS.has(action)) {
     const tabId = req.body?.tabId || req.query?.tabId || req.params?.tabId;
     const session = sessions.get(normalizeUserId(userId));
     if (session && tabId) {
@@ -1196,28 +1680,72 @@ function handleRouteError(err, req, res, extraFields = {}) {
         found.tabState.consecutiveTimeouts++;
         if (found.tabState.consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
           log('warn', 'auto-destroying tab after consecutive timeouts', { tabId, count: found.tabState.consecutiveTimeouts });
-          destroyTab(session, tabId, 'consecutive_timeouts');
+          destroyTab(session, tabId, 'consecutive_timeouts', userId);
         }
       }
     }
   }
-  // Lock queue timeout = tab is stuck. Destroy immediately.
+  // Lock queue timeout means the tab is busy, not necessarily broken. Do NOT
+  // destroy it: the holder may still be making progress (for example a long
+  // human-typed fill). The caller can retry or wait.
   if (userId && isTabLockQueueTimeout(err)) {
-    const tabId = req.body?.tabId || req.query?.tabId || req.params?.tabId;
-    const session = sessions.get(normalizeUserId(userId));
-    if (session && tabId) {
-      destroyTab(session, tabId, 'lock_queue');
-    }
-    return res.status(503).json({ error: 'Tab unresponsive and has been destroyed. Open a new tab.', ...extraFields });
+    handleTabLockQueueTimeout({ res, extraFields, sessions, userId, tabId });
+    return;
   }
   // Tab was destroyed while this request was queued in the lock
   if (isTabDestroyedError(err)) {
-    return res.status(410).json({ error: 'Tab was destroyed. Open a new tab.', ...extraFields });
+    return res.status(410).json({ error: 'Tab was destroyed. Open a new tab.', code: 'tab_destroyed', retryable: true, recovery: 'create_new_tab', ...extraFields });
+  }
+  // Dead context = session torn down (by proxy error, timeout, or reaper) while this op
+  // was in flight. The ROOT CAUSE was already reported — this is a cascade error.
+  // Return 503 (retriable) so the client retries with a fresh session.
+  if (isDeadContextError(err)) {
+    return res.status(503).json({ error: 'Browser session expired. Retry to get a fresh session.', code: 'session_expired', retryable: true, recovery: 'retry', ...extraFields });
+  }
+  // --- Frustration detection: report when a tab hits a streak of failures ---
+  // Individual failures are noise. 3+ consecutive = the site is persistently broken.
+  const FRUSTRATION_TYPES = new Set(['timeout', 'dead_context', 'nav_aborted']);
+  if (FRUSTRATION_TYPES.has(failureType) && userId && tabId) {
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (found) {
+      const ts = found.tabState;
+      ts.consecutiveFailures = (ts.consecutiveFailures || 0) + 1;
+      if (!ts.failureJournal) ts.failureJournal = [];
+      ts.failureJournal.push({ type: failureType, action, at: Date.now() });
+      if (ts.failureJournal.length > 20) ts.failureJournal = ts.failureJournal.slice(-20);
+
+      if (ts.consecutiveFailures === 3) {
+        const _proxyErr = classifyProxyError(err?.message);
+        reporter.reportHang(action, req.startTime ? Date.now() - req.startTime : 0, {
+          error: err,
+          healthSnapshot: ts.healthTracker ? ts.healthTracker.snapshot() : undefined,
+          healthTracker: ts.healthTracker || null,
+          resourceOpts: _resourceOpts(),
+          proxy: proxyPool ? {
+            configured: true,
+            type: proxyPool.mode || null,
+            authConfigured: !!CONFIG.proxy?.username,
+            error: _proxyErr.proxyError,
+            tlsError: _proxyErr.proxyTlsError,
+          } : { configured: false },
+          context: {
+            failureType,
+            consecutiveFailures: ts.consecutiveFailures,
+            toolCalls: ts.toolCalls,
+            journal: ts.failureJournal.map(j => `${j.type}:${j.action}`),
+          },
+        });
+      }
+    }
   }
   sendError(res, err, extraFields);
 }
 
-function destroyTab(session, tabId, reason) {
+function destroyTab(session, tabId, reason, userId) {
+  // A page crash can call this for a dedicated tab (or after its session was
+  // already torn down); there is no shared tabGroups map to mutate then.
+  if (!session || !session.tabGroups) return false;
   const lock = tabLocks.get(tabId);
   if (lock) {
     lock.drain();
@@ -1233,10 +1761,49 @@ function destroyTab(session, tabId, reason) {
       if (group.size === 0) session.tabGroups.delete(listItemId);
       refreshActiveTabsGauge();
       if (reason) tabsDestroyedTotal.labels(reason).inc();
+      pluginEvents.emit('tab:destroyed', { userId: userId || null, tabId, reason: reason || 'unknown' });
       return true;
     }
   }
   return false;
+}
+
+async function destroyTimedOutTab(session, tabId, reason, userId) {
+  const found = findTab(session, tabId);
+  if (!found) return;
+  const { tabState, group, listItemId } = found;
+  if (found.dedicated) {
+    await finalizeRecording(dedicatedTabs.get(tabId), reason).catch(() => {});
+    const dedicated = dedicatedTabs.get(tabId);
+    dedicatedTabs.delete(tabId);
+    if (dedicated?.videoDir) finalizedVideos.set(tabId, dedicated);
+    const lock = tabLocks.get(tabId);
+    if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+    scheduleDedicatedTabCleanup(tabId);
+    refreshActiveTabsGauge();
+    tabsDestroyedTotal.labels(reason).inc();
+    pluginEvents.emit('tab:destroyed', { userId: userId || null, tabId, reason });
+    return;
+  }
+  log('warn', 'destroying timed-out tab', { tabId, listItemId, toolCalls: tabState.toolCalls, reason });
+  try {
+    await safePageClose(tabState.page);
+    await clearTabDownloads(tabState);
+  } catch (err) {
+    log('warn', 'timed-out tab cleanup failed', { tabId, error: err.message });
+  } finally {
+    group.delete(tabId);
+    dropEmptyTabGroup(session, listItemId, group);
+    const lock = tabLocks.get(tabId);
+    if (lock) {
+      lock.drain();
+      tabLocks.delete(tabId);
+      refreshTabLockQueueDepth();
+    }
+    refreshActiveTabsGauge();
+    tabsDestroyedTotal.labels(reason).inc();
+    pluginEvents.emit('tab:destroyed', { userId: userId || null, tabId, reason });
+  }
 }
 
 /**
@@ -1244,7 +1811,7 @@ function destroyTab(session, tabId, reason) {
  * Closes the old tab's page and removes it from its group.
  * Returns { recycledTabId, recycledFromGroup } or null if no tab to recycle.
  */
-async function recycleOldestTab(session, reqId) {
+async function recycleOldestTab(session, reqId, userId) {
   let oldestTab = null;
   let oldestGroup = null;
   let oldestGroupKey = null;
@@ -1263,41 +1830,44 @@ async function recycleOldestTab(session, reqId) {
 
   await safePageClose(oldestTab.page);
   oldestGroup.delete(oldestTabId);
-  if (oldestGroup.size === 0) session.tabGroups.delete(oldestGroupKey);
+  dropEmptyTabGroup(session, oldestGroupKey, oldestGroup);
   const lock = tabLocks.get(oldestTabId);
   if (lock) { lock.drain(); tabLocks.delete(oldestTabId); }
   refreshTabLockQueueDepth();
   tabsRecycledTotal.inc();
+  pluginEvents.emit('tab:recycled', { userId: userId || null, tabId: oldestTabId });
   log('info', 'tab recycled (limit reached)', { reqId, recycledTabId: oldestTabId, recycledFromGroup: oldestGroupKey });
   return { recycledTabId: oldestTabId, recycledFromGroup: oldestGroupKey };
 }
 
-function destroySession(userId) {
+async function destroySession(userId, { reason = 'destroy_session' } = {}) {
   const key = normalizeUserId(userId);
+  // Dedicated-context tabs are independent of the shared session but belong to
+  // the same user; an explicit session delete tears them down too.
+  for (const [tabId, entry] of Array.from(dedicatedTabs.entries())) {
+    if (entry.userId !== key) continue;
+    await finalizeRecording(entry, reason).catch(() => {});
+    dedicatedTabs.delete(tabId);
+    if (entry.videoDir) finalizedVideos.set(tabId, entry);
+    const lock = tabLocks.get(tabId);
+    if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+    scheduleDedicatedTabCleanup(tabId);
+  }
   const session = sessions.get(key);
-  if (!session) return;
-  log('warn', 'destroying dead session', { userId: key });
-  session.context.close().catch(() => {});
+  if (!session) return false;
+  log('warn', 'destroying session', { userId: key, reason });
   sessions.delete(key);
+  deleteUserNavHealth(key);
+  await closeSession(key, session, { reason, clearDownloads: true, clearLocks: true });
+  return true;
 }
 
 function findTab(session, tabId) {
-  // Recorded tabs live in their own top-level map with a dedicated
-  // Playwright context — check there first so tabs created via
-  // `POST /tabs { recordVideo: ... }` resolve even though they aren't
-  // in any user session's tabGroups.
-  const recorded = dedicatedTabs.get(tabId);
-  if (recorded) {
-    return {
-      tabState: recorded.tabState,
-      listItemId: recorded.listItemId,
-      // `group` is unused by almost every caller; the one exception is
-      // DELETE which removes from group.delete(tabId). The dedicated
-      // close path handles recorded tabs separately so an undefined
-      // group is safe here.
-      group: null,
-      recorded: true,
-    };
+  // Dedicated-context tabs (recording / custom viewport) are not in any
+  // session's tabGroups; check their own map first.
+  const dedicated = dedicatedTabs.get(tabId);
+  if (dedicated) {
+    return { tabState: dedicated.tabState, listItemId: dedicated.listItemId, group: null, dedicated: true };
   }
   if (!session) return null;
   for (const [listItemId, group] of session.tabGroups) {
@@ -1309,30 +1879,249 @@ function findTab(session, tabId) {
   return null;
 }
 
+// Return 404 or 410 depending on whether the browser restarted recently.
+// 410 Gone tells clients the tab existed but the browser crashed — create a new one.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function tabNotFoundResponse(res, tabId) {
+  // Only return 410 for tabs that look like valid UUIDs (plausibly created by this server),
+  // belonged to this machine, and were lost in a recent browser restart.
+  // Random/invalid strings like 'non-existent-tab' always get 404.
+  // Tab IDs may be Fly-prefixed: "{machineId}_{uuid}" — extract UUID portion for validation.
+  const uuidPart = tabId && tabId.includes('_') && !tabId.slice(0, tabId.indexOf('_')).includes('-')
+    ? tabId.slice(tabId.indexOf('_') + 1)
+    : tabId;
+  if (_lastBrowserRestartAt && (Date.now() - _lastBrowserRestartAt < 300_000) && UUID_RE.test(uuidPart) && fly.isLocalTab(tabId)) {
+    return res.status(410).json({
+      error: 'Tab no longer exists (browser was restarted). Create a new tab.',
+      code: 'browser_restarted',
+    });
+  }
+  return res.status(404).json({ error: 'Tab not found' });
+}
+
 function createTabState(page) {
-  return {
+  const healthTracker = createTabHealthTracker(page);
+  const tabState = {
     page,
     refs: new Map(),
     visitedUrls: new Set(),
     downloads: [],
+    downloadEventSequence: 0,
     toolCalls: 0,
     consecutiveTimeouts: 0,
+    consecutiveFailures: 0,
+    failureJournal: [],
+    healthTracker,
     lastSnapshot: null,
+    lastStructure: null,
     lastRequestedUrl: null,
+    lastNavigationHttpStatus: null,
     googleRetryCount: 0,
-    // Server-side network capture (Playwright request events) — catches calls
-    // even from sites whose JS grabs `fetch` at module-load, which an in-page
-    // wrapper cannot. Armed via POST /tabs/:tabId/capture, drained via GET.
-    netCap: null,
-    netCapRE: null,
-    netCapAttached: false,
+    navigateAbort: null,
+    pressureObservedAt: Date.now(),
+    pressureObservedToolCalls: 0,
+    crashed: false,
+    lastMainFrameResponse: null,
+  };
+  page?.on?.('crash', () => { tabState.crashed = true; });
+  attachNavigationResponseTracker(tabState);
+  return tabState;
+}
+
+/**
+ * Attach a popup handler to a managed page so that popups (target=_blank,
+ * window.open) become tracked tabs rather than orphaned pages. (JO-2456)
+ *
+ * The handler registers the popup in the same session's '__popups__' tab group
+ * and recursively attaches itself to the new page.
+ */
+function attachPopupHandler(page, userId, sessionKey) {
+  page.on('popup', (popupPage) => {
+    const key = normalizeUserId(userId);
+    const currentSession = sessions.get(key);
+    if (!currentSession || currentSession._closing) return;
+
+    const popupTabId = fly.makeTabId();
+    const popupTabState = createTabState(popupPage);
+    attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
+    const popupGroup = getTabGroup(currentSession, sessionKey || '__popups__');
+    popupGroup.set(popupTabId, popupTabState);
+    currentSession.lastAccess = Date.now();
+    refreshActiveTabsGauge();
+    log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
+    pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
+    // Recursively handle popups from the popup
+    attachPopupHandler(popupPage, userId, sessionKey);
+  });
+}
+
+function pressureHash(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
+}
+
+function pressureLockState(tabId) {
+  const lock = tabLocks.get(tabId);
+  return {
+    active: Boolean(lock?.active),
+    queued: Number(lock?.queue?.length || 0),
+  };
+}
+
+async function camofoxPressureCleanup(options = {}) {
+  const now = Date.now();
+  const minIdleMs = Math.max(0, Number(options.minIdleMs ?? 10 * 60 * 1000));
+  const maxTabsToClose = Math.max(0, Number(options.maxTabsToClose ?? 4));
+  const minTabsPerSession = Math.max(0, Number(options.minTabsPerSession ?? 1));
+  const dryRun = options.dryRun !== false;
+  const closeEmptySessions = options.closeEmptySessions !== false;
+  const before = { sessions: sessions.size, tabs: getTotalTabCount() };
+  const sessionTabCounts = new Map();
+  for (const [userId, session] of sessions) {
+    let count = 0;
+    for (const group of session.tabGroups.values()) count += group.size;
+    sessionTabCounts.set(userId, count);
+  }
+  const preserved = {
+    locked: 0,
+    session_minimum: 0,
+    first_observation: 0,
+    recently_active: 0,
+    below_min_idle: 0,
+  };
+  const candidates = [];
+
+  for (const [userId, session] of sessions) {
+    for (const [listItemId, group] of session.tabGroups) {
+      for (const [tabId, tabState] of group) {
+        const lockState = pressureLockState(tabId);
+        if (lockState.active || lockState.queued > 0) {
+          preserved.locked += 1;
+          continue;
+        }
+
+        if ((sessionTabCounts.get(userId) || 0) <= minTabsPerSession) {
+          preserved.session_minimum += 1;
+          continue;
+        }
+
+        if (!Number.isFinite(tabState.pressureObservedAt)) {
+          tabState.pressureObservedAt = now;
+          tabState.pressureObservedToolCalls = tabState.toolCalls;
+          preserved.first_observation += 1;
+          continue;
+        }
+
+        if (tabState.pressureObservedToolCalls !== tabState.toolCalls) {
+          tabState.pressureObservedAt = now;
+          tabState.pressureObservedToolCalls = tabState.toolCalls;
+          preserved.recently_active += 1;
+          continue;
+        }
+
+        const idleMs = now - tabState.pressureObservedAt;
+        if (idleMs < minIdleMs) {
+          preserved.below_min_idle += 1;
+          continue;
+        }
+
+        candidates.push({
+          userId,
+          session,
+          listItemId,
+          group,
+          tabId,
+          tabState,
+          idleMs,
+          toolCalls: tabState.toolCalls,
+        });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => (b.idleMs - a.idleMs) || (a.toolCalls - b.toolCalls));
+  const selected = candidates.slice(0, maxTabsToClose);
+  const selectedSummary = selected.map((item) => ({
+    session: pressureHash(item.userId),
+    tab: pressureHash(item.tabId),
+    group: pressureHash(item.listItemId),
+    idleMs: item.idleMs,
+    toolCalls: item.toolCalls,
+  }));
+  const closed = [];
+
+  if (!dryRun) {
+    for (const item of selected) {
+      if (!item.group.has(item.tabId)) continue;
+      if ((sessionTabCounts.get(item.userId) || 0) <= minTabsPerSession) continue;
+      const lockState = pressureLockState(item.tabId);
+      if (lockState.active || lockState.queued > 0) continue;
+      if (item.tabState.navigateAbort) item.tabState.navigateAbort.abort();
+      await clearTabDownloads(item.tabState).catch(() => {});
+      await safePageClose(item.tabState.page);
+      item.group.delete(item.tabId);
+      sessionTabCounts.set(item.userId, Math.max(0, (sessionTabCounts.get(item.userId) || 0) - 1));
+      const lock = tabLocks.get(item.tabId);
+      if (lock) {
+        lock.drain();
+        tabLocks.delete(item.tabId);
+      }
+      tabsReapedTotal.inc();
+      pluginEvents.emit('tab:reaped', { userId: item.userId, tabId: item.tabId, listItemId: item.listItemId, reason: 'pressure_cleanup', idleMs: item.idleMs });
+      log('info', 'tab reaped (pressure cleanup)', { userId: item.userId, tabId: item.tabId, listItemId: item.listItemId, idleMs: item.idleMs, toolCalls: item.toolCalls });
+      closed.push({ session: pressureHash(item.userId), tab: pressureHash(item.tabId), group: pressureHash(item.listItemId), idleMs: item.idleMs, toolCalls: item.toolCalls });
+    }
+
+    for (const [userId, session] of Array.from(sessions.entries())) {
+      for (const [listItemId, group] of Array.from(session.tabGroups.entries())) {
+        if (group.size === 0) session.tabGroups.delete(listItemId);
+      }
+      if (closeEmptySessions && session.tabGroups.size === 0 && !hasActivePageLeases(session)) {
+        session._closing = true;
+        await closeSession(userId, session, { reason: 'pressure_cleanup_empty_session', clearDownloads: true, clearLocks: true });
+        sessionsExpiredTotal.inc();
+        log('info', 'session closed (pressure cleanup empty)', { userId });
+      }
+    }
+
+    refreshTabLockQueueDepth();
+    refreshActiveTabsGauge();
+    if (sessions.size === 0) scheduleBrowserIdleShutdown();
+  }
+
+  return {
+    ok: true,
+    dryRun,
+    minIdleMs,
+    maxTabsToClose,
+    minTabsPerSession,
+    before,
+    candidates: candidates.length,
+    selected: selectedSummary,
+    closed,
+    preserved,
+    after: { sessions: sessions.size, tabs: getTotalTabCount() },
   };
 }
 
 async function isGoogleUnavailable(page) {
   if (!page || page.isClosed()) return false;
   const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 600) || '').catch(() => '');
-  return /Unable to connect|502 Bad Gateway or Proxy Error|Camoufox can’t establish a connection/.test(bodyText);
+  return /Unable to connect|502 Bad Gateway or Proxy Error|Camoufox can't establish a connection/.test(bodyText);
+}
+
+async function isFallbackSearchBlocked(page, engine) {
+  if (!page || page.isClosed()) return true;
+  const url = page.url();
+  const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 1000) || '').catch(() => '');
+  if (/Unable to connect|502 Bad Gateway or Proxy Error|Camoufox can't establish a connection/i.test(bodyText)) return true;
+  if (engine === 'duckduckgo') {
+    return !/duckduckgo\.com/i.test(url) || /captcha|verify you are human|unusual traffic/i.test(bodyText);
+  }
+  if (engine === 'bing') {
+    return !/bing\.com/i.test(url) || /captcha|verify you are human|unusual traffic/i.test(bodyText);
+  }
+  return true;
 }
 
 async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reason, reqId) {
@@ -1341,22 +2130,23 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
 
   browserRestartsTotal.labels(reason).inc(); // track rotation events (not a full restart)
 
-  // Rotate at context level — create a fresh context with a new proxy session
+  // Rotate at context level -- create a fresh context with a new proxy session
   // instead of restarting the entire browser (which kills ALL sessions/tabs).
   const key = normalizeUserId(userId);
   const oldSession = sessions.get(key);
   if (oldSession) {
-    await oldSession.context.close().catch(() => {});
-    sessions.delete(key);
+    await closeSession(key, oldSession, { reason: 'google_rotate_context', clearDownloads: true, clearLocks: true });
   }
   const session = await getSession(userId);
   const group = getTabGroup(session, sessionKey);
-  const page = await session.context.newPage();
+  const { page, lease } = await createLeasedPage(session);
   const tabState = createTabState(page);
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
-  attachDownloadListener(tabState, tabId, log);
+  attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
   group.set(tabId, tabState);
+  releasePageLease(session, lease);
+  attachPopupHandler(page, userId, sessionKey);
   refreshActiveTabsGauge();
 
   log('warn', 'replaying google search on fresh context (per-context proxy rotation)', {
@@ -1367,10 +2157,10 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
     proxySession: session.proxySessionId || null,
   });
 
-  await withPageLoadDuration('navigate', () => page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }));
+  await withPageLoadDuration('navigate', () => navigatePage(page, 'https://www.google.com/', { timeout: NAVIGATE_TIMEOUT_MS }));
   tabState.visitedUrls.add('https://www.google.com/');
   await page.waitForTimeout(1200);
-  await withPageLoadDuration('navigate', () => page.goto(tabState.lastRequestedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+  await withPageLoadDuration('navigate', () => navigatePage(page, tabState.lastRequestedUrl, { timeout: NAVIGATE_TIMEOUT_MS }));
   tabState.visitedUrls.add(tabState.lastRequestedUrl);
   return { session, tabState };
 }
@@ -1396,6 +2186,15 @@ async function withPageLoadDuration(action, fn) {
   }
 }
 
+async function navigatePage(page, url, { timeout = 30000 } = {}) {
+  const response = await page.goto(url, { waitUntil: 'commit', timeout });
+  const contentType = response?.headers()?.['content-type']?.toLowerCase() || '';
+  if (!contentType.startsWith('image/')) {
+    await page.waitForLoadState('domcontentloaded', { timeout });
+  }
+  return response;
+}
+
 
 
 async function waitForPageReady(page, options = {}) {
@@ -1406,6 +2205,7 @@ async function waitForPageReady(page, options = {}) {
     settleMs = 200,
     hydrationPollMs = 250,
     hydrationTimeoutMs = Math.min(timeout, 10000),
+    dismissConsent = false,
   } = options;
   
   try {
@@ -1440,8 +2240,9 @@ async function waitForPageReady(page, options = {}) {
       await page.waitForTimeout(settleMs);
     }
     
-    // Auto-dismiss common consent/privacy dialogs
-    await dismissConsentDialogs(page);
+    if (dismissConsent) {
+      await dismissConsentDialogs(page);
+    }
     
     return true;
   } catch (err) {
@@ -1451,33 +2252,15 @@ async function waitForPageReady(page, options = {}) {
 }
 
 async function dismissConsentDialogs(page) {
-  // Common consent/privacy dialog selectors (matches Swift WebView.swift patterns)
+  // Restrict this opt-in behavior to consent-manager controls. Broad dialog,
+  // modal, and aria-label selectors can close application UI unrelated to consent.
   const dismissSelectors = [
-    // OneTrust (very common)
-    '#onetrust-banner-sdk button#onetrust-accept-btn-handler',
-    '#onetrust-banner-sdk button#onetrust-reject-all-handler',
-    '#onetrust-close-btn-container button',
-    // Generic patterns
-    'button[data-test="cookie-accept-all"]',
-    'button[aria-label="Accept all"]',
-    'button[aria-label="Accept All"]',
-    'button[aria-label="Close"]',
-    'button[aria-label="Dismiss"]',
-    // Dialog close buttons
-    'dialog button:has-text("Close")',
-    'dialog button:has-text("Accept")',
-    'dialog button:has-text("I Accept")',
-    'dialog button:has-text("Got it")',
-    'dialog button:has-text("OK")',
-    // GDPR/CCPA specific
-    '[class*="consent"] button[class*="accept"]',
-    '[class*="consent"] button[class*="close"]',
-    '[class*="privacy"] button[class*="close"]',
-    '[class*="cookie"] button[class*="accept"]',
-    '[class*="cookie"] button[class*="close"]',
-    // Overlay close buttons
-    '[class*="modal"] button[class*="close"]',
-    '[class*="overlay"] button[class*="close"]',
+    '#onetrust-banner-sdk #onetrust-accept-btn-handler',
+    '#onetrust-banner-sdk #onetrust-reject-all-handler',
+    '#onetrust-banner-sdk #onetrust-close-btn-container button',
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#CybotCookiebotDialogBodyButtonDecline',
+    '#qc-cmp2-ui button[mode="primary"]',
   ];
   
   for (const selector of dismissSelectors) {
@@ -1580,53 +2363,43 @@ async function extractGoogleSerp(page) {
     
     const resultContainer = document.querySelector('#rso') || document.querySelector('#search');
     if (resultContainer) {
-      const resultBlocks = resultContainer.querySelectorAll(':scope > div');
-      for (const block of resultBlocks) {
-        const h3 = block.querySelector('h3');
-        const mainLink = h3 ? h3.closest('a') : null;
-        
-        if (h3 && mainLink) {
-          const title = h3.textContent.trim().replace(/"/g, '\\"');
-          const href = mainLink.href;
-          const cite = block.querySelector('cite');
-          const displayUrl = cite ? cite.textContent.trim() : '';
-          
-          let snippet = '';
-          for (const sel of ['[data-sncf]', '[data-content-feature="1"]', '.VwiC3b', 'div[style*="-webkit-line-clamp"]', 'span.aCOpRe']) {
-            const el = block.querySelector(sel);
-            if (el) { snippet = el.textContent.trim().slice(0, 300); break; }
-          }
-          if (!snippet) {
-            const allText = block.textContent.trim().replace(/\s+/g, ' ');
-            const titleLen = title.length + (displayUrl ? displayUrl.length : 0);
-            if (allText.length > titleLen + 20) {
-              snippet = allText.slice(titleLen).trim().slice(0, 300);
-            }
-          }
-          
-          const refId = addRef('link', title);
-          snapshot.push('- link "' + title + '" [' + refId + ']:');
-          snapshot.push('  - /url: ' + href);
-          if (displayUrl) snapshot.push('  - cite: ' + displayUrl);
-          if (snippet) snapshot.push('  - text: ' + snippet);
-        } else {
-          const blockLinks = block.querySelectorAll('a[href^="http"]:not([href*="google.com/search"])');
-          if (blockLinks.length > 0) {
-            const blockText = block.textContent.trim().replace(/\s+/g, ' ').slice(0, 200);
-            if (blockText.length > 10) {
-              snapshot.push('- group:');
-              snapshot.push('  - text: ' + blockText);
-              blockLinks.forEach(a => {
-                const linkText = (a.textContent || '').trim().replace(/"/g, '\\"').slice(0, 100);
-                if (linkText.length > 2) {
-                  const refId = addRef('link', linkText);
-                  snapshot.push('  - link "' + linkText + '" [' + refId + ']:');
-                  snapshot.push('    - /url: ' + a.href);
-                }
-              });
-            }
-          }
+      const seenResultUrls = new Set();
+      const resultHeadings = resultContainer.querySelectorAll('h3');
+      for (const h3 of resultHeadings) {
+        const mainLink = h3.closest('a[href]');
+        if (!mainLink || !mainLink.href || seenResultUrls.has(mainLink.href)) continue;
+        if (mainLink.href.includes('google.com/search')) continue;
+        seenResultUrls.add(mainLink.href);
+
+        // Google's organic cards are nested several wrappers below #rso. Walk up
+        // to the nearest result-sized container instead of assuming direct children.
+        const block = h3.closest('.MjjYud, .g, [data-snhf], [data-content-feature]')
+          || mainLink.parentElement?.parentElement
+          || mainLink.parentElement
+          || resultContainer;
+        const title = h3.textContent.trim().replace(/"/g, '\\"');
+        if (!title) continue;
+        const href = mainLink.href;
+        const cite = block.querySelector('cite');
+        const displayUrl = cite ? cite.textContent.trim() : '';
+
+        let snippet = '';
+        for (const sel of ['[data-sncf]', '[data-content-feature="1"]', '.VwiC3b', 'div[style*="-webkit-line-clamp"]', 'span.aCOpRe']) {
+          const el = block.querySelector(sel);
+          if (el && !h3.contains(el)) { snippet = el.textContent.trim().slice(0, 300); break; }
         }
+        if (!snippet) {
+          const allText = block.textContent.trim().replace(/\s+/g, ' ');
+          const titleOffset = allText.indexOf(h3.textContent.trim());
+          const afterTitle = titleOffset >= 0 ? allText.slice(titleOffset + h3.textContent.trim().length) : allText;
+          if (afterTitle.length > 20) snippet = afterTitle.trim().slice(0, 300);
+        }
+
+        const refId = addRef('link', title);
+        snapshot.push('- link "' + title + '" [' + refId + ']:');
+        snapshot.push('  - /url: ' + href);
+        if (displayUrl) snapshot.push('  - cite: ' + displayUrl);
+        if (snippet) snapshot.push('  - text: ' + snippet);
       }
     }
     
@@ -1674,7 +2447,7 @@ async function buildRefs(page) {
     return refs;
   }
   
-  // Google SERP fast path — skip ariaSnapshot entirely
+  // Google SERP fast path -- skip ariaSnapshot entirely
   const url = page.url();
   if (isGoogleSerp(url)) {
     const { refs: googleRefs } = await extractGoogleSerp(page);
@@ -1756,8 +2529,6 @@ async function _buildRefsInner(page, refs, start) {
       const [, role, name] = match;
       const normalizedRole = role.toLowerCase();
       
-      if (normalizedRole === 'combobox') continue;
-      
       if (name && SKIP_PATTERNS.some(p => p.test(name))) continue;
       
       if (INTERACTIVE_ROLES.includes(normalizedRole)) {
@@ -1774,6 +2545,74 @@ async function _buildRefsInner(page, refs, start) {
     }
   }
   
+  // --- IFRAME SUPPORT ---
+  // Process child frames to capture elements inside iframes (e.g., Stripe payment fields)
+  const iframeRemaining = BUILDREFS_TIMEOUT_MS - (Date.now() - start);
+  if (iframeRemaining > 2000 && refCounter <= MAX_SNAPSHOT_NODES) {
+    const childFrames = page.frames().filter(f => f !== page.mainFrame());
+    let iframesProcessed = 0;
+    
+    for (const frame of childFrames) {
+      if (iframesProcessed >= MAX_IFRAMES_TO_PROCESS) break;
+      if (refCounter > MAX_SNAPSHOT_NODES) break;
+      
+      const frameUrl = frame.url();
+      const frameName = frame.name();
+      
+      // Skip tracking/analytics iframes
+      if (IFRAME_SKIP_PATTERNS.some(p => p.test(frameUrl) || p.test(frameName))) continue;
+      // Skip about:blank and empty frames
+      if (!frameUrl || frameUrl === 'about:blank' || frameUrl === 'about:srcdoc') continue;
+      
+      try {
+        const frameYaml = await frame.locator('body').ariaSnapshot({ timeout: IFRAME_SNAPSHOT_TIMEOUT_MS });
+        if (!frameYaml || frameYaml.trim().length < 10) continue;
+        
+        // Check if frame has any interactive elements
+        const hasInteractive = INTERACTIVE_ROLES.some(role => {
+          const regex = new RegExp(`^\\s*-\\s+${role}`, 'im');
+          return regex.test(frameYaml);
+        });
+        if (!hasInteractive) continue;
+        
+        iframesProcessed++;
+        // Use a separate seenCounts for each iframe (nth is per-frame for locator resolution)
+        const frameSeenCounts = new Map();
+        
+        const frameLines = frameYaml.split('\n');
+        for (const line of frameLines) {
+          if (refCounter > MAX_SNAPSHOT_NODES) break;
+          
+          const match = line.match(/^\s*-\s+(\w+)(?:\s+"([^"]*)")?/);
+          if (match) {
+            const [, role, name] = match;
+            const normalizedRole = role.toLowerCase();
+            if (name && SKIP_PATTERNS.some(p => p.test(name))) continue;
+            
+            if (INTERACTIVE_ROLES.includes(normalizedRole)) {
+              const normalizedName = name || '';
+              const key = `${normalizedRole}:${normalizedName}`;
+              const nth = frameSeenCounts.get(key) || 0;
+              frameSeenCounts.set(key, nth + 1);
+              
+              const refId = `e${refCounter++}`;
+              refs.set(refId, { role: normalizedRole, name: normalizedName, nth, frameName: frameName || null, frameUrl });
+            }
+          }
+        }
+        
+        log('debug', 'buildRefs: processed iframe', { frameName, frameUrl: frameUrl.slice(0, 80), refs: refCounter - 1 });
+      } catch (err) {
+        // Frame might have navigated away or be inaccessible — skip silently
+        log('debug', 'buildRefs: iframe snapshot failed', { frameName, error: err.message?.slice(0, 80) });
+      }
+    }
+    
+    if (iframesProcessed > 0) {
+      log('info', 'buildRefs: processed iframes', { count: iframesProcessed, totalRefs: refCounter - 1 });
+    }
+  }
+  
   return refs;
 }
 
@@ -1787,19 +2626,89 @@ async function getAriaSnapshot(page) {
     waitForHydration: false,
     settleMs: 100,
   });
+  let mainYaml;
   try {
-    return await page.locator('body').ariaSnapshot({ timeout: 5000 });
+    mainYaml = await page.locator('body').ariaSnapshot({ timeout: 5000 });
   } catch (err) {
     log('warn', 'getAriaSnapshot failed', { error: err.message });
     return null;
   }
+  
+  if (!mainYaml) return null;
+  
+  // --- IFRAME SUPPORT ---
+  // Append accessible iframe content to the snapshot YAML
+  const childFrames = page.frames().filter(f => f !== page.mainFrame());
+  const iframeYamls = [];
+  let iframesProcessed = 0;
+  
+  for (const frame of childFrames) {
+    if (iframesProcessed >= MAX_IFRAMES_TO_PROCESS) break;
+    
+    const frameUrl = frame.url();
+    const frameName = frame.name();
+    
+    // Skip tracking/analytics iframes
+    if (IFRAME_SKIP_PATTERNS.some(p => p.test(frameUrl) || p.test(frameName))) continue;
+    if (!frameUrl || frameUrl === 'about:blank' || frameUrl === 'about:srcdoc') continue;
+    
+    try {
+      const frameYaml = await frame.locator('body').ariaSnapshot({ timeout: IFRAME_SNAPSHOT_TIMEOUT_MS });
+      if (!frameYaml || frameYaml.trim().length < 10) continue;
+      
+      // Only include frames with interactive elements
+      const hasInteractive = INTERACTIVE_ROLES.some(role => {
+        const regex = new RegExp(`^\\s*-\\s+${role}`, 'im');
+        return regex.test(frameYaml);
+      });
+      if (!hasInteractive) continue;
+      
+      iframesProcessed++;
+      // Derive a human-readable label from frame name or URL
+      let label = frameName || '';
+      if (!label) {
+        try { label = new URL(frameUrl).hostname; } catch { label = 'iframe'; }
+      }
+      // Clean up Shopify-style frame names for readability
+      label = label.replace(/card-fields-/, '').replace(/-[a-z0-9]{10,}$/, '');
+      
+      iframeYamls.push(`- iframe "${label}":\n${frameYaml.split('\n').map(l => '  ' + l).join('\n')}`);
+    } catch {
+      // Frame inaccessible — skip
+    }
+  }
+  
+  if (iframeYamls.length > 0) {
+    return mainYaml + '\n' + iframeYamls.join('\n');
+  }
+  return mainYaml;
 }
 
 function refToLocator(page, ref, refs) {
   const info = refs.get(ref);
   if (!info) return null;
   
-  const { role, name, nth } = info;
+  const { role, name, nth, frameName, frameUrl } = info;
+  
+  // If ref belongs to an iframe, resolve via frame locator
+  if (frameName || frameUrl) {
+    let frame = null;
+    if (frameName) {
+      frame = page.frame({ name: frameName });
+    }
+    if (!frame && frameUrl) {
+      // Try matching by URL (partial match for long URLs)
+      frame = page.frames().find(f => f.url() === frameUrl || f.url().startsWith(frameUrl.slice(0, 80)));
+    }
+    if (frame) {
+      let locator = frame.getByRole(role, name ? { name } : undefined);
+      locator = locator.nth(nth);
+      return locator;
+    }
+    // Frame not found (navigated away?) — fall through to page-level resolution
+    log('warn', 'refToLocator: frame not found for iframe ref', { ref, frameName, frameUrl: frameUrl?.slice(0, 60) });
+  }
+  
   let locator = page.getByRole(role, name ? { name } : undefined);
   
   // Always use .nth() to disambiguate duplicate role+name combinations
@@ -1844,194 +2753,122 @@ async function refreshTabRefs(tabState, options = {}) {
   return refreshedRefs;
 }
 
-// --- YouTube transcript ---
-// Implementation extracted to lib/youtube.js to avoid scanner false positives
-// (child_process + app.post in same file triggers OpenClaw skill-scanner)
 
-await detectYtDlp(log);
-
-app.post('/youtube/transcript', async (req, res) => {
-  const reqId = req.reqId;
-  try {
-    const { url, languages = ['en'] } = req.body;
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
-    const urlErr = validateUrl(url);
-    if (urlErr) return res.status(400).json({ error: urlErr });
-
-    const videoIdMatch = url.match(
-      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/
-    );
-    if (!videoIdMatch) {
-      return res.status(400).json({ error: 'Could not extract YouTube video ID from URL' });
-    }
-    const videoId = videoIdMatch[1];
-    const lang = languages[0] || 'en';
-
-    // Re-detect yt-dlp if startup detection failed (transient issue)
-    await ensureYtDlp(log);
-
-    const ytDlpProxyUrl = buildProxyUrl(proxyPool, CONFIG.proxy);
-    log('info', 'youtube transcript: starting', { reqId, videoId, lang, method: hasYtDlp() ? 'yt-dlp' : 'browser', hasProxy: !!ytDlpProxyUrl });
-
-    let result;
-    if (hasYtDlp()) {
-      try {
-        result = await ytDlpTranscript(reqId, url, videoId, lang, ytDlpProxyUrl);
-      } catch (ytErr) {
-        log('warn', 'yt-dlp threw, falling back to browser', { reqId, error: ytErr.message });
-        result = null;
-      }
-      // If yt-dlp returned an error result (e.g. no captions) or threw, try browser
-      if (!result || result.status !== 'ok') {
-        if (result) log('warn', 'yt-dlp returned error, falling back to browser', { reqId, status: result.status, code: result.code });
-        result = await browserTranscript(reqId, url, videoId, lang);
-      }
-    } else {
-      result = await browserTranscript(reqId, url, videoId, lang);
-    }
-
-    log('info', 'youtube transcript: done', { reqId, videoId, status: result.status, words: result.total_words });
-    res.json(result);
-  } catch (err) {
-    failuresTotal.labels(classifyError(err), 'youtube_transcript').inc();
-    log('error', 'youtube transcript failed', { reqId, error: err.message, stack: err.stack });
-    res.status(500).json({ error: safeError(err) });
-  }
-});
-
-// Browser fallback — play video, intercept timedtext network response
-async function browserTranscript(reqId, url, videoId, lang) {
-  return await withUserLimit('__yt_transcript__', async () => {
-    await ensureBrowser();
-    const session = await getSession('__yt_transcript__');
-    const page = await session.context.newPage();
-
-    try {
-      await page.addInitScript(() => {
-        const origPlay = HTMLMediaElement.prototype.play;
-        HTMLMediaElement.prototype.play = function() { this.volume = 0; this.muted = true; return origPlay.call(this); };
-      });
-
-      let interceptedCaptions = null;
-      page.on('response', async (response) => {
-        const respUrl = response.url();
-        if (respUrl.includes('/api/timedtext') && respUrl.includes(`v=${videoId}`) && !interceptedCaptions) {
-          try {
-            const body = await response.text();
-            if (body && body.length > 0) interceptedCaptions = body;
-          } catch {}
-        }
-      });
-
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
-      await page.waitForTimeout(2000);
-
-      // Extract caption track URLs and metadata from ytInitialPlayerResponse
-      const meta = await page.evaluate(() => {
-        const r = window.ytInitialPlayerResponse || (typeof ytInitialPlayerResponse !== 'undefined' ? ytInitialPlayerResponse : null);
-        if (!r) return { title: '', tracks: [] };
-        const tracks = r?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-        return {
-          title: r?.videoDetails?.title || '',
-          tracks: tracks.map(t => ({ code: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || 'manual', url: t.baseUrl })),
-        };
-      });
-
-      log('info', 'youtube transcript: extracted caption tracks', { reqId, title: meta.title, trackCount: meta.tracks.length, tracks: meta.tracks.map(t => t.code) });
-
-      // Strategy A: Fetch caption track URL directly from ytInitialPlayerResponse
-      // These URLs are freshly signed by YouTube and work immediately
-      if (meta.tracks && meta.tracks.length > 0) {
-        const track = meta.tracks.find(t => t.code === lang) || meta.tracks[0];
-        if (track && track.url) {
-          const captionUrl = track.url + (track.url.includes('?') ? '&' : '?') + 'fmt=json3';
-          log('info', 'youtube transcript: fetching caption track', { reqId, lang: track.code, url: captionUrl.substring(0, 100) });
-          try {
-            const captionResp = await page.evaluate(async (fetchUrl) => {
-              const resp = await fetch(fetchUrl);
-              return resp.ok ? await resp.text() : null;
-            }, captionUrl);
-            if (captionResp && captionResp.length > 0) {
-              let transcriptText = null;
-              if (captionResp.trimStart().startsWith('{')) transcriptText = parseJson3(captionResp);
-              else if (captionResp.includes('WEBVTT')) transcriptText = parseVtt(captionResp);
-              else if (captionResp.includes('<text')) transcriptText = parseXml(captionResp);
-              if (transcriptText && transcriptText.trim()) {
-                return {
-                  status: 'ok', transcript: transcriptText,
-                  video_url: url, video_id: videoId, video_title: meta.title,
-                  language: track.code, total_words: transcriptText.split(/\s+/).length,
-                  available_languages: meta.tracks.map(t => ({ code: t.code, name: t.name, kind: t.kind })),
-                };
-              }
-            }
-          } catch (fetchErr) {
-            log('warn', 'youtube transcript: caption track fetch failed', { reqId, error: fetchErr.message });
-          }
-        }
-      }
-
-      // Strategy B: Play video and intercept timedtext network response
-      await page.evaluate(() => {
-        const v = document.querySelector('video');
-        if (v) { v.muted = true; v.play().catch(() => {}); }
-      }).catch(() => {});
-
-      for (let i = 0; i < 40 && !interceptedCaptions; i++) {
-        await page.waitForTimeout(500);
-      }
-
-      if (!interceptedCaptions) {
-        return {
-          status: 'error', code: 404,
-          message: 'No captions available for this video',
-          video_url: url, video_id: videoId, title: meta.title,
-        };
-      }
-
-      log('info', 'youtube transcript: intercepted captions', { reqId, len: interceptedCaptions.length });
-
-      let transcriptText = null;
-      if (interceptedCaptions.trimStart().startsWith('{')) transcriptText = parseJson3(interceptedCaptions);
-      else if (interceptedCaptions.includes('WEBVTT')) transcriptText = parseVtt(interceptedCaptions);
-      else if (interceptedCaptions.includes('<text')) transcriptText = parseXml(interceptedCaptions);
-
-      if (!transcriptText || !transcriptText.trim()) {
-        return {
-          status: 'error', code: 404,
-          message: 'Caption data intercepted but could not be parsed',
-          video_url: url, video_id: videoId, title: meta.title,
-        };
-      }
-
-      return {
-        status: 'ok', transcript: transcriptText,
-        video_url: url, video_id: videoId, video_title: meta.title,
-        language: lang, total_words: transcriptText.split(/\s+/).length,
-        available_languages: meta.languages,
-      };
-    } finally {
-      await safePageClose(page);
-      // Clean up phantom transcript session if no tabs remain
-      const ytSession = sessions.get(normalizeUserId('__yt_transcript__'));
-      if (ytSession) {
-        let totalTabs = 0;
-        for (const g of ytSession.tabGroups.values()) totalTabs += g.size;
-        if (totalTabs === 0) {
-          ytSession.context.close().catch(() => {});
-          sessions.delete(normalizeUserId('__yt_transcript__'));
-        }
-      }
-    }
-  });
-}
-
-// Arm server-side network capture on a tab. Records requests whose URL matches
-// `urlPattern` (default: all) into a per-tab ring buffer — at the Playwright
-// layer, so it sees requests issued by JS that captured `fetch` before any
-// in-page wrapper could run (the Airbnb/opaque-client case). Idempotent: a
-// second call just resets the pattern + clears the buffer.
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     tags: [System]
+ *     summary: Health check
+ *     description: Detailed health with tab/session counts and failure tracking.
+ *     responses:
+ *       200:
+ *         description: Healthy.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 engine:
+ *                   type: string
+ *                 browserConnected:
+ *                   type: boolean
+ *                 browserRunning:
+ *                   type: boolean
+ *                 activeTabs:
+ *                   type: integer
+ *                 activeSessions:
+ *                   type: integer
+ *                 consecutiveFailures:
+ *                   type: integer
+ *       503:
+ *         description: Unhealthy or recovering.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 recovering:
+ *                   type: boolean
+ */
+// Network capture
+/**
+ * @openapi
+ * /tabs/{tabId}/capture:
+ *   post:
+ *     tags: [Content]
+ *     summary: Arm per-tab network capture
+ *     description: >
+ *       Attaches a Playwright request listener and records requests into a
+ *       bounded per-tab ring buffer. Read them back with GET on the same path.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               urlPattern:
+ *                 type: string
+ *                 description: Optional regular expression; only matching URLs are kept.
+ *               max:
+ *                 type: integer
+ *                 description: Ring buffer size (1..500, default 100).
+ *     responses:
+ *       200:
+ *         description: Capture armed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       404:
+ *         description: Tab not found.
+ *   get:
+ *     tags: [Content]
+ *     summary: Read captured requests
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: clear
+ *         in: query
+ *         schema:
+ *           type: boolean
+ *     responses:
+ *       200:
+ *         description: Captured requests.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 requests:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *       404:
+ *         description: Tab not found.
+ */
 app.post('/tabs/:tabId/capture', express.json({ limit: '64kb' }), async (req, res) => {
   const tabId = req.params.tabId;
   try {
@@ -2068,7 +2905,6 @@ app.post('/tabs/:tabId/capture', express.json({ limit: '64kb' }), async (req, re
   }
 });
 
-// Drain the per-tab capture buffer. `?clear=1` empties it after reading.
 app.get('/tabs/:tabId/capture', async (req, res) => {
   const tabId = req.params.tabId;
   try {
@@ -2086,22 +2922,121 @@ app.get('/tabs/:tabId/capture', async (req, res) => {
   }
 });
 
+// Force-flush a session's persisted storage state
+/**
+ * @openapi
+ * /sessions/{userId}/persist:
+ *   post:
+ *     tags: [Sessions]
+ *     summary: Checkpoint a session's storage state now
+ *     description: >
+ *       Writes the session's current cookie jar + localStorage to the
+ *       configured profile dir immediately, instead of waiting for the next
+ *       background checkpoint. Returns a name-level cookie diagnostic (never
+ *       values) so a caller can confirm auth cookies landed.
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Checkpoint result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 written:
+ *                   type: boolean
+ *                 authed:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                 cookies:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *       404:
+ *         description: No such live session.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Persistence is not configured.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/sessions/:userId/persist', authMiddleware(), async (req, res) => {
+  try {
+    if (!CONFIG.profileDir) {
+      return res.status(409).json({ error: 'CAMOFOX_PROFILE_DIR not set - sessions are ephemeral' });
+    }
+    const key = normalizeUserId(req.params.userId);
+    const session = sessions.get(key);
+    if (!session) return res.status(404).json({ error: 'No such session' });
+
+    const result = await persistStorageState({
+      profileDir: CONFIG.profileDir,
+      userId: key,
+      context: session.context,
+      logger: { warn: (msg, fields = {}) => log('warn', msg, { userId: key, ...fields }) },
+    });
+    let names = [];
+    try {
+      names = (await session.context.cookies()).map((cookie) => cookie.name);
+    } catch {}
+
+    res.json({
+      ok: true,
+      userId: String(key),
+      written: result.persisted,
+      ...(result.persisted ? {} : { skipped: result.reason }),
+      ...(result.reason ? { reason: result.reason } : {}),
+      ...(result.lost ? { lost: result.lost } : {}),
+      authed: result.authed || [],
+      cookieCount: names.length,
+      cookieNames: [...new Set(names)].sort(),
+      cookies: names,
+    });
+  } catch (err) {
+    log('error', 'persist failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 app.get('/health', (req, res) => {
   if (healthState.isRecovering) {
     return res.status(503).json({ ok: false, engine: 'camoufox', recovering: true });
   }
   const running = browser !== null && (browser.isConnected?.() ?? false);
-  if (proxyPool?.canRotateSessions && !running) {
+  const mem = process.memoryUsage();
+  const rssMb = Math.round(mem.rss / 1048576);
+  const heapUsedMb = Math.round(mem.heapUsed / 1048576);
+  const nativeMemMb = rssMb - heapUsedMb;
+
+  // Browser not running: distinguish intentional idle stop from unexpected death
+  if (!running && _lastBrowserStopReason && !INTENTIONAL_STOP_REASONS.has(_lastBrowserStopReason)) {
+    // Unexpected browser absence — schedule recovery and report unhealthy
     scheduleBrowserWarmRetry();
     return res.status(503).json({
       ok: false,
       engine: 'camoufox',
-      browserConnected: false,
       browserRunning: false,
-      warming: true,
+      reason: _lastBrowserStopReason,
+      activeTabs: 0,
+      activeSessions: sessions.size,
+      memory: { rssMb, heapUsedMb, nativeMemMb },
       ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
     });
   }
+
   res.json({ 
     ok: true, 
     engine: 'camoufox',
@@ -2109,11 +3044,34 @@ app.get('/health', (req, res) => {
     browserRunning: running,
     activeTabs: getTotalTabCount(),
     activeSessions: sessions.size,
-    consecutiveFailures: healthState.consecutiveNavFailures,
+    consecutiveFailures: Array.from(userNavHealth.values())
+      .reduce((sum, h) => sum + h.consecutiveNavFailures, 0),
+    memory: { rssMb, heapUsedMb, nativeMemMb },
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
 });
 
+/**
+ * @openapi
+ * /metrics:
+ *   get:
+ *     tags: [System]
+ *     summary: Prometheus metrics
+ *     description: Returns Prometheus text exposition format. Requires PROMETHEUS_ENABLED=1.
+ *     responses:
+ *       200:
+ *         description: Prometheus metrics.
+ *         content:
+ *           text/plain:
+ *             schema:
+ *               type: string
+ *       404:
+ *         description: Metrics disabled.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/metrics', async (_req, res) => {
   const reg = getRegister();
   if (!reg) {
@@ -2124,27 +3082,106 @@ app.get('/metrics', async (_req, res) => {
   res.send(await reg.metrics());
 });
 
-// Shared helper for the POST /tabs dedicated-context path. Used by both
-// the recordVideo branch (ffmpeg x11grab) and the viewport branch
-// (fresh context at a custom width/height). Either or both can be set;
-// unset inputs just skip the corresponding setup step.
-async function createDedicatedTab({ req, userId, resolvedSessionKey, url, recordVideo, viewport }) {
-  const b = await ensureBrowser();
-  if (getTotalTabCount() >= MAX_TABS_GLOBAL) {
-    throw Object.assign(new Error('Maximum tabs (global) reached'), {
-      statusCode: 429,
+/**
+ * @openapi
+ * /pressure/cleanup:
+ *   post:
+ *     tags: [System]
+ *     summary: Proactive memory-pressure cleanup
+ *     description: |
+ *       Closes tabs observed idle across multiple checks while preserving tabs
+ *       with active/queued operations. Never returns URLs, titles, cookies,
+ *       page text, or user IDs. Defaults to dry-run mode.
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               dryRun:
+ *                 type: boolean
+ *                 default: true
+ *                 description: When true, returns candidates without closing them.
+ *               minIdleMs:
+ *                 type: number
+ *                 default: 600000
+ *                 description: Minimum idle time (ms) before a tab is eligible.
+ *               maxTabsToClose:
+ *                 type: number
+ *                 default: 4
+ *                 description: Maximum tabs to close per invocation.
+ *               minTabsPerSession:
+ *                 type: number
+ *                 default: 1
+ *                 description: Preserve at least this many tabs per session.
+ *               closeEmptySessions:
+ *                 type: boolean
+ *                 default: true
+ *                 description: Close sessions left with zero tabs after cleanup.
+ *     responses:
+ *       200:
+ *         description: Cleanup result with before/after counts and hashed metadata.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 dryRun:
+ *                   type: boolean
+ *                 before:
+ *                   type: object
+ *                   properties:
+ *                     sessions:
+ *                       type: integer
+ *                     tabs:
+ *                       type: integer
+ *                 after:
+ *                   type: object
+ *                   properties:
+ *                     sessions:
+ *                       type: integer
+ *                     tabs:
+ *                       type: integer
+ *                 candidates:
+ *                   type: integer
+ *                 closed:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 preserved:
+ *                   type: object
+ */
+app.post('/pressure/cleanup', async (req, res) => {
+  try {
+    const result = await camofoxPressureCleanup(req.body || {});
+    log('info', 'pressure cleanup', {
+      dryRun: result.dryRun,
+      beforeTabs: result.before.tabs,
+      afterTabs: result.after.tabs,
+      candidates: result.candidates,
+      closed: result.closed.length,
+      preserved: result.preserved,
     });
+    res.json(result);
+  } catch (err) {
+    log('error', 'pressure cleanup failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+
+// Create a tab in its own Playwright context (recording and/or custom viewport).
+async function createDedicatedTab({ req, userId, resolvedSessionKey, url, recordVideo, viewport }) {
+  if (getTotalTabCount() >= MAX_TABS_GLOBAL) {
+    throw Object.assign(new Error('Maximum tabs (global) reached'), { statusCode: 429 });
   }
   const tabId = fly.makeTabId();
 
-  // Sizing. A recording tab must CAPTURE the full window: camoufox renders at the
-  // real host-window size (anti-detection) and IGNORES a fixed viewport for
-  // rendering, but Playwright still clips screenshots to a declared viewport — so
-  // a fixed box captures only the top-left corner. viewport:null keeps render and
-  // capture in sync, exactly like the shared session contexts. recordVideo.width/
-  // height, if given, set the OUTPUT size (ffmpeg scales the full-window capture
-  // into it). A non-recording dedicated tab with an explicit `viewport` is a
-  // deliberate render-size request and keeps that fixed viewport.
+  // Sizing. A recording tab captures the full window (Camoufox ignores a fixed
+  // viewport for rendering but Playwright still clips screenshots to one), so
+  // use viewport:null. recordVideo.width/height only sets the output size.
   let width = 1280;
   let height = 720;
   let outWidth = width;
@@ -2160,37 +3197,58 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
 
   const recordKey = normalizeUserId(userId);
   const contextOptions = {
-    // Recording captures the full window (camoufox clips screenshots to a fixed
-    // viewport) → null. A non-recording dedicated tab keeps its requested size.
     viewport: recordVideo ? null : { width, height },
     permissions: ['geolocation'],
+    ...contextIdentityOptions({
+      hasProxy: !!proxyPool,
+      directIdentity: CONFIG.directIdentity,
+    }),
   };
-  if (!CONFIG.proxy.host) {
-    const [glat, glng] = (process.env.CAMOFOX_GEO || '48.8566,2.3522').split(',').map(Number);
-    contextOptions.locale = process.env.CAMOFOX_LOCALE || 'fr-FR';
-    contextOptions.timezoneId = process.env.CAMOFOX_TZ || 'Europe/Paris';
-    contextOptions.geolocation = { latitude: glat, longitude: glng };
-  }
-  // Restore the user's persisted jar so a recorded tab films the AUTHED view —
-  // the session frame-grab records the user's authed session, and this dedicated
-  // tab must match, not an anonymous context. Recording only; a non-recording
-  // custom-size tab stays anonymous as before.
-  const recordRestored = recordVideo ? loadStorageState(recordKey) : undefined;
-  if (recordRestored) contextOptions.storageState = recordRestored;
 
-  const context = await b.newContext(contextOptions);
-  if (recordRestored) await restorePartitionedCookies(context, recordKey, recordRestored);
+  // A recording tab films the AUTHED view, like the session it mirrors.
+  // Restore the persisted jar before the context exists, then re-inject the
+  // full cookie jar (partitioned/httpOnly cookies can be skipped by
+  // storageState restore).
+  let restoredStatePath = null;
+  if (recordVideo) {
+    restoredStatePath = await loadPersistedStorageState(CONFIG.profileDir, recordKey, {
+      warn: (msg, fields) => log('warn', msg, fields),
+    }).catch(() => undefined);
+    if (restoredStatePath) contextOptions.storageState = restoredStatePath;
+  }
+
+  const context = await createContextResilient(contextOptions, {
+    ensureBrowser,
+    restartBrowser,
+    timeoutMs: CONFIG.newContextTimeoutMs,
+    withTimeout,
+    isTimeoutError,
+    log,
+  });
+  if (restoredStatePath) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(restoredStatePath, 'utf8'));
+      if (Array.isArray(saved.cookies) && saved.cookies.length) {
+        await context.addCookies(saved.cookies).catch(async (err) => {
+          log('warn', 'dedicated tab addCookies batch failed, per-cookie fallback', {
+            userId: recordKey, error: err.message,
+          });
+          for (const c of saved.cookies) {
+            await context.addCookies([c]).catch((e) => log('warn', 'dedicated tab addCookie skipped', {
+              name: c.name, error: e.message,
+            }));
+          }
+        });
+      }
+    } catch (err) {
+      log('warn', 'dedicated tab cookie restore failed', { userId: recordKey, error: err.message });
+    }
+  }
+
   const page = await context.newPage();
   const tabState = createTabState(page);
-  attachDownloadListener(tabState, tabId);
+  attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
 
-  // recordVideo capture backend. Two paths, picked per host:
-  //  - x11grab: ffmpeg grabs the Xvfb framebuffer (the Linux deploy). Native
-  //    Playwright recordVideo is NOT an option — it's Chromium-only and this is
-  //    Firefox/Camoufox (Browser.setScreencastOptions unsupported).
-  //  - frame-grab: off-display (macOS/dev, no X) snapshot the page on a timer
-  //    and ffmpeg-assembles the PNGs at finalize. Lower fps, but cross-platform.
-  // Same map shape + /video endpoint for both; the backend is an internal detail.
   let ffmpegProcess;
   let frameRecorder;
   let videoDir;
@@ -2199,36 +3257,19 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     videoDir = path.join(VIDEO_BASE_DIR, tabId);
     fs.mkdirSync(videoDir, { recursive: true });
     videoPath = path.join(videoDir, `${tabId}.webm`);
-    const scale = (outWidth !== width || outHeight !== height)
+    const scale = outWidth !== width || outHeight !== height
       ? ['-vf', `scale=${outWidth}:${outHeight}`]
       : [];
-    if (x11GrabAvailable()) {
-      const fps = Number(recordVideo.fps) || 15;
-      const display = activeDisplay || ':99';
-      ffmpegProcess = ffmpegSpawn(
-        'ffmpeg',
-        [
-          '-loglevel', 'warning',
-          '-f', 'x11grab',
-          '-video_size', `${width}x${height}`,
-          '-framerate', String(fps),
-          '-i', display,
-          ...scale,
-          '-c:v', 'libvpx',
-          '-b:v', '1M',
-          '-cpu-used', '4',
-          '-deadline', 'realtime',
-          '-y',
-          videoPath,
-        ],
-        { stdio: ['ignore', 'ignore', 'pipe'] }
-      );
-      ffmpegProcess.stderr?.on('data', (buf) => {
-        const msg = buf.toString().trim();
-        if (msg) log('warn', 'ffmpeg stderr', { tabId, msg: msg.slice(0, 200) });
-      });
-      ffmpegProcess.on('exit', (code, signal) => {
-        log('info', 'ffmpeg exited', { tabId, code, signal });
+    if (x11GrabAvailable(process.env.DISPLAY || null)) {
+      ffmpegProcess = startX11Grab({
+        videoPath,
+        tabId,
+        width,
+        height,
+        fps: Number(recordVideo.fps) || 15,
+        scale,
+        display: process.env.DISPLAY || ':99',
+        log,
       });
     } else {
       frameRecorder = startFrameRecorder({
@@ -2238,6 +3279,7 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
         tabId,
         fps: Number(recordVideo.fps) || 4,
         scale,
+        log,
       });
     }
   }
@@ -2248,21 +3290,18 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
     videoDir,
     videoPath,
     frameRecorder,
-    // x11grab settles when ffmpeg exits, frame-grab when assembly finishes;
-    // viewport-only tabs (neither) are already settled — nothing to fetch.
     videoSettled: !ffmpegProcess && !frameRecorder,
     ffmpegProcess,
-    userId: normalizeUserId(userId),
+    userId: recordKey,
     listItemId: resolvedSessionKey,
     createdAt: Date.now(),
+    recorded: !!recordVideo,
   });
   refreshActiveTabsGauge();
 
   if (url) {
     const urlErr = validateUrl(url);
-    if (urlErr) {
-      throw Object.assign(new Error(urlErr), { statusCode: 400 });
-    }
+    if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
     tabState.lastRequestedUrl = url;
     await withPageLoadDuration('open_url', () =>
       page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
@@ -2283,33 +3322,146 @@ async function createDedicatedTab({ req, userId, resolvedSessionKey, url, record
   });
 
   const result = { tabId, url: page.url(), viewport: { width, height } };
-  if (recordVideo) {
-    result.recordVideo = { width, height, fps: Number(recordVideo.fps) || 15 };
-  }
+  if (recordVideo) result.recordVideo = { width, height, fps: Number(recordVideo.fps) || 4 };
   return result;
 }
 
+/**
+ * Finalize a recorded tab's video so the .webm is readable on disk, idempotent.
+ */
+async function finalizeRecording(recorded, reason) {
+  if (recorded.videoSettled) return;
+  recorded.videoSettled = true;
+  if (recorded.ffmpegProcess) {
+    await stopFfmpegAndWait(recorded.ffmpegProcess, {
+      tabId: recorded.tabState?.tabId, reason, log,
+    });
+  } else if (recorded.frameRecorder) {
+    const out = await recorded.frameRecorder.stop();
+    if (!out) recorded.videoPath = undefined;
+  }
+  await recorded.context.close().catch((err) =>
+    log('warn', 'recorded context close failed', { reason, error: err.message })
+  );
+}
+
+// Recording tabs keep their video dir for a grace window so a trailing
+// GET /video after DELETE still works. Viewport-only tabs have no file.
+function scheduleDedicatedTabCleanup(tabId) {
+  const entry = finalizedVideos.get(tabId) || dedicatedTabs.get(tabId);
+  if (!entry) return;
+  if (!entry.videoDir) {
+    finalizedVideos.delete(tabId);
+    dedicatedTabs.delete(tabId);
+    return;
+  }
+  setTimeout(() => {
+    const stillThere = finalizedVideos.get(tabId) || dedicatedTabs.get(tabId);
+    if (!stillThere) return;
+    try {
+      fs.rmSync(stillThere.videoDir, { recursive: true, force: true });
+    } catch (err) {
+      log('warn', 'recorded video dir cleanup failed', {
+        tabId, dir: stillThere.videoDir, error: err.message,
+      });
+    }
+    finalizedVideos.delete(tabId);
+    dedicatedTabs.delete(tabId);
+  }, VIDEO_GRACE_WINDOW_MS).unref?.();
+}
+
 // Create new tab
+/**
+ * @openapi
+ * /tabs:
+ *   post:
+ *     tags: [Tabs]
+ *     summary: Create a new tab
+ *     description: Creates a tab in the given session. Optionally navigates to an initial URL.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, sessionKey]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *                 description: Session owner.
+ *               sessionKey:
+ *                 type: string
+ *                 description: Tab group identifier.
+ *               listItemId:
+ *                 type: string
+ *                 description: Legacy alias for sessionKey.
+ *               url:
+ *                 type: string
+ *                 description: Optional initial URL.
+ *               trace:
+ *                 type: boolean
+ *                 description: Enable Playwright tracing for this session (screenshots, DOM snapshots, network). Must be set on first tab creation; cannot be added to an existing session.
+ *     responses:
+ *       200:
+ *         description: Tab created.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 tabId:
+ *                   type: string
+ *                 url:
+ *                   type: string
+ *                 httpStatus:
+ *                   type: integer
+ *                   nullable: true
+ *                   description: HTTP status of the optional initial document navigation.
+ *                 navigationOk:
+ *                   type: boolean
+ *                   description: False when the optional initial document navigation returned HTTP 400 or higher.
+ *       400:
+ *         description: Missing required fields.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Tab limit reached.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Cannot enable tracing on an existing session.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs', async (req, res) => {
+  // The tab is registered before it navigates, and the route deadline can pass
+  // while navigation is still in flight. An error response carries no tabId, so
+  // the catch below attempts to discard any registered tab, and a registration
+  // completed after abandonment attempts its own cleanup.
+  let createdTabId = null;
+  let abandoned = false;
+  const discardCreatedTab = async () => {
+    if (!createdTabId) return;
+    const session = sessions.get(normalizeUserId(req.body.userId));
+    if (session) await destroyTimedOutTab(session, createdTabId, 'tab_create_failed', req.body.userId);
+    createdTabId = null;
+  };
   try {
-    const { userId, sessionKey, listItemId, url, recordVideo, viewport, keepAlive } = req.body;
+    const { userId, sessionKey, listItemId, url, trace, recordVideo, viewport, keepAlive, storageState } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
     const resolvedSessionKey = sessionKey || listItemId;
     if (!userId || !resolvedSessionKey) {
       return res.status(400).json({ error: 'userId and sessionKey required' });
     }
 
-    // ── Dedicated-context path (agstudio/native-video) ──────────────
-    //
-    // When either `recordVideo` or `viewport` is set, the tab gets its
-    // own Playwright context instead of joining the shared session.
-    //
-    //  - `recordVideo` — ffmpeg x11grab captures the Xvfb display for
-    //    the lifetime of this tab into a .webm fetched via GET /video.
-    //  - `viewport` — Playwright's viewport is locked at newContext()
-    //    time, so custom sizes need a fresh context.
-    //
-    // Both cases live in `dedicatedTabs` and findTab() falls through.
+    // Dedicated-context path: recording and/or a custom viewport. Both need
+    // their own Playwright context, so they bypass the shared session.
     const hasRecordVideo = recordVideo && typeof recordVideo === 'object';
     const hasCustomViewport = viewport && typeof viewport === 'object';
     if (hasRecordVideo || hasCustomViewport) {
@@ -2322,56 +3474,234 @@ app.post('/tabs', async (req, res) => {
           recordVideo: hasRecordVideo ? recordVideo : null,
           viewport: hasCustomViewport ? viewport : null,
         }),
-        requestTimeoutMs(),
+        tabCreateRequestTimeoutMs(),
         'dedicated tab create'
       );
       return res.json(result);
     }
 
-    const result = await withTimeout((async () => {
-      const session = await getSession(userId);
-      if (keepAlive) session.keepAlive = true;
+    // Session overflow redirect (Fly.io only) — if this machine is above its
+    // fair share of sessions and the user doesn't already have one here,
+    // bounce back through the Fly Proxy to land on a less-loaded machine.
+    if (FLY_MACHINE_ID) {
+      const PER_MACHINE_SESSION_CAP = Math.max(3, Math.ceil(MAX_SESSIONS / 3));
+      const key = normalizeUserId(userId);
+      const isReplayed = !!req.headers['fly-replay-src'];
+      if (sessions.size >= PER_MACHINE_SESSION_CAP && !sessions.has(key) && !isReplayed) {
+        log('info', 'session overflow redirect', {
+          userId: key, sessions: sessions.size, cap: PER_MACHINE_SESSION_CAP,
+        });
+        res.set('fly-replay', `app=${CONFIG.flyAppName || 'camofox-browser'}`);
+        return res.status(307).send();
+      }
+    }
 
+    const result = await withTimeout((async () => {
+      const existing = sessions.get(normalizeUserId(userId));
+      if (trace && existing && !existing.tracePath) {
+        throw Object.assign(
+          new Error('trace must be set on session creation. DELETE /sessions/:userId first to restart with tracing.'),
+          { statusCode: 409 },
+        );
+      }
+      let session = await getSession(userId, { trace: !!trace, storageState });
+      if (keepAlive) session.keepAlive = true;
+      
       let totalTabs = 0;
       for (const group of session.tabGroups.values()) totalTabs += group.size;
-
+      
       // Recycle oldest tab when limits are reached instead of rejecting
       if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-        const recycled = await recycleOldestTab(session, req.reqId);
+        const recycled = await recycleOldestTab(session, req.reqId, userId);
         if (!recycled) {
           throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
         }
       }
-
+      
+      const createdPage = await createPageWithRecoveryForUser(userId, session, { trace: !!trace });
+      session = createdPage.session;
+      let page = createdPage.page;
+      const lease = createdPage.lease;
       const group = getTabGroup(session, resolvedSessionKey);
 
-      const page = await session.context.newPage();
       const tabId = fly.makeTabId();
-      const tabState = createTabState(page);
-      attachDownloadListener(tabState, tabId);
+      let tabState = createTabState(page);
+      attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
       group.set(tabId, tabState);
+      createdTabId = tabId;
+      releasePageLease(session, lease);
+      attachPopupHandler(page, userId, resolvedSessionKey);
       refreshActiveTabsGauge();
+      if (abandoned) {
+        // The route deadline passed during session or page creation.
+        await discardCreatedTab();
+        throw new Error('tab create abandoned after the route deadline');
+      }
 
       if (url) {
         const urlErr = validateUrl(url);
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
         tabState.lastRequestedUrl = url;
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        try {
+          const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(page, url));
+          tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
+          recordNavSuccess(userId);
+        } catch (navErr) {
+          // A page closed by discardCreatedTab is not a navigation verdict.
+          if (abandoned) throw navErr;
+          if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
+            log('warn', 'tab create navigate failed, retrying with fresh proxy', {
+              reqId: req.reqId, tabId, error: navErr.message,
+            });
+            browserRestartsTotal.labels('proxy_retry').inc();
+            const key = normalizeUserId(userId);
+            const oldSession = sessions.get(key);
+            if (oldSession) {
+              await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
+            }
+            session = await getSession(userId, { trace: !!trace });
+            const retryGroup = getTabGroup(session, resolvedSessionKey);
+            const { page: retryPage, lease: retryLease } = await createLeasedPage(session);
+            tabState = createTabState(retryPage);
+            page = retryPage;
+            tabState.lastRequestedUrl = url;
+            attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+            retryGroup.set(tabId, tabState);
+            createdTabId = tabId;
+            releasePageLease(session, retryLease);
+            attachPopupHandler(retryPage, userId, resolvedSessionKey);
+            refreshActiveTabsGauge();
+            if (abandoned) {
+              await discardCreatedTab();
+              throw new Error('tab create abandoned after the route deadline');
+            }
+            const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
+            tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
+            recordNavSuccess(userId);
+          } else {
+            if (recordNavFailure(userId)) {
+              await recoverUserSession(userId, 'tab_create_nav_failure');
+            }
+            throw navErr;
+          }
+        }
         tabState.visitedUrls.add(url);
       }
-      
+      // The route deadline passed during navigation and the catch below has
+      // begun discarding the tab, so do not announce it.
+      if (abandoned) throw new Error('tab create abandoned after the route deadline');
+
+      pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
       log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-      return { tabId, url: page.url() };
-    })(), requestTimeoutMs(), 'tab create');
+      return {
+        tabId,
+        url: page.url(),
+        httpStatus: tabState.lastNavigationHttpStatus,
+        navigationOk: tabState.lastNavigationHttpStatus === null || tabState.lastNavigationHttpStatus < 400,
+      };
+    })(), tabCreateRequestTimeoutMs(), 'tab create');
 
     res.json(result);
   } catch (err) {
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
+    abandoned = true;
+    try {
+      await discardCreatedTab();
+    } catch (cleanupErr) {
+      log('warn', 'tab create cleanup failed', { reqId: req.reqId, tabId: createdTabId, error: cleanupErr?.message ?? String(cleanupErr) });
+    }
+    // SSL certificate errors on initial navigation — non-retriable
+    const isSslError = err.message && (
+      err.message.includes('SEC_ERROR') ||
+      err.message.includes('SSL_ERROR') ||
+      err.message.includes('MOZILLA_PKIX_ERROR')
+    );
+    if (isSslError) {
+      return res.status(502).json({
+        error: `SSL certificate error: ${err.message.split('\n')[0]}`,
+        code: 'ssl_error',
+        recoverable: false,
+      });
+    }
+    // Memory pressure / max sessions → bounce through LB to another machine
+    if (FLY_MACHINE_ID && err.statusCode === 503) {
+      res.set('fly-replay', `app=${CONFIG.flyAppName || 'camofox-browser'}`);
+      return res.status(503).json({ error: safeError(err), code: err.code || 'admission_rejected' });
+    }
     handleRouteError(err, req, res);
   }
 });
 
 // Navigate
+/**
+ * @openapi
+ * /tabs/{tabId}/navigate:
+ *   post:
+ *     tags: [Navigation]
+ *     summary: Navigate a tab to a URL or macro
+ *     description: Navigate to a URL or expand a search macro. Auto-creates tab if not found.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               url:
+ *                 type: string
+ *               macro:
+ *                 type: string
+ *                 description: Search macro (e.g. @google_search).
+ *               query:
+ *                 type: string
+ *                 description: Search query for macro.
+ *               sessionKey:
+ *                 type: string
+ *               listItemId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Navigation result. Destination HTTP status is reported even when a rendered error page is available.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 tabId:
+ *                   type: string
+ *                 url:
+ *                   type: string
+ *                 httpStatus:
+ *                   type: integer
+ *                   nullable: true
+ *                   description: HTTP status of the final document navigation when available.
+ *                 navigationOk:
+ *                   type: boolean
+ *                   description: False when the final document returned an HTTP status of 400 or greater.
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/navigate', async (req, res) => {
   const tabId = req.params.tabId;
   
@@ -2379,42 +3709,26 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     const { userId, url, macro, query, sessionKey, listItemId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
+    let session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, tabId);
+    if (session) session.lastAccess = Date.now();
+
+    const navigateTimeoutMs = navigationRequestTimeoutMs();
+    const navigateDeadline = Date.now() + navigateTimeoutMs;
     const result = await withUserLimit(userId, () => withTimeout((async () => {
       await ensureBrowser();
-      const resolvedSessionKey = sessionKey || listItemId || 'default';
-      let session = sessions.get(normalizeUserId(userId));
-      let found = findTab(session, tabId);
-      
-      let tabState;
-      if (!found) {
-        session = await getSession(userId);
-        let sessionTabs = 0;
-        for (const g of session.tabGroups.values()) sessionTabs += g.size;
-        if (getTotalTabCount() >= MAX_TABS_GLOBAL || sessionTabs >= MAX_TABS_PER_SESSION) {
-          // Recycle oldest tab to free a slot, then create new page
-          const recycled = await recycleOldestTab(session, req.reqId);
-          if (!recycled) {
-            throw new Error('Maximum tabs per session reached');
-          }
-        }
-        {
-          const page = await session.context.newPage();
-          tabState = createTabState(page);
-          attachDownloadListener(tabState, tabId, log);
-          const group = getTabGroup(session, resolvedSessionKey);
-          group.set(tabId, tabState);
-          refreshActiveTabsGauge();
-          log('info', 'tab auto-created on navigate', { reqId: req.reqId, tabId, userId });
-        }
-      } else {
-        tabState = found.tabState;
-      }
-      tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+      const resolvedSessionKey = sessionKey || listItemId || found.listItemId || 'default';
+      let tabState = found.tabState;
+      tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
       
       let targetUrl = url;
       if (macro && macro !== '__NO__' && macro !== 'none' && macro !== 'null') {
         targetUrl = expandMacro(macro, query) || url;
       }
+      const searchFallbacks = getSearchFallbacks(macro, query);
+      let searchFallback = null;
+      let navigationHttpStatus = null;
       
       if (!targetUrl) throw new Error('url or macro required');
       
@@ -2424,47 +3738,249 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       return await withTabLock(tabId, async () => {
         const currentSessionKey = found?.listItemId || resolvedSessionKey;
         const isGoogleSearch = isGoogleSearchUrl(targetUrl);
+        const isAmazonSearch = macro === '@amazon_search';
 
-        const navigateCurrentPage = async () => {
+        const navigateAmazonSearch = async () => {
+          const amazonHomeUrl = 'https://www.amazon.com/';
           tabState.lastRequestedUrl = targetUrl;
-          await withPageLoadDuration('navigate', () => tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          const homeResponse = await withPageLoadDuration('navigate', () => tabState.page.goto(amazonHomeUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS }));
+          if (homeResponse && homeResponse.status() >= 500) {
+            tabState.lastSnapshot = null;
+            throw Object.assign(
+              new Error(`Destination server returned HTTP ${homeResponse.status()}`),
+              { statusCode: 502, code: 'destination_unavailable', retryable: true },
+            );
+          }
+
+          const continueShopping = tabState.page.getByRole('button', { name: /continue shopping/i });
+          const searchInput = tabState.page.locator('input#twotabsearchtextbox:visible, input[name="field-keywords"]:visible, input[type="search"]:visible').first();
+          const amazonSurface = await Promise.race([
+            continueShopping.waitFor({ state: 'visible', timeout: NAVIGATE_TIMEOUT_MS }).then(() => 'continue'),
+            searchInput.waitFor({ state: 'visible', timeout: NAVIGATE_TIMEOUT_MS }).then(() => 'search'),
+          ]);
+          if (amazonSurface === 'continue') {
+            let continueNavigation;
+            try {
+              continueNavigation = tabState.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
+              await continueShopping.click({ noWaitAfter: true });
+              const continueResponse = await continueNavigation;
+              if (continueResponse && continueResponse.status() >= 500) {
+                tabState.lastSnapshot = null;
+                throw Object.assign(
+                  new Error(`Destination server returned HTTP ${continueResponse.status()}`),
+                  { statusCode: 502, code: 'destination_unavailable', retryable: true },
+                );
+              }
+            } catch (err) {
+              continueNavigation?.catch(() => {});
+              throw err;
+            }
+          }
+
+          await searchInput.waitFor({ state: 'visible', timeout: NAVIGATE_TIMEOUT_MS });
+          let searchNavigation;
+          try {
+            searchNavigation = tabState.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
+            await searchInput.fill(query || '');
+            await searchInput.press('Enter');
+            const searchResponse = await searchNavigation;
+            if (searchResponse && searchResponse.status() >= 500) {
+              tabState.lastSnapshot = null;
+              throw Object.assign(
+                new Error(`Destination server returned HTTP ${searchResponse.status()}`),
+                { statusCode: 502, code: 'destination_unavailable', retryable: true },
+              );
+            }
+          } catch (err) {
+            searchNavigation?.catch(() => {});
+            throw err;
+          }
+          tabState.visitedUrls.add(amazonHomeUrl);
           tabState.visitedUrls.add(targetUrl);
           tabState.lastSnapshot = null;
         };
 
+        const navigateCurrentPage = async () => {
+          if (isAmazonSearch) return navigateAmazonSearch();
+          tabState.lastRequestedUrl = targetUrl;
+          const ac = tabState.navigateAbort = new AbortController();
+          const gotoP = withPageLoadDuration('navigate', () => navigatePage(tabState.page, targetUrl, { timeout: NAVIGATE_TIMEOUT_MS }));
+          try {
+            const response = await Promise.race([
+              gotoP,
+              new Promise((_, reject) => ac.signal.addEventListener('abort', () => reject(new Error('Navigation aborted: tab deleted')), { once: true })),
+            ]);
+            tabState.lastNavigationHttpStatus = typeof response?.status === 'function' ? response.status() : null;
+            navigationHttpStatus = tabState.lastNavigationHttpStatus;
+            if (response && response.status() >= 500) {
+              tabState.lastSnapshot = null;
+              throw Object.assign(
+                new Error(`Destination server returned HTTP ${response.status()}`),
+                { statusCode: 502, code: 'destination_unavailable', retryable: true },
+              );
+            }
+            tabState.visitedUrls.add(targetUrl);
+            tabState.lastSnapshot = null;
+          } catch (err) {
+            gotoP.catch(() => {}); // suppress unhandled rejection from still-pending goto
+            throw err;
+          } finally {
+            tabState.navigateAbort = null;
+          }
+        };
+
+        // Pages can close independently while the BrowserContext remains usable.
+        // Keep the public tab ID stable by replacing only that page and retrying
+        // this navigation once. Destination errors are never recovered as success.
+        const replaceDeadTabPage = async () => {
+          const previousTabState = tabState;
+          const createdPage = await createPageWithRecoveryForUser(userId, session);
+          session = createdPage.session;
+          const group = getTabGroup(session, currentSessionKey);
+          const replacementPage = createdPage.page;
+          const replacementLease = createdPage.lease;
+          let replacementAttached = false;
+          try {
+            tabState = createTabState(replacementPage);
+            tabState.googleRetryCount = previousTabState.googleRetryCount || 0;
+            attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+            group.set(tabId, tabState);
+            attachPopupHandler(replacementPage, userId, currentSessionKey);
+            replacementAttached = true;
+          } finally {
+            releasePageLease(session, replacementLease);
+            if (!replacementAttached) await safePageClose(replacementPage);
+          }
+          await clearTabDownloads(previousTabState).catch(() => {});
+          await safePageClose(previousTabState.page);
+          refreshActiveTabsGauge();
+        };
+
+        const navigateWithDeadPageRecovery = async () => {
+          if (tabState.page?.isClosed?.()) await replaceDeadTabPage();
+          try {
+            await navigateCurrentPage();
+          } catch (err) {
+            if (!isDeadContextError(err)) throw err;
+            log('warn', 'navigate found a dead tab page; replacing it once', {
+              reqId: req.reqId,
+              tabId,
+            });
+            await replaceDeadTabPage();
+            await navigateCurrentPage();
+          }
+        };
+
         const prewarmGoogleHome = async () => {
           if (!isGoogleSearch || tabState.visitedUrls.has('https://www.google.com/')) return;
-          await withPageLoadDuration('navigate', () => tabState.page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }));
-          tabState.visitedUrls.add('https://www.google.com/');
-          await tabState.page.waitForTimeout(1200);
+          const prewarm = await createLeasedPage(session);
+          const prewarmPage = prewarm.page;
+          try {
+            await withPageLoadDuration('navigate', () => navigatePage(prewarmPage, 'https://www.google.com/', { timeout: NAVIGATE_TIMEOUT_MS }));
+            tabState.visitedUrls.add('https://www.google.com/');
+            await prewarmPage.waitForTimeout(1200);
+          } finally {
+            await closeLeasedPage(session, prewarmPage, prewarm.lease);
+          }
+        };
+
+        const navigateSearchFallback = async () => {
+          for (const candidate of searchFallbacks) {
+            targetUrl = candidate.url;
+            try {
+              await navigateCurrentPage();
+              if (await isFallbackSearchBlocked(tabState.page, candidate.engine)) {
+                log('warn', 'search fallback blocked', {
+                  reqId: req.reqId,
+                  tabId,
+                  engine: candidate.engine,
+                  url: tabState.page.url(),
+                });
+                continue;
+              }
+              searchFallback = { searchEngine: candidate.engine, fallbackFrom: 'google' };
+              log('info', 'search fallback succeeded', {
+                reqId: req.reqId,
+                tabId,
+                engine: candidate.engine,
+                url: tabState.page.url(),
+              });
+              return true;
+            } catch (fallbackErr) {
+              log('warn', 'search fallback failed', {
+                reqId: req.reqId,
+                tabId,
+                engine: candidate.engine,
+                error: fallbackErr.message,
+              });
+            }
+          }
+          return false;
         };
 
         const recreateTabOnFreshContext = async () => {
           const previousRetryCount = tabState.googleRetryCount || 0;
           browserRestartsTotal.labels('google_search_block').inc();
-          // Rotate at context level — destroy this user's session and create
+          // Rotate at context level -- destroy this user's session and create
           // a fresh one with a new proxy session. Does NOT restart the browser.
           const key = normalizeUserId(userId);
           const oldSession = sessions.get(key);
           if (oldSession) {
-            await oldSession.context.close().catch(() => {});
-            sessions.delete(key);
+            await closeSession(key, oldSession, { reason: 'google_blocked_context_rotate', clearDownloads: true, clearLocks: true });
           }
           session = await getSession(userId);
           const group = getTabGroup(session, currentSessionKey);
-          const page = await session.context.newPage();
+          const { page, lease } = await createLeasedPage(session);
           tabState = createTabState(page);
           tabState.googleRetryCount = previousRetryCount + 1;
-          attachDownloadListener(tabState, tabId, log);
+          attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           group.set(tabId, tabState);
+          releasePageLease(session, lease);
+          attachPopupHandler(page, userId, currentSessionKey);
           refreshActiveTabsGauge();
         };
 
         if (isGoogleSearch && proxyPool?.canRotateSessions) {
-          await prewarmGoogleHome();
+          await prewarmGoogleHome().catch((prewarmErr) => {
+            log('warn', 'google prewarm failed; continuing to search navigation', {
+              reqId: req.reqId,
+              tabId,
+              error: prewarmErr.message,
+            });
+          });
         }
 
-        await navigateCurrentPage();
+        // Navigate with transparent retry on proxy/timeout errors.
+        // If the proxy is blocked or the page times out, destroy the session,
+        // get a fresh proxy, and retry once before failing to the caller.
+        try {
+          await navigateWithDeadPageRecovery();
+          recordNavSuccess(userId);
+        } catch (navErr) {
+          if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
+            log('warn', 'navigate failed, retrying with fresh proxy session', {
+              reqId: req.reqId, tabId, error: navErr.message,
+            });
+            browserRestartsTotal.labels('proxy_retry').inc();
+            await recreateTabOnFreshContext();
+            if (isGoogleSearch) await prewarmGoogleHome().catch(() => {});
+            try {
+              await navigateWithDeadPageRecovery();
+              recordNavSuccess(userId);
+            } catch (retryErr) {
+              if (!isGoogleSearch || !await navigateSearchFallback()) throw retryErr;
+              recordNavSuccess(userId);
+            }
+          } else if (isGoogleSearch && navErr.code === 'destination_unavailable' && await navigateSearchFallback()) {
+            // The Google request failed upstream; a successful fallback is the
+            // existing search behavior and is the only success reported here.
+          } else {
+            if (recordNavFailure(userId)) {
+              await recoverUserSession(userId, 'navigate_failure');
+            }
+            throw navErr;
+          }
+        }
 
         if (isGoogleSearch && proxyPool?.canRotateSessions && await isGoogleSearchBlocked(tabState.page)) {
           log('warn', 'google search blocked, rotating browser proxy session', {
@@ -2474,28 +3990,69 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             proxySession: browserLaunchProxy?.sessionId || null,
           });
           await recreateTabOnFreshContext();
-          await prewarmGoogleHome();
-          await navigateCurrentPage();
+          await prewarmGoogleHome().catch(() => {});
+          try {
+            await navigateWithDeadPageRecovery();
+          } catch (retryErr) {
+            if (!await navigateSearchFallback()) throw retryErr;
+          }
         }
         
-        // For Google SERP: skip eager ref building during navigate.
-        // Results render asynchronously after DOMContentLoaded — the snapshot
-        // call will wait for and extract them.
+        // A Google HTTP 200 shell can have a search box but no organic cards after
+        // proxy rotation. Do not report it as a successful search: wait briefly for
+        // cards, then use the ordinary DuckDuckGo → Bing fallback.
         if (isGoogleSerp(tabState.page.url())) {
-          tabState.refs = new Map();
-          return { ok: true, tabId, url: tabState.page.url(), refsAvailable: false, googleSerp: true };
+          if (await hasGoogleOrganicResults(tabState.page)) {
+            tabState.refs = new Map();
+            return { ok: true, tabId, url: tabState.page.url(), refsAvailable: false, googleSerp: true };
+          }
+
+          log('warn', 'google search returned no organic results; using fallback', {
+            reqId: req.reqId,
+            tabId,
+            url: tabState.page.url(),
+          });
+          if (!await navigateSearchFallback()) {
+            return {
+              ok: false,
+              tabId,
+              url: tabState.page.url(),
+              refsAvailable: false,
+              googleResultsAvailable: false,
+              searchFallbackAttempted: searchFallbacks.length > 0,
+              searchFallbacksExhausted: searchFallbacks.length > 0,
+            };
+          }
         }
 
         if (isGoogleSearch && await isGoogleSearchBlocked(tabState.page)) {
-          return { ok: false, tabId, url: tabState.page.url(), refsAvailable: false, googleBlocked: true };
+          if (!await navigateSearchFallback()) {
+            return {
+              ok: false,
+              tabId,
+              url: tabState.page.url(),
+              refsAvailable: false,
+              googleBlocked: true,
+              searchFallbackAttempted: searchFallbacks.length > 0,
+            };
+          }
         }
         
         tabState.refs = await buildRefs(tabState.page);
-        return { ok: true, tabId, url: tabState.page.url(), refsAvailable: tabState.refs.size > 0 };
-      }, requestTimeoutMs());
-    })(), requestTimeoutMs(), 'navigate'));
+        return {
+          ok: true,
+          tabId,
+          url: tabState.page.url(),
+          refsAvailable: tabState.refs.size > 0,
+          httpStatus: navigationHttpStatus,
+          navigationOk: navigationHttpStatus === null || navigationHttpStatus < 400,
+          ...searchFallback,
+        };
+      }, navigateTimeoutMs, undefined, { maxQueueWaitMs: navigateDeadline - Date.now() });
+    })(), navigateTimeoutMs, 'navigate'));
     
     log('info', 'navigated', { reqId: req.reqId, tabId, url: result.url });
+    pluginEvents.emit('tab:navigated', { userId: req.body.userId, tabId, url: result.url, prevUrl: null });
     res.json(result);
   } catch (err) {
     log('error', 'navigate failed', { reqId: req.reqId, tabId, error: err.message });
@@ -2503,11 +4060,90 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     if (is400) {
       return res.status(400).json({ error: safeError(err) });
     }
+    // SSL certificate errors — site has a bad/self-signed cert. Non-retriable.
+    const isSslError = err.message && (
+      err.message.includes('SEC_ERROR') ||
+      err.message.includes('SSL_ERROR') ||
+      err.message.includes('MOZILLA_PKIX_ERROR')
+    );
+    if (isSslError) {
+      return res.status(502).json({
+        error: `SSL certificate error: ${err.message.split('\n')[0]}`,
+        code: 'ssl_error',
+        recoverable: false,
+      });
+    }
     handleRouteError(err, req, res);
   }
 });
 
 // Snapshot
+/**
+ * @openapi
+ * /tabs/{tabId}/snapshot:
+ *   get:
+ *     tags: [Content]
+ *     summary: Accessibility snapshot
+ *     description: Returns accessibility tree with element refs. Supports pagination via offset.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: format
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: [text, json]
+ *           default: text
+ *       - name: offset
+ *         in: query
+ *         schema:
+ *           type: integer
+ *         description: Character offset for paginated retrieval.
+ *       - name: includeScreenshot
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: ['true', 'false']
+ *     responses:
+ *       200:
+ *         description: Snapshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 url:
+ *                   type: string
+ *                 snapshot:
+ *                   type: string
+ *                 structure:
+ *                   type: object
+ *                   description: Optional bounded read-only DOM summary of forms and tables. The snapshot field remains unchanged.
+ *                 refsCount:
+ *                   type: integer
+ *                 truncated:
+ *                   type: boolean
+ *                 totalChars:
+ *                   type: integer
+ *                 hasMore:
+ *                   type: boolean
+ *                 nextOffset:
+ *                   type: integer
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/tabs/:tabId/snapshot', async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -2516,15 +4152,16 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     const offset = parseInt(req.query.offset) || 0;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
     // Cached chunk retrieval for offset>0 requests
     if (offset > 0 && tabState.lastSnapshot) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
-      const response = { url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      const response = { url: tabState.page.url(), snapshot: win.text, structure: tabState.lastStructure, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
       if (req.query.includeScreenshot === 'true') {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
@@ -2555,11 +4192,12 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
 
       const pageUrl = tabState.page.url();
       
-      // Google SERP fast path — DOM extraction instead of ariaSnapshot
+      // Google SERP fast path -- DOM extraction instead of ariaSnapshot
       if (isGoogleSerp(pageUrl)) {
         const { refs: googleRefs, snapshot: googleSnapshot } = await extractGoogleSerp(tabState.page);
         tabState.refs = googleRefs;
         tabState.lastSnapshot = googleSnapshot;
+        snapshotBytes.labels('google_serp').observe(Buffer.byteLength(googleSnapshot, 'utf8'));
         const annotatedYaml = googleSnapshot;
         const win = windowSnapshot(annotatedYaml, 0);
         const response = {
@@ -2580,7 +4218,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       
       tabState.refs = await refreshTabRefs(tabState, { reason: 'snapshot' });
       const ariaYaml = await getAriaSnapshot(tabState.page);
-      
+      const structure = attachStructureRefs(await extractPageStructure(tabState.page), tabState.refs);
       let annotatedYaml = ariaYaml || '';
       if (annotatedYaml && tabState.refs.size > 0) {
         const refsByKey = new Map();
@@ -2597,7 +4235,6 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
           if (match) {
             const [, prefix, role, nameMatch, name, suffix] = match;
             const normalizedRole = role.toLowerCase();
-            if (normalizedRole === 'combobox') return line;
             if (name && SKIP_PATTERNS.some(p => p.test(name))) return line;
             if (INTERACTIVE_ROLES.includes(normalizedRole)) {
               const normalizedName = name || '';
@@ -2616,11 +4253,14 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       }
       
       tabState.lastSnapshot = annotatedYaml;
+      tabState.lastStructure = structure;
+      if (annotatedYaml) snapshotBytes.labels('full').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
       const win = windowSnapshot(annotatedYaml, 0);
 
       const response = {
         url: tabState.page.url(),
         snapshot: win.text,
+        structure,
         refsCount: tabState.refs.size,
         truncated: win.truncated,
         totalChars: win.totalChars,
@@ -2636,6 +4276,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       return response;
     })(), requestTimeoutMs(), 'snapshot'));
 
+    pluginEvents.emit('tab:snapshot', { userId: req.query.userId, tabId: req.params.tabId, snapshot: result.snapshot });
     log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, truncated: result.truncated });
     res.json(result);
   } catch (err) {
@@ -2645,15 +4286,60 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
 });
 
 // Wait for page ready
+/**
+ * @openapi
+ * /tabs/{tabId}/wait:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Wait for a selector or timeout
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               selector:
+ *                 type: string
+ *               timeout:
+ *                 type: integer
+ *                 description: Max wait in ms.
+ *     responses:
+ *       200:
+ *         description: Wait completed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/wait', async (req, res) => {
   try {
-    const { userId, timeout = 10000, waitForNetwork = true } = req.body;
+    const { userId, timeout = 10000, waitForNetwork = true, dismissConsent = false } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork });
+    const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork, dismissConsent });
     
     res.json({ ok: true, ready });
   } catch (err) {
@@ -2663,6 +4349,70 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
 });
 
 // Click
+/**
+ * @openapi
+ * /tabs/{tabId}/click:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Click an element
+ *     description: Click by element ref, CSS selector, or coordinates.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *                 description: Element ref ID (e.g. "e3").
+ *               selector:
+ *                 type: string
+ *                 description: CSS selector fallback.
+ *               doubleClick:
+ *                 type: boolean
+ *               coordinates:
+ *                 type: object
+ *                 properties:
+ *                   x:
+ *                     type: number
+ *                   y:
+ *                     type: number
+ *     responses:
+ *       200:
+ *         description: Click result with optional post-action snapshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Page changed during the click; caller should take a fresh snapshot and retry with current refs.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/click', async (req, res) => {
   const tabId = req.params.tabId;
   
@@ -2671,78 +4421,134 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     if (!ref && !selector) {
       return res.status(400).json({ error: 'ref or selector required' });
     }
+    const selectorErr = selectorValidationError(selector);
+    if (selectorErr) throw invalidSelectorError(selectorErr);
     
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
       const clickStart = Date.now();
       const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - clickStart));
       // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
-      // Dispatches: mouseover → mouseenter → mousedown → mouseup → click
+      // Dispatches: mouseover -> mouseenter -> mousedown -> mouseup -> click
+      const dispatchDomClick = async (locator) => {
+        await locator.evaluate((element) => {
+          if (!(element instanceof HTMLElement)) throw new Error('Element is not an HTMLElement');
+          element.click();
+        });
+        log('info', 'DOM click dispatched after Playwright click failure');
+      };
+
       const dispatchMouseSequence = async (locator) => {
-        const box = await locator.boundingBox();
+        // boundingBox() with no timeout inherits Playwright's 30s default, which
+        // silently eats the entire handler budget when the element detached after
+        // the failed click attempt (the page changed under us). Bound it to the
+        // remaining budget (capped at 3s) so the route fails fast with an
+        // actionable 422 instead of blowing HANDLER_TIMEOUT_MS into a 500.
+        // NOTE: the message deliberately avoids the 'timed out after' phrase so
+        // isTimeoutError() doesn't classify a detached element as a navigation
+        // timeout and destroy the whole session in handleRouteError().
+        const bboxTimeout = Math.max(500, Math.min(3000, remainingBudget()));
+        let box;
+        try {
+          box = await locator.boundingBox({ timeout: bboxTimeout });
+        } catch (e) {
+          const detachedErr = new Error(`Element not actionable: no bounding box within ${bboxTimeout}ms (element likely detached after page change). Call snapshot to refresh refs and retry.`);
+          detachedErr.statusCode = 422;
+          throw detachedErr;
+        }
         if (!box) throw new Error('Element not visible (no bounding box)');
         
         const x = box.x + box.width / 2;
         const y = box.y + box.height / 2;
         
-        // Move mouse to element (direct, a few steps — not a teleport, not a
-        // wiggle), then a natural click HOLD (~70-150ms), like a person.
-        await tabState.page.mouse.move(x, y, { steps: 4 });
+        // Move mouse to element (direct, a few steps, not a teleport and not a
+        // wiggle), then a natural click HOLD like a person.
+        await withTimeout(tabState.page.mouse.move(x, y, { steps: 4 }), Math.max(1, remainingBudget()), 'native mouse move');
         await tabState.page.waitForTimeout(70 + Math.floor(Math.random() * 120));
 
         // Full click sequence
-        await tabState.page.mouse.down();
+        await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
         await tabState.page.waitForTimeout(60 + Math.floor(Math.random() * 90));
-        await tabState.page.mouse.up();
+        await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
         
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
       };
       
+      const recoverForceClickFailure = async (locator) => {
+        try {
+          await dispatchDomClick(locator);
+        } catch (domErr) {
+          log('warn', 'DOM click fallback failed, trying mouse sequence', { error: domErr.message });
+          await dispatchMouseSequence(locator);
+        }
+      };
+
       // On Google SERPs, skip the normal click attempt (always intercepted by overlays)
-      // and go directly to force click — saves 5s timeout per click
+      // and go directly to force click -- saves 5s timeout per click
       const onGoogleSerp = isGoogleSerp(tabState.page.url());
       
       const doClick = async (locatorOrSelector, isLocator) => {
-        // .first() so a selector that matches duplicates (e.g. desktop+mobile
-        // variants sharing an id, like leboncoin's didomi consent button) doesn't
-        // trip Playwright strict mode.
-        const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector).first();
+        let locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
+        // CSS selectors supplied by callers can match both the visible menu and
+        // inactive template copies. Prefer one visible match when that is
+        // unambiguous, while leaving selector lists untouched because appending
+        // :visible would change their meaning. When the visible match does not
+        // resolve it, fall back to .first() so duplicate-id pages do not trip
+        // Playwright strict mode.
+        const visibleSelector = isLocator ? null : visibleSelectorCandidate(locatorOrSelector);
+        let constrained = false;
+        if (visibleSelector) {
+          const visibleLocator = tabState.page.locator(visibleSelector);
+          if (await visibleLocator.count() === 1) {
+            locator = visibleLocator;
+            constrained = true;
+            log('info', 'click constrained selector to visible match', { selector: locatorOrSelector });
+          }
+        }
+        if (!isLocator && !constrained) {
+          locator = tabState.page.locator(locatorOrSelector).first();
+        }
+        const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
         
         if (onGoogleSerp) {
           try {
-            await locator.click({ timeout: 3000, force: true });
+            await click({ timeout: 3000, force: true });
           } catch (forceErr) {
-            log('warn', 'google force click failed, trying mouse sequence');
-            await dispatchMouseSequence(locator);
+            log('warn', 'google force click failed, trying DOM click fallback');
+            await recoverForceClickFailure(locator);
           }
           return;
         }
         
         try {
           // First try normal click (respects visibility, enabled, not-obscured)
-          await locator.click({ timeout: 3000 });
+          await click({ timeout: 3000 });
         } catch (err) {
           // Fallback 1: If intercepted by overlay, retry with force
           if (err.message.includes('intercepts pointer events')) {
             log('warn', 'click intercepted, retrying with force');
             try {
-              await locator.click({ timeout: 3000, force: true });
+              await click({ timeout: 3000, force: true });
             } catch (forceErr) {
-              // Fallback 2: Full mouse event sequence for stubborn JS handlers
-              log('warn', 'force click failed, trying mouse sequence');
-              await dispatchMouseSequence(locator);
+              log('warn', 'force click failed, trying DOM click fallback');
+              await recoverForceClickFailure(locator);
             }
           } else if (err.message.includes('not visible') || err.message.toLowerCase().includes('timeout')) {
-            // Fallback 2: Element not responding to click, try mouse sequence
-            log('warn', 'click timeout, trying mouse sequence');
-            await dispatchMouseSequence(locator);
+            log('warn', 'click timeout, retrying with force');
+            try {
+              await click({ timeout: Math.max(1, Math.min(3000, remainingBudget())), force: true });
+            } catch (forceErr) {
+              log('warn', 'force click failed, trying DOM click fallback');
+              await recoverForceClickFailure(locator);
+            }
           } else {
             throw err;
           }
@@ -2781,7 +4587,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
           await tabState.page.waitForLoadState('domcontentloaded', { timeout: 3000 });
         } catch {}
         await tabState.page.waitForTimeout(200);
-        // Skip buildRefs here — SERP clicks typically navigate to a new page,
+        // Skip buildRefs here -- SERP clicks typically navigate to a new page,
         // and the caller always requests /snapshot next which rebuilds refs.
         tabState.lastSnapshot = null;
         tabState.refs = new Map();
@@ -2792,7 +4598,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         await tabState.page.waitForTimeout(500);
       }
       tabState.lastSnapshot = null;
-      // buildRefs after click — use remaining budget (min 2s) so we don't blow the handler timeout.
+      // buildRefs after click -- use remaining budget (min 2s) so we don't blow the handler timeout.
       // If it times out, return without refs (caller's next /snapshot will rebuild them).
       const postClickBudget = Math.max(2000, remainingBudget());
       try {
@@ -2809,23 +4615,27 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       const newUrl = tabState.page.url();
       tabState.visitedUrls.add(newUrl);
       return { ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 };
-    }));
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
     
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
+    pluginEvents.emit('tab:click', { userId: req.body.userId, tabId, ref: req.body.ref, selector: req.body.selector });
     res.json(result);
   } catch (err) {
     log('error', 'click failed', { reqId: req.reqId, tabId, error: err.message });
-    if (err.message?.includes('timed out')) {
+    if (err.code !== 'tab_timeout' && err.message?.includes('timed out')) {
       try {
         const session = sessions.get(normalizeUserId(req.body.userId));
         const found = findTab(session, tabId);
         if (found?.tabState?.page && !found.tabState.page.isClosed()) {
           found.tabState.refs = await refreshTabRefs(found.tabState, { reason: 'click_timeout' });
           found.tabState.lastSnapshot = null;
-          return res.status(500).json({
-            error: safeError(err),
+          return res.status(409).json({
+            error: 'Page changed during click. Call snapshot to see the current state and retry with current refs.',
+            code: 'page_changed',
+            retryable: true,
+            recovery: 'snapshot_then_retry',
             hint: 'The page may have changed. Call snapshot to see the current state and retry.',
-            url: found.tabState.page.url(),
+            url: safePageUrl(found.tabState.page),
             refsCount: found.tabState.refs.size,
           });
         }
@@ -2837,52 +4647,332 @@ app.post('/tabs/:tabId/click', async (req, res) => {
   }
 });
 
+// --- /tabs/:tabId/upload timeouts (ms) ---
+// UPLOAD_UI_TIMEOUT_MS is the default for the request's optional `timeout`: the
+// overall budget to wait for an upload UI to appear after the trigger is
+// activated -- either an in-app panel <input type=file> (preferred) or the
+// native file chooser. The panel-poll window sits UPLOAD_PANEL_MARGIN_MS inside
+// that budget so a native chooser that fires late is still caught after polling
+// stops. The remaining constants bound the individual Playwright calls.
+const UPLOAD_UI_TIMEOUT_MS = 12000;
+const UPLOAD_PANEL_MARGIN_MS = 2000;
+const UPLOAD_INPUT_TIMEOUT_MS = 4000; // setInputFiles() on an <input type=file>
+const UPLOAD_FOCUS_TIMEOUT_MS = 3000; // focus() the trigger before pressing Enter
+const UPLOAD_CLICK_TIMEOUT_MS = 4000; // forced click() fallback on the trigger
+const UPLOAD_PANEL_POLL_MS = 500; // interval between panel-input polls
+const UPLOAD_REFS_TIMEOUT_MS = 4000; // refreshTabRefs() before/after the upload
+const UPLOAD_SETTLE_MS = 1500; // let the page process the upload / render a preview
+
+// Upload (file attach via filechooser / setInputFiles)
+/**
+ * @openapi
+ * /tabs/{tabId}/upload:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Attach a file to an upload control
+ *     description: >
+ *       Attaches files from the configured upload directory without going through
+ *       the native OS file dialog. Set CAMOFOX_UPLOADS_DIR to a directory that
+ *       contains the files (default: ~/.camofox/uploads). Two strategies are
+ *       tried in order: (1) if an
+ *       <input type="file"> is already present, call Playwright setInputFiles
+ *       on it directly (works for hidden inputs); (2) otherwise arm a
+ *       filechooser listener, activate the trigger element (ref or selector)
+ *       via keyboard (focus + Enter) then a forced click as fallback, and call
+ *       setFiles on the resulting chooser. Each path must be an absolute path
+ *       that resolves inside the configured upload directory.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, path]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               path:
+ *                 description: "Absolute path, or array of paths, that resolves within CAMOFOX_UPLOADS_DIR."
+ *                 oneOf:
+ *                   - type: string
+ *                   - type: array
+ *                     items:
+ *                       type: string
+ *               ref:
+ *                 type: string
+ *                 description: "Trigger element ref (e.g. e36). Optional when an input[type=file] already exists."
+ *               selector:
+ *                 type: string
+ *                 description: "Trigger element CSS/Playwright selector. Optional when an input[type=file] already exists."
+ *               timeout:
+ *                 type: integer
+ *                 default: 12000
+ *                 description: "Overall budget in ms to wait for an upload UI (in-app panel input or native file chooser) to appear after the trigger is activated. Ignored values (non-numeric or <= 0) fall back to the default."
+ *     responses:
+ *       200:
+ *         description: "File(s) attached."
+ *       400:
+ *         description: "Bad request (missing path/userId; non-regular file; or a path that is missing or outside the configured upload directory)."
+ *       404:
+ *         description: "Tab not found."
+ */
+app.post('/tabs/:tabId/upload', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, ref, selector } = req.body;
+    const { path: filePath } = req.body;
+    const uploadTimeout = Number.isFinite(req.body.timeout) && req.body.timeout > 0
+      ? req.body.timeout
+      : UPLOAD_UI_TIMEOUT_MS;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    if (!filePath) return res.status(400).json({ error: 'path required (container-side file path)' });
+
+    const paths = await resolveUploadPaths({ uploadsDir: CONFIG.uploadsDir, filePaths: Array.isArray(filePath) ? filePath : [filePath] });
+
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const directInput = tabState.page.locator('input[type="file"]').first();
+      let attachedVia = null;
+
+      const trySetExistingInput = async () => {
+        try {
+          if (await directInput.count() > 0) {
+            await directInput.setInputFiles(paths, { timeout: UPLOAD_INPUT_TIMEOUT_MS });
+            return true;
+          }
+        } catch (e) {
+          log('info', 'upload: setInputFiles on existing input failed', { error: e.message });
+        }
+        return false;
+      };
+
+      // Strategy 1: an <input type=file> already exists right now (an upload
+      // panel was opened before this call) -> set files directly. setInputFiles
+      // works on hidden inputs and skips the OS dialog entirely.
+      if (await trySetExistingInput()) {
+        attachedVia = 'direct_input';
+      }
+
+      // Strategy 2: activate the trigger element, then handle EITHER UI path:
+      //   (a) the trigger opens the OS file chooser  -> answer the filechooser;
+      //   (b) the trigger opens an in-app upload panel that mounts a hidden
+      //       <input type=file> a beat later          -> setInputFiles on it.
+      // LinkedIn A/B-tests both behaviors for the same "Photo" control, so we
+      // arm the filechooser listener BEFORE clicking and then race it against
+      // polling for a freshly-mounted input. Whichever resolves first wins.
+      if (!attachedVia) {
+        let locator;
+        if (ref) {
+          locator = refToLocator(tabState.page, ref, tabState.refs);
+          if (!locator) {
+            try {
+              tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_upload', timeoutMs: UPLOAD_REFS_TIMEOUT_MS });
+            } catch (e) { /* proceed without refresh */ }
+            locator = refToLocator(tabState.page, ref, tabState.refs);
+          }
+          if (!locator) {
+            const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+            throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+          }
+        } else if (selector) {
+          locator = tabState.page.locator(selector);
+        } else {
+          const err = new Error('No input[type=file] present and no ref/selector trigger provided.');
+          err.statusCode = 400;
+          throw err;
+        }
+
+        // Arm the filechooser listener FIRST (catch a no-quotes rejection so an
+        // unfired listener never crashes the handler), then activate the trigger.
+        const fcPromise = tabState.page
+          .waitForEvent('filechooser', { timeout: uploadTimeout })
+          .catch(() => null);
+        try {
+          await locator.focus({ timeout: UPLOAD_FOCUS_TIMEOUT_MS });
+          await tabState.page.keyboard.press('Enter');
+        } catch (e) {
+          try { await locator.click({ timeout: UPLOAD_CLICK_TIMEOUT_MS, force: true }); } catch (e2) { /* chooser/panel may still appear */ }
+        }
+
+        // The trigger may surface EITHER UI path (LinkedIn A/B-tests both, and
+        // its "Add media" control opens a native chooser AND mounts a hidden
+        // panel <input>). We must attach the file EXACTLY ONCE — attaching via
+        // both paths produces a duplicate ("1 of 2") image. So this is a
+        // PREFERENCE order, not a race:
+        //   1. Poll for an in-app <input type=file> and setInputFiles on it
+        //      (the reliable LinkedIn path -> via: panel_input).
+        //   2. Only if no panel input ever mounts, fall back to the native
+        //      chooser if it fired -> via: filechooser.
+        const panelWindow = Math.max(UPLOAD_PANEL_POLL_MS, uploadTimeout - UPLOAD_PANEL_MARGIN_MS);
+        const deadline = Date.now() + panelWindow;
+        while (!attachedVia && Date.now() < deadline) {
+          if (await trySetExistingInput()) { attachedVia = 'panel_input'; break; }
+          await tabState.page.waitForTimeout(UPLOAD_PANEL_POLL_MS);
+        }
+        if (!attachedVia) {
+          const fc = await fcPromise;
+          if (fc) {
+            try {
+              await fc.setFiles(paths);
+              attachedVia = 'filechooser';
+            } catch (e) {
+              log('info', 'upload: setFiles on filechooser failed', { error: e.message });
+            }
+          }
+        }
+        // If the panel path won, a native chooser may still have fired and be
+        // sitting on fcPromise. fcPromise is already .catch()'d to null so it
+        // can never reject; Playwright intercepts file choosers (no real OS
+        // dialog is left open), so an un-actioned chooser is harmless and needs
+        // no cancel() — which FileChooser doesn't expose in this PW version
+        // anyway. Nothing to do here; documented so nobody re-adds a second
+        // setFiles (that was the source of the duplicate-image bug).
+
+        if (!attachedVia) {
+          const err = new Error('Upload trigger did not open a file chooser or mount a file input.');
+          err.statusCode = 422;
+          throw err;
+        }
+      }
+
+      // Allow the page to process the upload / render a preview.
+      await tabState.page.waitForTimeout(UPLOAD_SETTLE_MS);
+
+      // Refresh refs so the caller's next snapshot reflects the post-upload UI.
+      try {
+        tabState.refs = await refreshTabRefs(tabState, { reason: 'post_upload', timeoutMs: UPLOAD_REFS_TIMEOUT_MS });
+      } catch (e) { tabState.refs = new Map(); }
+
+      return { ok: true, attached: paths, via: attachedVia, refsAvailable: tabState.refs.size > 0 };
+    }));
+
+    log('info', 'uploaded', { reqId: req.reqId, tabId, attached: paths, via: result.via });
+    pluginEvents.emit('tab:upload', { userId, tabId, paths });
+    res.json(result);
+  } catch (err) {
+    log('error', 'upload failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Type
+/**
+ * @openapi
+ * /tabs/{tabId}/type:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Type text into an element
+ *     description: Types text into a focused element or a specific ref/selector.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, text]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *               selector:
+ *                 type: string
+ *               text:
+ *                 type: string
+ *               clear:
+ *                 type: boolean
+ *                 description: Clear field before typing.
+ *               submit:
+ *                 type: boolean
+ *                 description: Press Enter after typing.
+ *     responses:
+ *       200:
+ *         description: Type result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Page changed or target became invalid; caller should take a fresh snapshot and retry.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/type', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector, text, human, delay } = req.body;
+    const { userId, ref, selector, text, mode = 'fill', delay, human = false, submit = false, pressEnter = false } = req.body;
+    let modePlan;
+    try {
+      modePlan = resolveTypeMode({ mode, human, delay });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
-
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
+    
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
-
-    if (!ref && !selector) {
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    
+    if (typeof text !== 'string') {
+      return res.status(400).json({ error: 'text is required' });
+    }
+    // keyboard mode: ref/selector are optional (types into current focus)
+    if ((mode === 'fill' || mode === 'human' || human) && !ref && !selector) {
       return res.status(400).json({ error: 'ref or selector required' });
     }
+    const selectorErr = selectorValidationError(selector);
+    if (selectorErr) throw invalidSelectorError(selectorErr);
+    const shouldSubmit = submit || pressEnter;
 
-    // Human typing: focus the field, then emit one real keydown/keyup per
-    // character with a jittered inter-keystroke delay — so the page sees genuine
-    // keyboard events (DataDome &co. watch keystroke cadence), not an instant
-    // value-set. Default stays `.fill()` (fast) unless human/delay is requested.
+    // Human typing costs baseDelay + 0..90ms per character, plus an occasional
+    // think-pause. A flat handler budget aborts a long fill mid-type while the
+    // keystroke loop keeps running, so the caller sees a retryable failure and
+    // a retry types twice. Scale the budget with the text and cancel the loop
+    // if the route deadline still fires.
     const baseDelay = typeof delay === 'number' ? delay : 75;
-    // Budget must scale with the work. Human typing costs baseDelay+0..90ms
-    // per char (~5% of chars add a 180-680ms think-pause). A fixed 30s
-    // handler budget aborted any fill longer than ~220 chars mid-type while
-    // the keystroke loop kept running, and the caller saw success
-    // (dogfood 2026-09-03: silent form corruption). Give the operation a
-    // worst-case budget instead of the flat default.
     const typeBudgetMs = Math.max(
       HANDLER_TIMEOUT_MS,
-      Math.ceil(String(text).length * (baseDelay + 90 + 34) + 5000)
+      Math.ceil(String(text).length * (baseDelay + 90 + 120) + 5000)
     );
-    // Cancellation flag — flipped in `finally` around the withTabLock call
-    // below. withTimeout can abort this request while typeHuman is still
-    // mid-loop; without the flag the orphaned loop keeps firing keystrokes
-    // into whatever is focused AFTER the lock is released, interleaving with
-    // the next operation's typing (dogfood 2026-09-03: silent corruption).
     const typeCancelled = { value: false };
-    const typeHuman = async (locator) => {
-      // navigate like a human: glide the real cursor to the field (visible,
-      // curved, multi-step), pause, then a real mouse click — before any keys.
-      const box = await locator.boundingBox().catch(() => null);
+    const wantsHuman = modePlan.useHuman;
+    const typeHuman = async (target) => {
+      const box = await target.boundingBox({ timeout: 5000 }).catch(() => null);
       if (box) {
-        // a DIRECT move to the field (few steps), then click — NOT a many-step
-        // jittered glide. Empirically the high-step "wiggle" trips DataDome;
-        // a clean point-to-point move (like the click path) does not.
         const cx = box.x + box.width / 2;
         const cy = box.y + box.height / 2;
         await tabState.page.mouse.move(cx, cy, { steps: 3 });
@@ -2891,35 +4981,54 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         await tabState.page.waitForTimeout(40 + Math.floor(Math.random() * 60));
         await tabState.page.mouse.up();
       } else {
-        await locator.click({ timeout: 10000 }).catch(() => {});
+        await target.click({ timeout: 10000 }).catch(() => {});
       }
       await tabState.page.waitForTimeout(120 + Math.floor(Math.random() * 200));
-      await locator.fill('').catch(() => {}); // clear existing value
+      await target.fill('').catch(() => {});
       for (const ch of String(text)) {
-        if (typeCancelled.value) break; // orphaned post-timeout — stop typing
+        if (typeCancelled.value) break;
         await tabState.page.keyboard.type(ch, { delay: baseDelay + Math.floor(Math.random() * 90) });
-        if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500)); // occasional think-pause
+        if (Math.random() < 0.05) await tabState.page.waitForTimeout(180 + Math.floor(Math.random() * 500));
       }
     };
 
     await withTabLock(tabId, async () => {
+      // Resolve and focus the target if ref/selector provided
+      let locator = null;
       if (ref) {
-        let locator = refToLocator(tabState.page, ref, tabState.refs);
+        locator = refToLocator(tabState.page, ref, tabState.refs);
         if (!locator) {
-          log('info', 'auto-refreshing refs before fill', { ref, hadRefs: tabState.refs.size });
+          log('info', 'auto-refreshing refs before type', { ref, hadRefs: tabState.refs.size, mode });
           tabState.refs = await refreshTabRefs(tabState, { reason: 'type' });
           locator = refToLocator(tabState.page, ref, tabState.refs);
         }
         if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
-        if (human || delay != null) await typeHuman(locator);
-        else await locator.fill(text, { timeout: 10000 });
-      } else if (human || delay != null) {
-        await typeHuman(tabState.page.locator(selector).first());
-      } else {
-        await tabState.page.fill(selector, text, { timeout: 10000 });
       }
-    }, typeBudgetMs).catch((err) => { typeCancelled.value = true; throw err; });
+      
+      if (mode === 'fill' && !human) {
+        if (locator) {
+          await fillLocator(locator, text);
+        } else {
+          await fillLocator(tabState.page.locator(selector), text);
+        }
+      } else if (wantsHuman) {
+        await typeHuman(locator || tabState.page.locator(selector).first());
+      } else {
+        // keyboard mode -- char-by-char real key events (required for Ember/contenteditable)
+        if (locator) {
+          await locator.focus({ timeout: 10000 });
+        } else if (selector) {
+          await tabState.page.focus(selector, { timeout: 10000 });
+        }
+        await tabState.page.keyboard.type(text, { delay: delay ?? 30 });
+      }
+      if (shouldSubmit) await tabState.page.keyboard.press('Enter');
+    }, typeBudgetMs).catch((err) => {
+      typeCancelled.value = true;
+      throw err;
+    });
     
+    pluginEvents.emit('tab:type', typeEventPayload({ userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode }));
     res.json({ ok: true });
   } catch (err) {
     log('error', 'type failed', { reqId: req.reqId, error: err.message });
@@ -2930,10 +5039,13 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         if (found?.tabState?.page && !found.tabState.page.isClosed()) {
           found.tabState.refs = await refreshTabRefs(found.tabState, { reason: 'type_timeout' });
           found.tabState.lastSnapshot = null;
-          return res.status(500).json({
-            error: safeError(err),
+          return res.status(409).json({
+            error: 'Page changed during type. Call snapshot to see the current state and retry with current refs.',
+            code: 'page_changed',
+            retryable: true,
+            recovery: 'snapshot_then_retry',
             hint: 'The page may have changed. Call snapshot to see the current state and retry.',
-            url: found.tabState.page.url(),
+            url: safePageUrl(found.tabState.page),
             refsCount: found.tabState.refs.size,
           });
         }
@@ -2945,7 +5057,136 @@ app.post('/tabs/:tabId/type', async (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /tabs/{tabId}/select:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Select a native form option
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, option]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *               selector:
+ *                 type: string
+ *               option:
+ *                 type: string
+ *                 description: Visible option label or HTML value.
+ *     responses:
+ *       200:
+ *         description: Option selected.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+// Select a native form option by its visible label or HTML value.
+app.post('/tabs/:tabId/select', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, ref, selector, option } = req.body;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if ((!ref && !selector) || typeof option !== 'string' || !option) {
+      return res.status(400).json({ error: 'ref or selector and a nonempty option are required' });
+    }
+    const selectorErr = selectorValidationError(selector);
+    if (selectorErr) throw invalidSelectorError(selectorErr);
+    if (session) session.lastAccess = Date.now();
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    await withTabLock(tabId, async () => {
+      let locator = ref ? refToLocator(tabState.page, ref, tabState.refs) : tabState.page.locator(selector);
+      if (!locator && ref) {
+        tabState.refs = await refreshTabRefs(tabState, { reason: 'select' });
+        locator = refToLocator(tabState.page, ref, tabState.refs);
+      }
+      if (!locator) throw new StaleRefsError(ref, `e${tabState.refs.size}`, tabState.refs.size);
+      if (selector && await locator.count() === 0) {
+        const error = new Error('Selector did not match any element. Call snapshot and use a current element ref or a matching selector.');
+        error.statusCode = 422;
+        throw error;
+      }
+      await selectOption(locator, option);
+    });
+    pluginEvents.emit('tab:select', { userId, tabId, ref, option });
+    res.json({ ok: true });
+  } catch (err) {
+    log('error', 'select failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Press key
+/**
+ * @openapi
+ * /tabs/{tabId}/press:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Press a keyboard key
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, key]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               key:
+ *                 type: string
+ *                 description: Key name (e.g. "Enter", "Escape", "Tab").
+ *     responses:
+ *       200:
+ *         description: Key pressed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/press', async (req, res) => {
   const tabId = req.params.tabId;
   
@@ -2953,15 +5194,18 @@ app.post('/tabs/:tabId/press', async (req, res) => {
     const { userId, key } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    const normalizedKey = normalizeBrowserKey(key);
     
     await withTabLock(tabId, async () => {
-      await tabState.page.keyboard.press(key);
+      await tabState.page.keyboard.press(normalizedKey);
     });
     
+    pluginEvents.emit('tab:press', { userId, tabId, key: normalizedKey });
     res.json({ ok: true });
   } catch (err) {
     log('error', 'press failed', { reqId: req.reqId, error: err.message });
@@ -2969,98 +5213,92 @@ app.post('/tabs/:tabId/press', async (req, res) => {
   }
 });
 
-// Solve a DataDome "slide to confirm" puzzle with a HUMAN drag curve. The
-// challenge lives in a cross-origin captcha-delivery iframe; Playwright frames
-// pierce it. We grab the handle, press, then drag right with an ease-in-out
-// velocity profile + vertical jitter + a small overshoot-and-settle — a linear
-// constant-velocity drag is exactly what DataDome's motion analysis flags.
-app.post('/tabs/:tabId/slide', async (req, res) => {
-  try {
-    const { userId } = req.body || {};
-    const session = sessions.get(normalizeUserId(userId));
-    const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
-    const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
-    const page = tabState.page;
-
-    // locate the captcha frame
-    const frame = page.frames().find(f => /captcha-delivery\.com/.test(f.url() || ''));
-    if (!frame) return res.json({ ok: false, reason: 'no captcha frame' });
-
-    // find the draggable handle (DataDome markup varies — try known anchors)
-    const HANDLE = ['.slider-control', '.slider .slider-control', '[class*="slider"] [class*="control"]',
-      '.sliderContainer .slider', '[class*="slider"] [draggable]', '.slider', '#ddv1-captcha-container [class*="slider"]'];
-    let handle = null;
-    for (const sel of HANDLE) {
-      const loc = frame.locator(sel).first();
-      const box = await loc.boundingBox().catch(() => null);
-      if (box && box.width > 8 && box.width < 160 && box.height > 8) { handle = box; break; }
-    }
-    if (!handle) return res.json({ ok: false, reason: 'no slider handle' });
-
-    // track width → drag distance (full track; overshoot is clamped by the widget)
-    const track = await frame.locator('.slider, [class*="sliderContainer"], [class*="slider-track"]').first().boundingBox().catch(() => null);
-    const dx = Math.round((track ? track.width : 280) - handle.width * 0.5);
-
-    const sx = handle.x + handle.width / 2;
-    const sy = handle.y + handle.height / 2;
-    await page.mouse.move(sx, sy, { steps: 4 });
-    await page.waitForTimeout(120 + Math.floor(Math.random() * 160));
-    await page.mouse.down();
-
-    // ease-in-out path with jitter, then a small overshoot and settle-back
-    const steps = 28 + Math.floor(Math.random() * 14);
-    const overshoot = 6 + Math.floor(Math.random() * 10);
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps;
-      const eased = 0.5 - Math.cos(Math.PI * t) / 2;       // cosine ease-in-out
-      const x = sx + (dx + overshoot) * eased;
-      const y = sy + (Math.random() * 3 - 1.5);            // tiny vertical drift
-      await page.mouse.move(x, y, { steps: 1 });
-      await page.waitForTimeout(8 + Math.floor(Math.random() * 22));
-    }
-    await page.waitForTimeout(60 + Math.floor(Math.random() * 80));
-    await page.mouse.move(sx + dx, sy, { steps: 3 });       // settle back from overshoot
-    await page.waitForTimeout(40 + Math.floor(Math.random() * 60));
-    await page.mouse.up();
-    await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
-
-    const stillThere = !!page.frames().find(f => /captcha-delivery\.com/.test(f.url() || ''));
-    res.json({ ok: true, dragged: dx, solved: !stillThere });
-  } catch (err) {
-    log('error', 'slide failed', { reqId: req.reqId, error: err.message });
-    handleRouteError(err, req, res);
-  }
-});
-
 // Scroll
-app.post('/tabs/:tabId/scroll', async (req, res) => {
-  try {
-    const { userId, direction = 'down', amount = 500 } = req.body;
-    const session = sessions.get(normalizeUserId(userId));
-    const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
-    
-    const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
-    
-    const isVertical = direction === 'up' || direction === 'down';
-    const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
-    await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
-    await tabState.page.waitForTimeout(300);
-    
-    res.json({ ok: true });
-  } catch (err) {
-    log('error', 'scroll failed', { reqId: req.reqId, error: err.message });
-    handleRouteError(err, req, res);
-  }
-});
-
-// Human-like mouse movement — real (trusted) pointer motion via Playwright, so
-// anti-bot heuristics (DataDome &co.) see organic mouse activity rather than a
-// cursor frozen at (0,0). Modes: wander N times across the viewport (default),
-// move to {x,y}, or hover a {selector}. Stepped paths + jittered dwell.
+/**
+ * @openapi
+ * /tabs/{tabId}/scroll:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Scroll the page
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               direction:
+ *                 type: string
+ *                 description: '"up" or "down" (default "down").'
+ *               amount:
+ *                 type: integer
+ *                 description: Pixels to scroll.
+ *     responses:
+ *       200:
+ *         description: Scroll result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+// Human-like pointer movement
+/**
+ * @openapi
+ * /tabs/{tabId}/mouse:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Move the real pointer like a human
+ *     description: >
+ *       Emits trusted Playwright mouse motion: wander N points, move to {x,y},
+ *       or hover a {selector}. Point-to-point moves with jittered dwell time.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               moves:
+ *                 type: integer
+ *               x:
+ *                 type: number
+ *               y:
+ *                 type: number
+ *               selector:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Pointer moved.
+ *       404:
+ *         description: Tab not found.
+ */
 app.post('/tabs/:tabId/mouse', async (req, res) => {
   try {
     const { userId, moves = 3, x, y, selector } = req.body || {};
@@ -3078,7 +5316,7 @@ app.post('/tabs/:tabId/mouse', async (req, res) => {
 
     const path = [];
     if (selector) {
-      const box = await page.locator(selector).first().boundingBox().catch(() => null);
+      const box = await page.locator(selector).first().boundingBox({ timeout: 5000 }).catch(() => null);
       if (box) path.push([box.x + box.width / 2, box.y + box.height / 2]);
     } else if (typeof x === 'number' && typeof y === 'number') {
       path.push([x, y]);
@@ -3088,7 +5326,8 @@ app.post('/tabs/:tabId/mouse', async (req, res) => {
       for (let i = 0; i < hops; i++) path.push([40 + rnd(Math.max(1, vp.w - 80)), 60 + rnd(Math.max(1, vp.h - 120))]);
     }
     for (const [tx, ty] of path) {
-      await page.mouse.move(tx, ty, { steps: 3 }); // DIRECT point-to-point (no jitter wiggle — that trips DataDome)
+      // Direct point-to-point: a many-step jittered "wiggle" trips DataDome.
+      await page.mouse.move(tx, ty, { steps: 3 });
       await page.waitForTimeout(120 + rnd(400));
     }
     res.json({ ok: true, moves: path.length });
@@ -3098,7 +5337,242 @@ app.post('/tabs/:tabId/mouse', async (req, res) => {
   }
 });
 
+// DataDome slide-to-confirm
+/**
+ * @openapi
+ * /tabs/{tabId}/slide:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Solve a DataDome slide puzzle with a human drag curve
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Drag result.
+ *       404:
+ *         description: Tab not found.
+ */
+app.post('/tabs/:tabId/slide', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    const page = tabState.page;
+
+    const frame = page.frames().find((f) => /captcha-delivery\.com/.test(f.url() || ''));
+    if (!frame) return res.json({ ok: false, reason: 'no captcha frame' });
+
+    const HANDLE = ['.slider-control', '.slider .slider-control', '[class*="slider"] [class*="control"]',
+      '.sliderContainer .slider', '[class*="slider"] [draggable]', '.slider', '#ddv1-captcha-container [class*="slider"]'];
+    let handle = null;
+    for (const sel of HANDLE) {
+      const loc = frame.locator(sel).first();
+      const box = await loc.boundingBox({ timeout: 5000 }).catch(() => null);
+      if (box && box.width > 8 && box.width < 160 && box.height > 8) { handle = box; break; }
+    }
+    if (!handle) return res.json({ ok: false, reason: 'no slider handle' });
+
+    const track = await frame.locator('.slider, [class*="sliderContainer"], [class*="slider-track"]').first().boundingBox({ timeout: 5000 }).catch(() => null);
+    const dx = Math.round((track ? track.width : 280) - handle.width * 0.5);
+
+    const sx = handle.x + handle.width / 2;
+    const sy = handle.y + handle.height / 2;
+    await page.mouse.move(sx, sy, { steps: 4 });
+    await page.waitForTimeout(120 + Math.floor(Math.random() * 160));
+    await page.mouse.down();
+
+    const steps = 28 + Math.floor(Math.random() * 14);
+    const overshoot = 6 + Math.floor(Math.random() * 10);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const eased = 0.5 - Math.cos(Math.PI * t) / 2;
+      const px = sx + (dx + overshoot) * eased;
+      const py = sy + (Math.random() * 3 - 1.5);
+      await page.mouse.move(px, py, { steps: 1 });
+      await page.waitForTimeout(8 + Math.floor(Math.random() * 22));
+    }
+    await page.waitForTimeout(60 + Math.floor(Math.random() * 80));
+    await page.mouse.move(sx + dx, sy, { steps: 3 });
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+    await page.mouse.up();
+    await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
+
+    const stillThere = !!page.frames().find((f) => /captcha-delivery\.com/.test(f.url() || ''));
+    res.json({ ok: true, dragged: dx, solved: !stillThere });
+  } catch (err) {
+    log('error', 'slide failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+app.post('/tabs/:tabId/scroll', async (req, res) => {
+  try {
+    const { userId, direction = 'down', amount = 500 } = req.body;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
+    
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    
+    await withTabLock(req.params.tabId, async () => {
+      const isVertical = direction === 'up' || direction === 'down';
+      const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
+      await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
+      await tabState.page.waitForTimeout(300);
+    });
+    
+    pluginEvents.emit('tab:scroll', { userId, tabId: req.params.tabId, direction, amount });
+    res.json({ ok: true });
+  } catch (err) {
+    log('error', 'scroll failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Viewport
+/**
+ * @openapi
+ * /tabs/{tabId}/viewport:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Set the page viewport size
+ *     description: >
+ *       Physically resizes the page via Playwright's `page.setViewportSize`,
+ *       triggering a real layout reflow. Use for responsive testing —
+ *       `window.resizeTo()` is a no-op on non-popup windows.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, width, height]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               width:
+ *                 type: integer
+ *                 minimum: 100
+ *                 maximum: 4000
+ *               height:
+ *                 type: integer
+ *                 minimum: 100
+ *                 maximum: 4000
+ *     responses:
+ *       200:
+ *         description: Viewport set.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 width:
+ *                   type: integer
+ *                 height:
+ *                   type: integer
+ *       400:
+ *         description: Width or height missing or out of range.
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/viewport', async (req, res) => {
+  try {
+    const { userId, width, height } = req.body;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 100 || height < 100 || width > 4000 || height > 4000) {
+      return res.status(400).json({ error: 'width and height required (100..4000 px)' });
+    }
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (session) session.lastAccess = Date.now();
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    await tabState.page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
+    await tabState.page.waitForTimeout(150);
+
+    pluginEvents.emit('tab:viewport', { userId, tabId: req.params.tabId, width, height });
+    res.json({ ok: true, width: Math.round(width), height: Math.round(height) });
+  } catch (err) {
+    log('error', 'viewport failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Back
+/**
+ * @openapi
+ * /tabs/{tabId}/back:
+ *   post:
+ *     tags: [Navigation]
+ *     summary: Go back
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Navigated back.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 url:
+ *                   type: string
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/back', async (req, res) => {
   const tabId = req.params.tabId;
   
@@ -3106,17 +5580,18 @@ app.post('/tabs/:tabId/back', async (req, res) => {
     const { userId } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(tabId, async () => {
       try {
-        await tabState.page.goBack({ timeout: 10000 });
+        await tabState.page.goBack({ timeout: 20000 });
       } catch (navErr) {
         // NS_BINDING_CANCELLED_OLD_LOAD: Firefox cancels the old load when going back.
-        // The navigation itself succeeded — just the prior page's load was interrupted.
+        // The navigation itself succeeded -- just the prior page's load was interrupted.
         if (navErr.message && navErr.message.includes('NS_BINDING_CANCELLED')) {
           log('info', 'goBack cancelled old load (expected)', { reqId: req.reqId, tabId });
         } else {
@@ -3135,6 +5610,47 @@ app.post('/tabs/:tabId/back', async (req, res) => {
 });
 
 // Forward
+/**
+ * @openapi
+ * /tabs/{tabId}/forward:
+ *   post:
+ *     tags: [Navigation]
+ *     summary: Go forward
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Navigated forward.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 url:
+ *                   type: string
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/forward', async (req, res) => {
   const tabId = req.params.tabId;
   
@@ -3142,10 +5658,11 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
     const { userId } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(tabId, async () => {
       await tabState.page.goForward({ timeout: 10000 });
@@ -3161,6 +5678,47 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
 });
 
 // Refresh
+/**
+ * @openapi
+ * /tabs/{tabId}/refresh:
+ *   post:
+ *     tags: [Navigation]
+ *     summary: Refresh page
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Page refreshed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 url:
+ *                   type: string
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/:tabId/refresh', async (req, res) => {
   const tabId = req.params.tabId;
   
@@ -3168,10 +5726,11 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
     const { userId } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(tabId, async () => {
       await tabState.page.reload({ timeout: 30000 });
@@ -3187,6 +5746,49 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
 });
 
 // Get links
+/**
+ * @openapi
+ * /tabs/{tabId}/links:
+ *   get:
+ *     tags: [Content]
+ *     summary: Extract page links
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Links extracted.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 links:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       text:
+ *                         type: string
+ *                       href:
+ *                         type: string
+ *                       ref:
+ *                         type: string
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/tabs/:tabId/links', async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -3196,38 +5798,167 @@ app.get('/tabs/:tabId/links', async (req, res) => {
     const found = findTab(session, req.params.tabId);
     if (!found) {
       log('warn', 'links: tab not found', { reqId: req.reqId, tabId: req.params.tabId, userId, hasSession: !!session });
-      return res.status(404).json({ error: 'Tab not found' });
+      return tabNotFoundResponse(res, req.params.tabId);
     }
+    if (session) session.lastAccess = Date.now();
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
-    const allLinks = await tabState.page.evaluate(() => {
-      const links = [];
-      document.querySelectorAll('a[href]').forEach(a => {
-        const href = a.href;
-        const text = a.textContent?.trim().slice(0, 100) || '';
-        if (href && href.startsWith('http')) {
-          links.push({ url: href, text });
-        }
+    const result = await withTabLock(req.params.tabId, async () => {
+      const allLinks = await tabState.page.evaluate(() => {
+        const links = [];
+        document.querySelectorAll('a[href]').forEach(a => {
+          const href = a.href;
+          const text = a.textContent?.trim().slice(0, 100) || '';
+          if (href && href.startsWith('http')) {
+            links.push({ url: href, text });
+          }
+        });
+        return links;
       });
-      return links;
+      
+      const total = allLinks.length;
+      const paginated = allLinks.slice(offset, offset + limit);
+      
+      return {
+        links: paginated,
+        pagination: { total, offset, limit, hasMore: offset + limit < total }
+      };
     });
     
-    const total = allLinks.length;
-    const paginated = allLinks.slice(offset, offset + limit);
-    
-    res.json({
-      links: paginated,
-      pagination: { total, offset, limit, hasMore: offset + limit < total }
-    });
+    res.json(result);
   } catch (err) {
     log('error', 'links failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
 
+// Fetch the currently displayed PDF through its existing browser context.
+/**
+ * @openapi
+ * /tabs/{tabId}/fetch-current-resource:
+ *   post:
+ *     tags: [Content]
+ *     summary: Save the current tab's PDF as a download artifact
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Saved PDF download artifact.
+ *       404:
+ *         description: Tab not found.
+ *       415:
+ *         description: Current resource is not a PDF.
+ */
+app.post('/tabs/:tabId/fetch-current-resource', async (req, res) => {
+  try {
+    const userId = req.body?.userId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId);
+    const { tabState } = found;
+    const url = tabState.page.url();
+    if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Current tab does not have an HTTP resource' });
+
+    // Prefer the bytes the browser already received for the current document
+    // (inline PDF); fall back to a Node-side refetch when unavailable.
+    let body = null;
+    let mimeType = null;
+    let source = 'navigation_response';
+    const inline = await readInlinePdfResponse(tabState, url);
+    if (inline?.exceedsLimit) {
+      return res.status(413).json({ error: `Current resource exceeds ${MAX_FETCHED_RESOURCE_BYTES} byte limit` });
+    }
+    if (inline) {
+      ({ body, mimeType } = inline);
+    } else {
+      source = 'refetch';
+      const response = await tabState.page.context().request.get(url);
+      const headers = response.headers();
+      mimeType = String(headers['content-type'] || '').split(';', 1)[0].toLowerCase();
+      if (mimeType !== 'application/pdf') return res.status(415).json({ error: 'Current resource is not a PDF' });
+      const declaredBytes = Number(headers['content-length']);
+      if (Number.isFinite(declaredBytes) && declaredBytes > MAX_FETCHED_RESOURCE_BYTES) {
+        return res.status(413).json({ error: `Current resource exceeds ${MAX_FETCHED_RESOURCE_BYTES} byte limit` });
+      }
+      body = await response.body();
+    }
+    if (body.length > MAX_FETCHED_RESOURCE_BYTES) {
+      return res.status(413).json({ error: `Current resource exceeds ${MAX_FETCHED_RESOURCE_BYTES} byte limit` });
+    }
+    log('debug', 'fetch current resource', { reqId: req.reqId, source, bytes: body.length });
+    const pathname = new URL(url).pathname;
+    const filename = pathname.split('/').pop() || 'document.pdf';
+    const download = await captureFetchedResource(tabState, { url, mimeType, filename, body });
+    tabState.toolCalls++;
+    if (session) session.lastAccess = Date.now();
+    res.json({ tabId: req.params.tabId, download });
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'fetch_current_resource').inc();
+    log('error', 'fetch current resource failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Get captured downloads
+/**
+ * @openapi
+ * /tabs/{tabId}/downloads:
+ *   get:
+ *     tags: [Content]
+ *     summary: List tab downloads
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Downloads list.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 downloads:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       filename:
+ *                         type: string
+ *                       url:
+ *                         type: string
+ *                       state:
+ *                         type: string
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/tabs/:tabId/downloads', async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -3237,7 +5968,8 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
     const maxBytes = Number.isFinite(maxBytesRaw) && maxBytesRaw > 0 ? maxBytesRaw : MAX_DOWNLOAD_INLINE_BYTES;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
 
     const { tabState } = found;
     tabState.toolCalls++;
@@ -3257,6 +5989,51 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
 });
 
 // Get image elements from current page
+/**
+ * @openapi
+ * /tabs/{tabId}/images:
+ *   get:
+ *     tags: [Content]
+ *     summary: Extract page images
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Images extracted.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 images:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       src:
+ *                         type: string
+ *                       alt:
+ *                         type: string
+ *                       width:
+ *                         type: integer
+ *                       height:
+ *                         type: integer
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/tabs/:tabId/images', async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -3267,7 +6044,8 @@ app.get('/tabs/:tabId/images', async (req, res) => {
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 20) : 8;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
 
     const { tabState } = found;
     tabState.toolCalls++;
@@ -3283,17 +6061,87 @@ app.get('/tabs/:tabId/images', async (req, res) => {
 });
 
 // Screenshot
+/**
+ * @openapi
+ * /tabs/{tabId}/screenshot:
+ *   get:
+ *     tags: [Content]
+ *     summary: Take a screenshot
+ *     description: Returns a base64-encoded PNG screenshot.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: selector
+ *         in: query
+ *         schema:
+ *           type: string
+ *         description: Capture only this CSS-selected element.
+ *       - name: format
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: [png, jpeg]
+ *       - name: quality
+ *         in: query
+ *         schema:
+ *           type: integer
+ *         description: JPEG quality (1..100).
+ *       - name: fullPage
+ *         in: query
+ *         schema:
+ *           type: boolean
+ *     responses:
+ *       200:
+ *         description: Screenshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 screenshot:
+ *                   type: object
+ *                   properties:
+ *                     data:
+ *                       type: string
+ *                     mimeType:
+ *                       type: string
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/tabs/:tabId/screenshot', async (req, res) => {
   try {
     const userId = req.query.userId;
     const fullPage = req.query.fullPage === 'true';
+    const selector = req.query.selector;
+    const format = req.query.format === 'jpeg' ? 'jpeg' : 'png';
+    const qualityRaw = Number(req.query.quality);
+    const quality = Number.isFinite(qualityRaw) && qualityRaw > 0 && qualityRaw <= 100
+      ? Math.round(qualityRaw)
+      : undefined;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
-    
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
+
     const { tabState } = found;
-    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
-    res.set('Content-Type', 'image/png');
+    const options = { type: format, ...(format === 'jpeg' && quality ? { quality } : {}) };
+    const buffer = selector
+      ? await tabState.page.locator(selector).first().screenshot({ ...options, timeout: 10000 })
+      : await tabState.page.screenshot({ ...options, fullPage });
+    pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
+    res.set('Content-Type', format === 'jpeg' ? 'image/jpeg' : 'image/png');
     res.send(buffer);
   } catch (err) {
     log('error', 'screenshot failed', { reqId: req.reqId, error: err.message });
@@ -3302,12 +6150,60 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
 });
 
 // Stats
+/**
+ * @openapi
+ * /tabs/{tabId}/stats:
+ *   get:
+ *     tags: [Tabs]
+ *     summary: Tab statistics
+ *     description: Returns tab metadata including URL, tool call count, visited URLs, download/failure counts.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Tab stats.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 tabId:
+ *                   type: string
+ *                 url:
+ *                   type: string
+ *                 toolCalls:
+ *                   type: integer
+ *                 visitedUrls:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                 downloadCount:
+ *                   type: integer
+ *                 consecutiveFailures:
+ *                   type: integer
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/tabs/:tabId/stats', async (req, res) => {
   try {
     const userId = req.query.userId;
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if (session) session.lastAccess = Date.now();
     
     const { tabState, listItemId } = found;
     res.json({
@@ -3327,7 +6223,69 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
 });
 
 // Evaluate JavaScript in page context
-app.post('/tabs/:tabId/evaluate', express.json({ limit: '1mb' }), async (req, res) => {
+/**
+ * @openapi
+ * /tabs/{tabId}/evaluate:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Evaluate JavaScript in tab
+ *     description: Runs arbitrary JS in the page context and returns the result.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, expression]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               expression:
+ *                 type: string
+ *                 description: JavaScript expression to evaluate.
+ *     responses:
+ *       200:
+ *         description: Evaluation result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 result: {}
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Page navigated while evaluating; caller should retry once the page settles.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: Browser session expired; caller should retry to get a fresh session.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySize }), async (req, res) => {
   try {
     const { userId, expression } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
@@ -3335,291 +6293,270 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: '1mb' }), async (req, re
 
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, req.params.tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
 
-    session.lastAccess = Date.now();
+    if (session) session.lastAccess = Date.now();
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
-    const result = await tabState.page.evaluate(expression);
+    pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
+    const result = await withUserLimit(userId, () => withTabLock(
+      req.params.tabId,
+      () => tabState.page.evaluate(expression),
+      requestTimeoutMs(),
+      () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId),
+    ));
+    pluginEvents.emit('tab:evaluated', { userId, tabId: req.params.tabId, result });
     log('info', 'evaluate', { reqId: req.reqId, tabId: req.params.tabId, userId, resultType: typeof result });
     res.json({ ok: true, result });
   } catch (err) {
-    failuresTotal.labels(classifyError(err), 'evaluate').inc();
-    log('error', 'evaluate failed', { reqId: req.reqId, error: err.message });
+    log('error', 'evaluate failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Structured extraction using JSON Schema with x-ref hints
+/**
+ * @openapi
+ * /tabs/{tabId}/extract:
+ *   post:
+ *     tags: [Content]
+ *     summary: Structured data extraction via JSON Schema
+ *     description: |
+ *       Extracts structured data from the current page using a JSON Schema whose properties
+ *       carry `x-ref` hints pointing at snapshot element refs (e.g. `e1`, `e2`).  
+ *       Call `GET /tabs/{tabId}/snapshot` first to populate the ref table.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, schema]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               schema:
+ *                 type: object
+ *                 description: |
+ *                   JSON Schema with `type: "object"` and a `properties` map.  
+ *                   Each property may include `x-ref` (a snapshot element ref) and an optional
+ *                   `type` (`string`, `number`, `integer`, `boolean`).
+ *                 required: [type, properties]
+ *                 properties:
+ *                   type:
+ *                     type: string
+ *                     enum: [object]
+ *                   properties:
+ *                     type: object
+ *                     additionalProperties:
+ *                       type: object
+ *                       properties:
+ *                         type:
+ *                           type: string
+ *                           enum: [string, number, integer, boolean, object, "null"]
+ *                         x-ref:
+ *                           type: string
+ *                           description: Snapshot element ref (e.g. `e1`).
+ *                   required:
+ *                     type: array
+ *                     items:
+ *                       type: string
+ *                     description: Property names that must resolve to a non-null value.
+ *     responses:
+ *       200:
+ *         description: Extraction succeeded.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   description: Extracted key-value pairs matching the input schema.
+ *       400:
+ *         description: Missing userId, missing schema, or invalid schema.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: No refs available -- call snapshot first.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                 snapshot:
+ *                   type: string
+ *                   nullable: true
+ *       422:
+ *         description: Extraction failed (e.g. required ref not found).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 error:
+ *                   type: string
+ *                 snapshot:
+ *                   type: string
+ *                   nullable: true
+ *       500:
+ *         description: Internal server error.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/extract', express.json({ limit: '256kb' }), async (req, res) => {
+  try {
+    const { userId, schema } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    if (!schema) return res.status(400).json({ error: 'schema is required' });
+
+    const check = validateExtractSchema(schema);
+    if (!check.ok) return res.status(400).json({ error: check.error });
+
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+
+    if (session) session.lastAccess = Date.now();
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+
+    if (!tabState.refs || tabState.refs.size === 0) {
+      return res.status(409).json({
+        error: 'no refs available -- call GET /tabs/:tabId/snapshot first to build the ref table',
+        snapshot: tabState.lastSnapshot || null,
+      });
+    }
+
+    try {
+      const data = extractDeterministic({ schema, refs: tabState.refs });
+      log('info', 'extract', { reqId: req.reqId, tabId: req.params.tabId, userId, keys: Object.keys(data) });
+      res.json({ ok: true, data });
+    } catch (extractErr) {
+      log('warn', 'extract failed', { reqId: req.reqId, error: extractErr.message });
+      res.status(422).json({ ok: false, error: extractErr.message, snapshot: tabState.lastSnapshot || null });
+    }
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'extract').inc();
+    log('error', 'extract error', { reqId: req.reqId, error: err.message });
     res.status(500).json({ error: safeError(err) });
   }
 });
 
 // Close tab
-app.delete('/tabs/:tabId', async (req, res) => {
-  try {
-    const userId = req.query.userId || req.body?.userId;
-    if (!userId) return res.status(400).json({ error: 'userId required (query or body)' });
-    const tabId = req.params.tabId;
-
-    // Recorded tabs own their own context + ffmpeg subprocess. Stop
-    // ffmpeg first (SIGINT flushes the WebM container header to disk),
-    // then close the Playwright context, then schedule a grace-window
-    // cleanup of the video dir so a late `GET /tabs/:tabId/video` can
-    // still read the finalized file.
-    const recorded = dedicatedTabs.get(tabId);
-    if (recorded) {
-      await clearTabDownloads(recorded.tabState);
-      await finalizeRecording(recorded, 'delete');
-      const lock = tabLocks.get(tabId);
-      if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
-      scheduleDedicatedTabCleanup(tabId);
-      refreshActiveTabsGauge();
-      log('info', 'recorded tab closed', {
-        reqId: req.reqId,
-        tabId,
-        userId,
-        videoPath: recorded.videoPath,
-      });
-      return res.json({ ok: true });
-    }
-
-    const session = sessions.get(normalizeUserId(userId));
-    const found = findTab(session, tabId);
-    if (found) {
-      await clearTabDownloads(found.tabState);
-      await safePageClose(found.tabState.page);
-      found.group.delete(tabId);
-      { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
-      if (found.group.size === 0) {
-        session.tabGroups.delete(found.listItemId);
-      }
-      refreshActiveTabsGauge();
-      log('info', 'tab closed', { reqId: req.reqId, tabId, userId });
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    log('error', 'tab close failed', { reqId: req.reqId, error: err.message });
-    handleRouteError(err, req, res);
-  }
-});
-
-// ── Recorded-tab helpers ──────────────────────────────────────
-
 /**
- * Stop the ffmpeg x11grab subprocess for a recorded tab and wait for it
- * to exit cleanly. SIGINT is critical: SIGKILL would leave the WebM file
- * with an incomplete container header (no seek index / duration), which
- * most players refuse to open. SIGINT triggers ffmpeg's normal shutdown
- * path that writes the final trailer.
- *
- * If ffmpeg doesn't exit within 5s (stuck, huge buffer, etc) we escalate
- * to SIGKILL as a last resort — the file will be truncated but some
- * content is better than a hung close.
+ * @openapi
+ * /tabs/{tabId}:
+ *   delete:
+ *     tags: [Tabs]
+ *     summary: Close a tab
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Tab closed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
-// The X display x11grab captures. Seeded from DISPLAY if the host set one, else
-// stamped with camoufox's Xvfb display (e.g. :99) when the browser launches —
-// camoufox starts Xvfb but doesn't export DISPLAY, so we can't rely on the env.
-let activeDisplay = process.env.DISPLAY || null;
-
-// Camoufox runs its Xvfb at 1x1 — it renders to an internal virtual viewport,
-// not a real framebuffer — so x11grab (which captures the X screen) has nothing
-// to grab and fails with "capture area outside screen size 1x1". Frame-grab
-// (Playwright screenshots, which read the browser's own rendering) is therefore
-// the universal backend on every host. x11grab stays reachable only behind an
-// explicit opt-in, for a hypothetical non-camoufox setup with a real-sized X.
-function x11GrabAvailable() {
-  return (
-    process.platform === 'linux' &&
-    Boolean(activeDisplay) &&
-    process.env.CAMOFOX_X11GRAB === '1'
-  );
-}
-
+// Get recorded video
 /**
- * Off-display recorder for Firefox/Camoufox: snapshot the page on a timer into
- * PNG frames, then ffmpeg-assemble them into `videoPath` at stop(). Best-effort
- * — a frame that fails (navigation in flight, page closing) is skipped, and the
- * single-flight guard drops ticks while a screenshot is still running rather
- * than queueing. Returns { videoPath, stop() } where stop() is idempotent and
- * resolves once the .webm exists (or there were no frames to assemble).
+ * @openapi
+ * /tabs/{tabId}/video:
+ *   get:
+ *     tags: [Content]
+ *     summary: Download a tab recording
+ *     description: >
+ *       Streams the .webm recorded for a tab opened with
+ *       `POST /tabs { recordVideo }`. The first call finalizes the recording
+ *       (stops the frame timer / ffmpeg and closes the context). A tab opened
+ *       without recordVideo returns 400; an unknown/expired recording 404/410.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: WebM video.
+ *         content:
+ *           video/webm:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       400:
+ *         description: Tab exists but was not opened with recordVideo.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Recorded tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
-function startFrameRecorder({ page, videoDir, videoPath, tabId, fps, scale = [] }) {
-  const framesDir = path.join(videoDir, 'frames');
-  fs.mkdirSync(framesDir, { recursive: true });
-  const intervalMs = Math.max(50, Math.round(1000 / Math.max(1, fps)));
-  let frameCount = 0;
-  let busy = false;
-  let stopped = false;
-  const tick = async () => {
-    if (busy || stopped) return;
-    busy = true;
-    try {
-      const buf = await page.screenshot({ type: 'png' });
-      if (!stopped) {
-        const name = `frame-${String(frameCount).padStart(6, '0')}.png`;
-        fs.writeFileSync(path.join(framesDir, name), buf);
-        frameCount++;
-      }
-    } catch {
-      // page mid-navigation or closing — skip this frame.
-    } finally {
-      busy = false;
-    }
-  };
-  const timer = setInterval(tick, intervalMs);
-  timer.unref?.();
-
-  let stopPromise;
-  const stop = () => {
-    if (stopPromise) return stopPromise;
-    stopped = true;
-    clearInterval(timer);
-    stopPromise = (async () => {
-      // Let an in-flight screenshot land before assembling.
-      for (let i = 0; busy && i < 20; i++) await new Promise(r => setTimeout(r, 50));
-      if (frameCount === 0) {
-        log('warn', 'frame recorder produced no frames', { tabId });
-        return undefined;
-      }
-      await new Promise((resolve) => {
-        const proc = ffmpegSpawn(
-          'ffmpeg',
-          [
-            '-loglevel', 'warning',
-            '-framerate', String(Math.max(1, fps)),
-            '-i', path.join(framesDir, 'frame-%06d.png'),
-            ...scale,
-            '-c:v', 'libvpx',
-            '-b:v', '1M',
-            '-pix_fmt', 'yuv420p',
-            '-y',
-            videoPath,
-          ],
-          { stdio: ['ignore', 'ignore', 'pipe'] }
-        );
-        proc.stderr?.on('data', (b) => {
-          const m = b.toString().trim();
-          if (m) log('warn', 'ffmpeg assemble stderr', { tabId, msg: m.slice(0, 200) });
-        });
-        proc.on('exit', () => resolve());
-        proc.on('error', () => resolve());
-      });
-      fs.rmSync(framesDir, { recursive: true, force: true });
-      return videoPath;
-    })();
-    return stopPromise;
-  };
-  return { videoPath, stop, frameCount: () => frameCount };
-}
-
-/**
- * Finalize a recorded tab's video so the .webm is readable on disk, idempotent.
- * x11grab: SIGINT ffmpeg (flush trailer) then close the context. Frame-grab:
- * stop the timer + assemble frames, then close the context. Either flips
- * `videoSettled`. If frame-grab produced nothing, `videoPath` is cleared so the
- * /video endpoint reports the empty case instead of a missing-file error.
- */
-async function finalizeRecording(recorded, reason) {
-  if (recorded.videoSettled) return;
-  recorded.videoSettled = true;
-  if (recorded.ffmpegProcess) {
-    await stopFfmpegAndWait(recorded, reason);
-  } else if (recorded.frameRecorder) {
-    const out = await recorded.frameRecorder.stop();
-    if (!out) recorded.videoPath = undefined;
-  }
-  await recorded.context.close().catch((err) =>
-    log('warn', 'recorded context close failed', { reason, error: err.message })
-  );
-}
-
-async function stopFfmpegAndWait(recorded, reason) {
-  const proc = recorded.ffmpegProcess;
-  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(killer);
-      resolve();
-    };
-    proc.once('exit', finish);
-    proc.once('close', finish);
-    try {
-      proc.kill('SIGINT');
-    } catch {
-      // already dead
-      finish();
-      return;
-    }
-    const killer = setTimeout(() => {
-      if (settled) return;
-      log('warn', 'ffmpeg SIGINT timed out, escalating to SIGKILL', {
-        tabId: recorded.tabState?.tabId,
-        reason,
-      });
-      try { proc.kill('SIGKILL'); } catch {}
-    }, 5000);
-  });
-}
-
-// After a dedicated tab closes, schedule cleanup.
-// Recording tabs (have videoDir): keep the dir for VIDEO_GRACE_WINDOW_MS so
-// a trailing `GET /tabs/:tabId/video` after `DELETE` can still read the
-// file, then remove both dir and map entry.
-// Viewport-only tabs (no videoDir): nothing to fetch later, evict the map
-// entry immediately.
-function scheduleDedicatedTabCleanup(tabId) {
-  const entry = dedicatedTabs.get(tabId);
-  if (!entry) return;
-  if (!entry.videoDir) {
-    // Viewport-only: no file to preserve, drop immediately.
-    dedicatedTabs.delete(tabId);
-    return;
-  }
-  setTimeout(() => {
-    const stillThere = dedicatedTabs.get(tabId);
-    if (!stillThere) return;
-    try {
-      fs.rmSync(stillThere.videoDir, { recursive: true, force: true });
-    } catch (err) {
-      log('warn', 'recorded video dir cleanup failed', {
-        tabId,
-        dir: stillThere.videoDir,
-        error: err.message,
-      });
-    }
-    dedicatedTabs.delete(tabId);
-  }, VIDEO_GRACE_WINDOW_MS).unref?.();
-}
-
-// GET /tabs/:tabId/video — stream the recorded .webm back to the caller.
-//
-// Order of operations expected by the downstream
-// (packages/integration/browser/src/automation/providers/camofox.adapter.ts):
-//
-//   POST /tabs { recordVideo } → agent runs N steps → GET /tabs/:id/video
-//   → DELETE /tabs/:id
-//
-// On first GET we close the Playwright context ourselves — that forces
-// the video file to finalize on disk — then stream it. A subsequent
-// DELETE is a no-op for the context and just removes bookkeeping.
 app.get('/tabs/:tabId/video', async (req, res) => {
   try {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const tabId = req.params.tabId;
-    const recorded = dedicatedTabs.get(tabId);
-    if (!recorded) {
+    const recorded = dedicatedTabs.get(tabId) || finalizedVideos.get(tabId);
+    if (!recorded || recorded.userId !== normalizeUserId(userId)) {
       return res.status(404).json({ error: 'recorded tab not found' });
     }
-    if (recorded.userId !== normalizeUserId(userId)) {
-      return res.status(404).json({ error: 'recorded tab not found' });
-    }
-    // Viewport-only tabs (no recorder, no video) weren't recording. Return 400
-    // instead of 404 so callers know the tab exists but isn't a recording target.
-    if (!recorded.ffmpegProcess && !recorded.frameRecorder && !recorded.videoPath) {
+    if (!recorded.recorded) {
       return res.status(400).json({
-        error:
-          'this tab was not opened with recordVideo — no video to fetch. Open a new tab with { recordVideo: {...} } to record one.',
+        error: 'this tab was not opened with recordVideo - no video to fetch.',
       });
     }
 
@@ -3627,8 +6564,7 @@ app.get('/tabs/:tabId/video', async (req, res) => {
 
     if (!recorded.videoPath) {
       return res.status(409).json({
-        error:
-          'no video produced — the tab closed before any frame was captured',
+        error: 'no video produced - the tab closed before any frame was captured',
       });
     }
     let stat;
@@ -3642,16 +6578,9 @@ app.get('/tabs/:tabId/video', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const stream = fs.createReadStream(recorded.videoPath);
     stream.on('error', (err) => {
-      log('error', 'video stream failed', {
-        reqId: req.reqId,
-        tabId,
-        error: err.message,
-      });
-      if (!res.headersSent) {
-        res.status(500).json({ error: err.message });
-      } else {
-        res.destroy(err);
-      }
+      log('error', 'video stream failed', { reqId: req.reqId, tabId, error: err.message });
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+      else res.destroy(err);
     });
     stream.pipe(res);
   } catch (err) {
@@ -3660,7 +6589,83 @@ app.get('/tabs/:tabId/video', async (req, res) => {
   }
 });
 
+app.delete('/tabs/:tabId', async (req, res) => {
+  try {
+    const userId = req.query.userId || req.body?.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required (query or body)' });
+    const tabId = req.params.tabId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = findTab(session, tabId);
+    if (found && !found.dedicated) {
+      if (found.tabState.navigateAbort) found.tabState.navigateAbort.abort();
+      await clearTabDownloads(found.tabState);
+      await safePageClose(found.tabState.page);
+      found.group.delete(tabId);
+      { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+      dropEmptyTabGroup(session, found.listItemId, found.group);
+      refreshActiveTabsGauge();
+      log('info', 'tab closed', { reqId: req.reqId, tabId, userId });
+      return res.json({ ok: true });
+    }
+
+    // Dedicated-context tabs own their context (and maybe a recorder).
+    const dedicated = dedicatedTabs.get(tabId);
+    if (dedicated) {
+      if (dedicated.tabState.navigateAbort) dedicated.tabState.navigateAbort.abort();
+      await clearTabDownloads(dedicated.tabState);
+      await finalizeRecording(dedicated, 'delete');
+      dedicatedTabs.delete(tabId);
+      if (dedicated.videoDir) finalizedVideos.set(tabId, dedicated);
+      const lock = tabLocks.get(tabId);
+      if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+      scheduleDedicatedTabCleanup(tabId);
+      refreshActiveTabsGauge();
+      log('info', 'dedicated tab closed', { reqId: req.reqId, tabId, userId });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    log('error', 'tab close failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Close tab group
+/**
+ * @openapi
+ * /tabs/group/{listItemId}:
+ *   delete:
+ *     tags: [Tabs]
+ *     summary: Close all tabs in a group
+ *     parameters:
+ *       - name: listItemId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Group closed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 closed:
+ *                   type: integer
+ *       404:
+ *         description: Session not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.delete('/tabs/group/:listItemId', async (req, res) => {
   try {
     const userId = req.query.userId || req.body?.userId;
@@ -3676,8 +6681,10 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
           lock.drain();
           tabLocks.delete(tabId);
         }
+        group.delete(tabId);
       }
-      session.tabGroups.delete(req.params.listItemId);
+      // Do not remove a replacement group registered under the same key.
+      dropEmptyTabGroup(session, req.params.listItemId, group);
       refreshTabLockQueueDepth();
       refreshActiveTabsGauge();
       log('info', 'tab group closed', { reqId: req.reqId, listItemId: req.params.listItemId, userId });
@@ -3689,27 +6696,260 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
   }
 });
 
+// List trace files for a session
+/**
+ * @openapi
+ * /sessions/{userId}/traces:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: List trace files
+ *     description: Returns all Playwright trace zip files for the given user session, sorted newest first.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Session owner identifier.
+ *     responses:
+ *       200:
+ *         description: Trace list.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 traces:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       filename:
+ *                         type: string
+ *                       sizeBytes:
+ *                         type: integer
+ *                       createdAt:
+ *                         type: number
+ *                       modifiedAt:
+ *                         type: number
+ *       403:
+ *         description: Forbidden.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Server error.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/sessions/:userId/traces', authMiddleware(), async (req, res) => {
+  try {
+    const userId = normalizeUserId(req.params.userId);
+    const traces = await listUserTraces(CONFIG.tracesDir, userId);
+    res.json({ traces });
+  } catch (err) {
+    log('error', 'list traces failed', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stream one trace file
+/**
+ * @openapi
+ * /sessions/{userId}/traces/{filename}:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: Download a trace file
+ *     description: Streams a Playwright trace zip for viewing in trace.playwright.dev.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Session owner identifier.
+ *       - name: filename
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Trace zip filename.
+ *     responses:
+ *       200:
+ *         description: Trace zip stream.
+ *         content:
+ *           application/zip:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       400:
+ *         description: Invalid filename.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Trace not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Server error.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/sessions/:userId/traces/:filename', authMiddleware(), async (req, res) => {
+  try {
+    const userId = normalizeUserId(req.params.userId);
+    const full = resolveTracePath(CONFIG.tracesDir, userId, req.params.filename);
+    if (!full) return res.status(400).json({ error: 'invalid filename' });
+    const st = await statTrace(full);
+    if (!st) return res.status(404).json({ error: 'not found' });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Length', String(st.size));
+    const stream = fs.createReadStream(full);
+    stream.on('error', (err) => {
+      if (!res.headersSent) res.status(404).json({ error: 'not found' });
+      else res.destroy();
+    });
+    stream.pipe(res);
+  } catch (err) {
+    log('error', 'stream trace failed', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete one trace file
+/**
+ * @openapi
+ * /sessions/{userId}/traces/{filename}:
+ *   delete:
+ *     tags: [Sessions]
+ *     summary: Delete a trace file
+ *     description: Removes a specific Playwright trace zip from the server.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Session owner identifier.
+ *       - name: filename
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Trace zip filename.
+ *     responses:
+ *       200:
+ *         description: Trace deleted.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *       400:
+ *         description: Invalid filename.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Trace not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Server error.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.delete('/sessions/:userId/traces/:filename', authMiddleware(), async (req, res) => {
+  try {
+    const userId = normalizeUserId(req.params.userId);
+    const full = resolveTracePath(CONFIG.tracesDir, userId, req.params.filename);
+    if (!full) return res.status(400).json({ error: 'invalid filename' });
+    try {
+      await deleteTrace(full);
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'not found' });
+      throw err;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    log('error', 'delete trace failed', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Close session
+/**
+ * @openapi
+ * /sessions/{userId}:
+ *   delete:
+ *     tags: [Sessions]
+ *     summary: Destroy a user session
+ *     description: Closes all tabs and cleans up state for the given userId.
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Session destroyed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 closed:
+ *                   type: integer
+ *       404:
+ *         description: Session not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.delete('/sessions/:userId', async (req, res) => {
   try {
     const userId = normalizeUserId(req.params.userId);
     const session = sessions.get(userId);
     if (session) {
-      await clearSessionDownloads(session);
-      await session.context.close();
-      sessions.delete(userId);
-      // Remove any lingering tab locks for the session
-      for (const [listItemId, group] of session.tabGroups) {
-        for (const tabId of group.keys()) {
-          const lock = tabLocks.get(tabId);
-          if (lock) {
-            lock.drain();
-            tabLocks.delete(tabId);
-          }
-        }
-      }
-      refreshTabLockQueueDepth();
-      refreshActiveTabsGauge();
+      await closeSession(userId, session, { reason: 'api_delete_session', clearDownloads: true, clearLocks: true });
       log('info', 'session closed', { userId });
     }
     if (sessions.size === 0) scheduleBrowserIdleShutdown();
@@ -3723,14 +6963,13 @@ app.delete('/sessions/:userId', async (req, res) => {
 // Cleanup stale sessions
 setInterval(() => {
   const now = Date.now();
-  for (const [userId, session] of sessions) {
-    if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+  for (const [userId, session] of Array.from(sessions.entries())) {
+    if (SESSION_TIMEOUT_MS > 0 && now - session.lastAccess > SESSION_TIMEOUT_MS) {
+      session._closing = true;
+      const idleMs = now - session.lastAccess;
       sessionsExpiredTotal.inc();
-      saveStorageState(userId, session.context).catch(() => {});
-      clearSessionDownloads(session).catch(() => {});
-      session.context.close().catch(() => {});
-      sessions.delete(userId);
-      refreshActiveTabsGauge();
+      pluginEvents.emit('session:expired', { userId, idleMs });
+      closeSession(userId, session, { reason: 'session_timeout', clearDownloads: true, clearLocks: true }).catch(() => {});
       log('info', 'session expired', { userId });
     }
   }
@@ -3741,60 +6980,181 @@ setInterval(() => {
   refreshTabLockQueueDepth();
 }, 60_000);
 
-// Per-tab inactivity reaper — close tabs idle for TAB_INACTIVITY_MS.
-// TAB_INACTIVITY_MS <= 0 disables tab reaping entirely (sessions stay until
-// explicit close or SESSION_TIMEOUT_MS). Per-session keepAlive (set via
-// POST /tabs { keepAlive: true }) exempts that session from reaping.
-setInterval(() => {
-  const now = Date.now();
-  for (const [userId, session] of sessions) {
-    if (TAB_INACTIVITY_MS <= 0 || session.keepAlive) continue;
-    for (const [listItemId, group] of session.tabGroups) {
-      for (const [tabId, tabState] of group) {
-        if (!tabState._lastReaperCheck) {
-          tabState._lastReaperCheck = now;
-          tabState._lastReaperToolCalls = tabState.toolCalls;
-          continue;
-        }
-        if (tabState.toolCalls === tabState._lastReaperToolCalls) {
-          const idleMs = now - tabState._lastReaperCheck;
-          if (idleMs >= TAB_INACTIVITY_MS) {
-            tabsReapedTotal.inc();
-            log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
-            safePageClose(tabState.page);
-            group.delete(tabId);
-            { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
-            refreshTabLockQueueDepth();
-            refreshActiveTabsGauge();
-          }
-        } else {
-          tabState._lastReaperCheck = now;
-          tabState._lastReaperToolCalls = tabState.toolCalls;
+// Memory pressure eviction (Fly.io only) — evict oldest session when RAM is high.
+// Prevents Camoufox OOM by proactively freeing BrowserContexts.
+if (FLY_MACHINE_ID) {
+  const MEMORY_HIGH_WATERMARK = 0.80;
+  setInterval(() => {
+    let totalMem = os.totalmem();
+    let freeMem = os.freemem();
+    let usedRatio = 1 - (freeMem / totalMem);
+
+    // Evict sessions in a loop until memory drops below the watermark
+    // or no more sessions remain. closeSession is async but memory
+    // reclamation (context.close → Firefox frees pages) starts immediately.
+    let evicted = 0;
+    while (usedRatio >= MEMORY_HIGH_WATERMARK && sessions.size > 0) {
+      let oldestKey = null;
+      let oldestAccess = Infinity;
+      for (const [key, session] of sessions) {
+        if (session._closing || hasActivePageLeases(session)) continue;
+        if (session.lastAccess < oldestAccess) {
+          oldestAccess = session.lastAccess;
+          oldestKey = key;
         }
       }
-      if (group.size === 0) {
-        session.tabGroups.delete(listItemId);
-      }
-    }
-    if (session.tabGroups.size === 0) {
-      log('info', 'session empty after tab reaper, closing', { userId });
-      saveStorageState(userId, session.context).catch(() => {});
-      clearSessionDownloads(session).catch(() => {});
-      session.context.close().catch(() => {});
-      sessions.delete(userId);
+      if (!oldestKey) break;
+      const session = sessions.get(oldestKey);
+      const idleMs = Date.now() - session.lastAccess;
+      log('warn', 'memory pressure eviction', {
+        userId: oldestKey,
+        usedPct: (usedRatio * 100).toFixed(1),
+        freeMb: Math.round(freeMem / 1048576),
+        idleMs,
+        sessions: sessions.size,
+      });
+      session._closing = true;
       sessionsExpiredTotal.inc();
-      refreshActiveTabsGauge();
+      closeSession(oldestKey, session, {
+        reason: 'memory_pressure', clearDownloads: true, clearLocks: true,
+      }).catch(() => {});
+      evicted++;
+      // Re-check after marking session for closure
+      freeMem = os.freemem();
+      usedRatio = 1 - (freeMem / totalMem);
     }
-  }
+  }, 30_000);
+}
+
+// Per-tab inactivity reaper — close tabs idle for TAB_INACTIVITY_MS
+setInterval(() => {
+  runTabReaperTick({
+    sessions,
+    tabInactivityMs: TAB_INACTIVITY_MS,
+    now: Date.now(),
+    hasActivePageLeases,
+    onTabReaped: ({ userId, tabId, listItemId, idleMs, tabState }) => {
+      tabsReapedTotal.inc();
+      log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
+      safePageClose(tabState.page);
+      { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
+      refreshTabLockQueueDepth();
+      refreshActiveTabsGauge();
+    },
+    onSessionEmpty: (userId) => {
+      const session = sessions.get(userId);
+      if (!session) return;
+      log('info', 'session empty after tab reaper, closing', { userId });
+      closeSession(userId, session, { reason: 'tab_reaper_empty_session', clearDownloads: true, clearLocks: true }).catch(() => {});
+      sessionsExpiredTotal.inc();
+    },
+  });
   if (sessions.size === 0) scheduleBrowserIdleShutdown();
 }, 60_000);
+
+// Orphan page reaper -- force-closes Playwright pages that survived a safePageClose
+// timeout or were otherwise dropped from tabGroups tracking. Without this, leaked
+// pages starve Firefox of DOM threads and eventually block new tab creation.
+setInterval(() => {
+  let reaped = 0;
+  for (const session of sessions.values()) {
+    if (session._closing) continue;
+    let contextPages;
+    try {
+      contextPages = session.context.pages();
+    } catch (_) {
+      continue; // context already dead
+    }
+    const registered = new Set();
+    for (const group of session.tabGroups.values()) {
+      for (const tabState of group.values()) registered.add(tabState.page);
+    }
+    for (const page of contextPages) {
+      if (!registered.has(page) && !isPageLeased(session, page)) {
+        reaped++;
+        page.removeAllListeners();
+        page.close({ runBeforeUnload: false }).catch(() => {});
+      }
+    }
+  }
+  if (reaped > 0) log('warn', 'orphan page reaper closed leaked pages', { reaped });
+}, 60_000);
+
+// Idle memory pressure restart -- when all sessions are gone, kill the browser
+// process immediately if either Node native memory or the Camoufox process tree
+// is large. This prevents idle Firefox children from holding most of the VM RAM
+// while Node reports zero sessions/tabs.
+setInterval(() => {
+  if (sessions.size > 0 || !browser) return;
+  const mem = process.memoryUsage();
+  const nativeMemMb = Math.round((mem.rss - mem.heapUsed) / 1048576);
+  const browserRssMb = browserProcessTreeRssMb(_browserPid()) ?? browserProcessNameRssMb();
+
+  if (browserRssMb !== null && browserRssMb >= CONFIG.browserRssRestartThresholdMb) {
+    log('warn', 'browser rss pressure, restarting browser', {
+      browserRssMb,
+      thresholdMb: CONFIG.browserRssRestartThresholdMb,
+    });
+    browserRestartsTotal.labels('browser_rss_pressure').inc();
+    closeBrowserFully('browser_rss_pressure').catch((err) => {
+      log('error', 'browser rss pressure browser close failed', { error: err.message });
+    });
+    return;
+  }
+
+  if (_nativeMemBaseline === null) {
+    _nativeMemBaseline = nativeMemMb;
+    return;
+  }
+  const growth = nativeMemMb - _nativeMemBaseline;
+  if (growth >= NATIVE_MEM_RESTART_THRESHOLD_MB) {
+    log('warn', 'native memory pressure, restarting browser', {
+      baselineMb: _nativeMemBaseline,
+      currentMb: nativeMemMb,
+      growthMb: growth,
+      thresholdMb: NATIVE_MEM_RESTART_THRESHOLD_MB,
+    });
+    browserRestartsTotal.labels('memory_pressure').inc();
+    closeBrowserFully('memory_pressure').catch((err) => {
+      log('error', 'memory pressure browser close failed', { error: err.message });
+    });
+  }
+}, 30_000);
 
 // =============================================================================
 // OpenClaw-compatible endpoint aliases
 // These allow camoufox to be used as a profile backend for OpenClaw's browser tool
 // =============================================================================
 
-// GET / - Status (passive — does not launch browser)
+// GET / - Status (passive -- does not launch browser)
+/**
+ * @openapi
+ * /:
+ *   get:
+ *     tags: [System]
+ *     summary: Server status
+ *     description: Returns basic server liveness and browser state.
+ *     responses:
+ *       200:
+ *         description: Server status.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 enabled:
+ *                   type: boolean
+ *                 running:
+ *                   type: boolean
+ *                 engine:
+ *                   type: string
+ *                 browserConnected:
+ *                   type: boolean
+ *                 browserRunning:
+ *                   type: boolean
+ */
 app.get('/', (req, res) => {
   const running = browser !== null && (browser.isConnected?.() ?? false);
   res.json({ 
@@ -3808,28 +7168,78 @@ app.get('/', (req, res) => {
 });
 
 // GET /tabs - List all tabs (OpenClaw expects this)
+/**
+ * @openapi
+ * /tabs:
+ *   get:
+ *     tags: [Tabs]
+ *     summary: List open tabs
+ *     description: Returns all tabs for a given userId.
+ *     parameters:
+ *       - name: userId
+ *         in: query
+ *         schema:
+ *           type: string
+ *         description: Filter by session owner.
+ *     responses:
+ *       200:
+ *         description: Tab list.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 running:
+ *                   type: boolean
+ *                 tabs:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       tabId:
+ *                         type: string
+ *                       targetId:
+ *                         type: string
+ *                       url:
+ *                         type: string
+ *                       title:
+ *                         type: string
+ *                       listItemId:
+ *                         type: string
+ */
 app.get('/tabs', async (req, res) => {
   try {
     const userId = req.query.userId;
-    const session = sessions.get(normalizeUserId(userId));
-    
-    if (!session) {
-      return res.json({ running: true, tabs: [] });
-    }
-    
+    const key = normalizeUserId(userId);
+    const session = sessions.get(key);
+
     const tabs = [];
-    for (const [listItemId, group] of session.tabGroups) {
-      for (const [tabId, tabState] of group) {
-        tabs.push({
-          targetId: tabId,
-          tabId,
-          url: tabState.page.url(),
-          title: await tabState.page.title().catch(() => ''),
-          listItemId
-        });
+    if (session) {
+      for (const [listItemId, group] of session.tabGroups) {
+        for (const [tabId, tabState] of group) {
+          tabs.push({
+            targetId: tabId,
+            tabId,
+            url: tabState.page.url(),
+            title: await tabState.page.title().catch(() => ''),
+            listItemId,
+          });
+        }
       }
     }
-    
+    // Dedicated-context tabs (recording / custom viewport) belong to the same
+    // user but live outside session.tabGroups.
+    for (const [tabId, entry] of dedicatedTabs) {
+      if (entry.userId !== key) continue;
+      tabs.push({
+        targetId: tabId,
+        tabId,
+        url: entry.tabState.page.url(),
+        title: await entry.tabState.page.title().catch(() => ''),
+        listItemId: entry.listItemId,
+      });
+    }
+
     res.json({ running: true, tabs });
   } catch (err) {
     log('error', 'list tabs failed', { reqId: req.reqId, error: err.message });
@@ -3838,6 +7248,41 @@ app.get('/tabs', async (req, res) => {
 });
 
 // POST /tabs/open - Open tab (alias for POST /tabs, OpenClaw format)
+/**
+ * @openapi
+ * /tabs/open:
+ *   post:
+ *     tags: [Legacy]
+ *     summary: Open tab (OpenClaw format)
+ *     deprecated: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, url]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               url:
+ *                 type: string
+ *               listItemId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Tab opened.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/tabs/open', async (req, res) => {
   try {
     const { url, userId, listItemId = 'default' } = req.body;
@@ -3851,28 +7296,61 @@ app.post('/tabs/open', async (req, res) => {
     const urlErr = validateUrl(url);
     if (urlErr) return res.status(400).json({ error: urlErr });
     
-    const session = await getSession(userId);
+    let session = await getSession(userId);
     
     // Recycle oldest tab when limits are reached instead of rejecting
     let totalTabs = 0;
     for (const g of session.tabGroups.values()) totalTabs += g.size;
     if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-      const recycled = await recycleOldestTab(session, req.reqId);
+      const recycled = await recycleOldestTab(session, req.reqId, userId);
       if (!recycled) {
         return res.status(429).json({ error: 'Maximum tabs per session reached' });
       }
     }
     
-    const group = getTabGroup(session, listItemId);
+    let group = getTabGroup(session, listItemId);
     
-    const page = await session.context.newPage();
+    let { page, lease } = await createLeasedPage(session);
     const tabId = fly.makeTabId();
-    const tabState = createTabState(page);
-    attachDownloadListener(tabState, tabId, log);
+    let tabState = createTabState(page);
+    attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
     group.set(tabId, tabState);
+    releasePageLease(session, lease);
+    attachPopupHandler(page, userId, listItemId);
     refreshActiveTabsGauge();
     
-    await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+    try {
+      await withPageLoadDuration('open_url', () => navigatePage(page, url));
+      recordNavSuccess(userId);
+    } catch (navErr) {
+      if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
+        log('warn', 'tab open failed, retrying with fresh proxy', {
+          reqId: req.reqId, tabId, error: navErr.message,
+        });
+        browserRestartsTotal.labels('proxy_retry').inc();
+        const key = normalizeUserId(userId);
+        const oldSession = sessions.get(key);
+        if (oldSession) {
+          await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
+        }
+        session = await getSession(userId);
+        group = getTabGroup(session, listItemId);
+        ({ page, lease } = await createLeasedPage(session));
+        tabState = createTabState(page);
+        attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+        group.set(tabId, tabState);
+        releasePageLease(session, lease);
+        attachPopupHandler(page, userId, listItemId);
+        refreshActiveTabsGauge();
+        await withPageLoadDuration('open_url', () => navigatePage(page, url));
+        recordNavSuccess(userId);
+      } else {
+        if (recordNavFailure(userId)) {
+          await recoverUserSession(userId, 'tab_open_nav_failure');
+        }
+        throw navErr;
+      }
+    }
     tabState.visitedUrls.add(url);
     
     log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
@@ -3890,6 +7368,32 @@ app.post('/tabs/open', async (req, res) => {
 });
 
 // POST /start - Start browser (OpenClaw expects this)
+/**
+ * @openapi
+ * /start:
+ *   post:
+ *     tags: [Browser]
+ *     summary: Start browser
+ *     description: Ensures the browser process is running. Idempotent.
+ *     responses:
+ *       200:
+ *         description: Browser started.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 profile:
+ *                   type: string
+ *       500:
+ *         description: Launch failed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/start', async (req, res) => {
   try {
     await ensureBrowser();
@@ -3901,36 +7405,44 @@ app.post('/start', async (req, res) => {
 });
 
 // POST /stop - Stop browser (OpenClaw expects this)
+/**
+ * @openapi
+ * /stop:
+ *   post:
+ *     tags: [Browser]
+ *     summary: Stop browser
+ *     description: Stops the browser and closes all sessions. Requires x-admin-key header.
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Browser stopped.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 stopped:
+ *                   type: boolean
+ *                 profile:
+ *                   type: string
+ *       403:
+ *         description: Forbidden.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/stop', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || !timingSafeCompare(adminKey, CONFIG.adminKey)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (browser) {
-      await browser.close().catch(() => {});
-      browser = null;
-    }
-    const cleanupTasks = [];
-    for (const session of sessions.values()) {
-      cleanupTasks.push(clearSessionDownloads(session));
-    }
-    await Promise.all(cleanupTasks);
-    for (const session of sessions.values()) {
-      for (const [, group] of session.tabGroups) {
-        for (const tabId of group.keys()) {
-          const lock = tabLocks.get(tabId);
-          if (lock) {
-            lock.drain();
-            tabLocks.delete(tabId);
-          }
-        }
-      }
-    }
-    tabLocks.clear();
-    sessions.clear();
-    refreshActiveTabsGauge();
-    refreshTabLockQueueDepth();
+    await closeAllSessions('admin_stop', { clearDownloads: true, clearLocks: true });
+    await closeBrowserFully('admin_stop');
     res.json({ ok: true, stopped: true, profile: 'camoufox' });
   } catch (err) {
     res.status(500).json({ ok: false, error: safeError(err) });
@@ -3938,6 +7450,48 @@ app.post('/stop', async (req, res) => {
 });
 
 // POST /navigate - Navigate (OpenClaw format with targetId in body)
+/**
+ * @openapi
+ * /navigate:
+ *   post:
+ *     tags: [Legacy]
+ *     summary: Navigate (OpenClaw format)
+ *     description: Navigate with targetId in body instead of path param.
+ *     deprecated: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, url]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               targetId:
+ *                 type: string
+ *               url:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Navigation result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/navigate', async (req, res) => {
   try {
     const { targetId, url, userId } = req.body;
@@ -3954,14 +7508,15 @@ app.post('/navigate', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, targetId);
     if (!found) {
-      return res.status(404).json({ error: 'Tab not found' });
+      return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
-      await withPageLoadDuration('navigate', () => tabState.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+      await withPageLoadDuration('navigate', () => navigatePage(tabState.page, url));
+      recordNavSuccess(userId);
       tabState.visitedUrls.add(url);
       tabState.lastSnapshot = null;
       
@@ -3978,11 +7533,66 @@ app.post('/navigate', async (req, res) => {
     res.json(result);
   } catch (err) {
     log('error', 'openclaw navigate failed', { reqId: req.reqId, error: err.message });
+    if (recordNavFailure(req.body?.userId)) {
+      await recoverUserSession(req.body.userId, 'openclaw_navigate_failure');
+    }
     handleRouteError(err, req, res);
   }
 });
 
 // GET /snapshot - Snapshot (OpenClaw format with query params)
+/**
+ * @openapi
+ * /snapshot:
+ *   get:
+ *     tags: [Legacy]
+ *     summary: Snapshot (OpenClaw format)
+ *     description: Snapshot with targetId/userId as query params.
+ *     deprecated: true
+ *     parameters:
+ *       - name: targetId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: format
+ *         in: query
+ *         schema:
+ *           type: string
+ *       - name: offset
+ *         in: query
+ *         schema:
+ *           type: integer
+ *       - name: includeScreenshot
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: ['true', 'false']
+ *     responses:
+ *       200:
+ *         description: Snapshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get('/snapshot', async (req, res) => {
   try {
     const { targetId, userId, format = 'text' } = req.query;
@@ -3994,16 +7604,16 @@ app.get('/snapshot', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, targetId);
     if (!found) {
-      return res.status(404).json({ error: 'Tab not found' });
+      return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
     // Cached chunk retrieval
     if (offset > 0 && tabState.lastSnapshot) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
-      const response = { ok: true, format: 'aria', targetId, url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      const response = { ok: true, format: 'aria', targetId, url: tabState.page.url(), snapshot: win.text, structure: tabState.lastStructure, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
       if (req.query.includeScreenshot === 'true') {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
@@ -4018,6 +7628,8 @@ app.get('/snapshot', async (req, res) => {
       const { refs: googleRefs, snapshot: googleSnapshot } = await extractGoogleSerp(tabState.page);
       tabState.refs = googleRefs;
       tabState.lastSnapshot = googleSnapshot;
+      tabState.lastStructure = null;
+      snapshotBytes.labels('google_serp').observe(Buffer.byteLength(googleSnapshot, 'utf8'));
       const annotatedYaml = googleSnapshot;
       const win = windowSnapshot(annotatedYaml, 0);
       const response = {
@@ -4036,8 +7648,7 @@ app.get('/snapshot', async (req, res) => {
     tabState.refs = await buildRefs(tabState.page);
     
     const ariaYaml = await getAriaSnapshot(tabState.page);
-    
-    // Annotate YAML with ref IDs
+    const structure = attachStructureRefs(await extractPageStructure(tabState.page), tabState.refs);
     let annotatedYaml = ariaYaml || '';
     if (annotatedYaml && tabState.refs.size > 0) {
       const refsByKey = new Map();
@@ -4062,6 +7673,8 @@ app.get('/snapshot', async (req, res) => {
     }
     
     tabState.lastSnapshot = annotatedYaml;
+    tabState.lastStructure = structure;
+    if (annotatedYaml) snapshotBytes.labels('full').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
     const win = windowSnapshot(annotatedYaml, 0);
 
     const response = {
@@ -4070,6 +7683,7 @@ app.get('/snapshot', async (req, res) => {
       targetId,
       url: tabState.page.url(),
       snapshot: win.text,
+      structure,
       refsCount: tabState.refs.size,
       truncated: win.truncated,
       totalChars: win.totalChars,
@@ -4091,6 +7705,61 @@ app.get('/snapshot', async (req, res) => {
 
 // POST /act - Combined action endpoint (OpenClaw format)
 // Routes to click/type/scroll/press/etc based on 'kind' parameter
+/**
+ * @openapi
+ * /act:
+ *   post:
+ *     tags: [Legacy]
+ *     summary: Combined action (OpenClaw format)
+ *     description: Routes to click/type/scroll/press/etc based on "kind" parameter.
+ *     deprecated: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, kind]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               kind:
+ *                 type: string
+ *                 description: 'Action kind: click, type, scroll, press, key, select_option, drag, hover, screenshot, wait, back, forward.'
+ *               targetId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *               selector:
+ *                 type: string
+ *               text:
+ *                 type: string
+ *               key:
+ *                 type: string
+ *               direction:
+ *                 type: string
+ *               url:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Action result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post('/act', async (req, res) => {
   try {
     const { kind, targetId, userId, ...params } = req.body;
@@ -4105,11 +7774,11 @@ app.post('/act', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = findTab(session, targetId);
     if (!found) {
-      return res.status(404).json({ error: 'Tab not found' });
+      return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
     
     const { tabState } = found;
-    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
       switch (kind) {
@@ -4154,28 +7823,43 @@ app.post('/act', async (req, res) => {
         }
         
         case 'type': {
-          const { ref, selector, text, submit } = params;
-          if (!ref && !selector) {
-            throw new Error('ref or selector required');
+          const { ref, selector, text, submit, mode = 'fill', delay = 30 } = params;
+          if (mode === 'fill' && !ref && !selector) {
+            throw new Error('ref or selector required for mode=fill');
           }
           if (typeof text !== 'string') {
             throw new Error('text is required');
           }
+          if (mode !== 'fill' && mode !== 'keyboard') {
+            throw new Error("mode must be 'fill' or 'keyboard'");
+          }
           
+          let locator = null;
           if (ref) {
-            let locator = refToLocator(tabState.page, ref, tabState.refs);
+            locator = refToLocator(tabState.page, ref, tabState.refs);
             if (!locator) {
-              log('info', 'auto-refreshing refs before type (openclaw)', { ref, hadRefs: tabState.refs.size });
+              log('info', 'auto-refreshing refs before type (openclaw)', { ref, hadRefs: tabState.refs.size, mode });
               tabState.refs = await buildRefs(tabState.page);
               locator = refToLocator(tabState.page, ref, tabState.refs);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
-            await locator.fill(text, { timeout: 10000 });
-            if (submit) await tabState.page.keyboard.press('Enter');
-          } else {
-            await tabState.page.fill(selector, text, { timeout: 10000 });
-            if (submit) await tabState.page.keyboard.press('Enter');
           }
+          
+          if (mode === 'fill') {
+            if (locator) {
+              await fillLocator(locator, text);
+            } else {
+              await fillLocator(tabState.page.locator(selector), text);
+            }
+          } else {
+            if (locator) {
+              await locator.focus({ timeout: 10000 });
+            } else if (selector) {
+              await tabState.page.focus(selector, { timeout: 10000 });
+            }
+            await tabState.page.keyboard.type(text, { delay });
+          }
+          if (submit) await tabState.page.keyboard.press('Enter');
           return { ok: true, targetId };
         }
         
@@ -4274,12 +7958,12 @@ setInterval(() => {
   });
 }, 5 * 60_000);
 
-// Active health probe — detect hung browser even when isConnected() lies
+// Active health probe -- detect hung browser even when isConnected() lies
 setInterval(async () => {
   if (!browser || healthState.isRecovering) return;
   const timeSinceSuccess = Date.now() - healthState.lastSuccessfulNav;
   // Skip probe if operations are in flight AND last success was recent.
-  // If it's been >120s since any successful operation, probe anyway —
+  // If it's been >120s since any successful operation, probe anyway --
   // active ops are likely stuck on a frozen browser and will time out eventually.
   if (healthState.activeOps > 0 && timeSinceSuccess < 120000) {
     log('info', 'health probe skipped, operations active', { activeOps: healthState.activeOps });
@@ -4293,13 +7977,12 @@ setInterval(async () => {
   
   let testContext;
   try {
-    testContext = await withTimeout(browser.newContext(), 5000, 'health probe newContext');
-    // In HEADFUL mode a probe page is a real Firefox window: with no session
-    // open, `newPage()` pops a visible window that closes a few ms later —
-    // every ~2 min while idle. A context round-trip is already a live protocol
-    // exchange with the browser process (a hung browser never answers it), so
-    // headful stops there; headless keeps the full page-level probe.
-    if (process.env.CAMOFOX_HEADFUL !== 'true') {
+    testContext = await withTimeout(browser.newContext({ viewport: null }), 5000, 'health probe newContext');
+    // In headful mode a probe page is a real Firefox window: with no session
+    // open, newPage() pops a visible window every ~2 min while idle. A context
+    // round-trip is already a live protocol exchange (a hung browser never
+    // answers it), so headful stops there; headless keeps the page probe.
+    if (!CONFIG.headful) {
       const page = await testContext.newPage();
       await page.goto('about:blank', { timeout: 5000 });
       await page.close();
@@ -4316,11 +7999,17 @@ setInterval(async () => {
 
 // Crash logging
 process.on('uncaughtException', (err) => {
+  pluginEvents.emit('browser:error', { error: err });
   log('error', 'uncaughtException', { error: err.message, stack: err.stack });
-  process.exit(1);
+  reporter.reportCrash(err, { resourceOpts: _resourceOpts() });
+  sentryCaptureException(err, { type: 'uncaughtException' });
+  sentryFlush(2000).finally(() => process.exit(1));
 });
 process.on('unhandledRejection', (reason) => {
   log('error', 'unhandledRejection', { reason: String(reason) });
+  if (reason instanceof Error) {
+    sentryCaptureException(reason, { type: 'unhandledRejection' });
+  }
 });
 
 // Graceful shutdown
@@ -4331,12 +8020,10 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
   log('info', 'shutting down', { signal });
 
-  // flush persistent sessions (cookies/logins) before exit
-  if (PROFILE_DIR) {
-    for (const [userId, s] of sessions.entries()) { try { await saveStorageState(userId, s.context); } catch {} }
-    log('info', 'persisted sessions', { count: sessions.size, dir: PROFILE_DIR });
-  }
-
+  // Arm the watchdog and stop accepting new connections before anything
+  // that can block or reject -- a hung or failing server:shutdown listener
+  // must not disable the force-exit safety net or widen the window where
+  // the server still accepts new sessions.
   const forceTimeout = setTimeout(() => {
     log('error', 'shutdown timed out, forcing exit');
     process.exit(1);
@@ -4346,30 +8033,109 @@ async function gracefulShutdown(signal) {
   server.close();
   stopMemoryReporter();
 
-  for (const [userId, session] of sessions) {
-    await session.context.close().catch(() => {});
-  }
-  if (browser) await browser.close().catch(() => {});
+  await pluginEvents.emitAsync('server:shutdown', { signal }).catch((err) => {
+    log('error', 'server:shutdown listener failed', { error: err.message });
+  });
+
+  await closeAllSessions(`shutdown:${signal}`, {
+    clearDownloads: false,
+    clearLocks: false,
+  });
+
+  await closeBrowserFully(`shutdown:${signal}`);
+  await sentryFlush(2000);
   process.exit(0);
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Idle self-shutdown REMOVED — it was racing with min_machines_running=2
+// Idle self-shutdown REMOVED -- it was racing with min_machines_running=2
 // and stopping machines that Fly couldn't auto-restart fast enough, leaving
 // only 1 machine to handle all browser traffic (causing timeouts for users).
 // Fly's auto_stop_machines=false + min_machines_running=2 handles scaling.
 
 const PORT = CONFIG.port;
-const server = app.listen(PORT, async () => {
+pluginEvents.emit('server:starting', { port: PORT });
+
+// Load plugins before starting the server
+const pluginCtx = {
+  sessions,
+  config: CONFIG,
+  log,
+  events: pluginEvents,
+  auth: authMiddleware,
+  ensureBrowser,
+  getSession,
+  destroySession,
+  closeSession,
+  withUserLimit,
+  safePageClose,
+  createLeasedPage,
+  closeLeasedPage,
+  normalizeUserId,
+  validateUrl,
+  safeError,
+  buildProxyUrl,
+  proxyPool,
+  failuresTotal,
+  metricsRegistry: getRegister,
+  createMetric,
+  registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory),
+  /** The upstream VirtualDisplay class -- plugins can subclass it. */
+  VirtualDisplay,
+};
+const loadedPlugins = await loadPlugins(app, pluginCtx);
+
+// --- OpenAPI docs (after all routes are registered) ---
+mountDocs(app);
+
+// --- Sentry Express error handler (after all routes, before app.listen) ---
+setupSentryErrorHandler(app);
+
+const server = app.listen(PORT, CONFIG.bindHost || undefined, async () => {
   startMemoryReporter();
   refreshActiveTabsGauge();
   refreshTabLockQueueDepth();
+  const address = server.address();
+  const bindHost = typeof address === 'object' && address ? address.address : CONFIG.bindHost;
+  pluginEvents.emit('server:started', { port: PORT, host: bindHost, pid: process.pid, plugins: loadedPlugins });
   if (FLY_MACHINE_ID) {
-    log('info', 'server started (fly)', { port: PORT, pid: process.pid, machineId: FLY_MACHINE_ID, nodeVersion: process.version });
+    log('info', 'server started (fly)', { port: PORT, host: bindHost, pid: process.pid, machineId: FLY_MACHINE_ID, nodeVersion: process.version });
   } else {
-    log('info', 'server started', { port: PORT, pid: process.pid, nodeVersion: process.version });
+    log('info', 'server started', { port: PORT, host: bindHost, pid: process.pid, nodeVersion: process.version });
+  }
+  const tmpCleanup = cleanupOrphanedTempFiles({ tmpDir: os.tmpdir() });
+  if (tmpCleanup.removed > 0) {
+    log('info', 'cleaned up orphaned camoufox temp files', tmpCleanup);
+  }
+  const profileCleanup = cleanupStaleFirefoxProfiles();
+  if (profileCleanup.removed > 0) {
+    log('info', 'cleaned up stale firefox profiles on startup', profileCleanup);
+  }
+
+  // Periodic cleanup is liveness-aware: a running browser's profile can look
+  // stale by mtime while its storage is still in use.
+  setInterval(() => {
+    try {
+      const profiles = browser ? profilePathsFromProcessSnapshot(snapshotOwnedBrowserProcesses(process.pid)) : [];
+      if (browser && profiles.size === 0) {
+        log('warn', 'skipped periodic firefox profile cleanup: live profile path unavailable');
+        return;
+      }
+      const cleaned = cleanupStaleFirefoxProfiles({ protectedPaths: profiles });
+      if (cleaned.removed > 0) {
+        log('info', 'periodic firefox profile cleanup', cleaned);
+      }
+    } catch { /* best effort */ }
+  }, 10 * 60 * 1000).unref();
+  const traceSweep = sweepOldTraces({
+    baseDir: CONFIG.tracesDir,
+    ttlMs: CONFIG.tracesTtlHours * 3600 * 1000,
+    maxBytesPerFile: CONFIG.tracesMaxBytes,
+  });
+  if (traceSweep.removedTtl > 0 || traceSweep.removedOversized > 0) {
+    log('info', 'swept old traces', traceSweep);
   }
   // Pre-warm browser so first request doesn't eat a 6-7s cold start
   try {
@@ -4378,10 +8144,17 @@ const server = app.listen(PORT, async () => {
     log('info', 'browser pre-warmed', { ms: Date.now() - start });
     scheduleBrowserIdleShutdown();
   } catch (err) {
-    log('error', 'browser pre-warm failed (will retry in background)', { error: err.message });
-    scheduleBrowserWarmRetry();
+    if (isFatalInstallError(err)) {
+      log('error', 'browser pre-warm aborted: Camoufox binaries are not installed', {
+        error: err.message,
+        remediation: camoufoxInstallRemediation(),
+      });
+    } else {
+      log('error', 'browser pre-warm failed (will retry in background)', { error: err.message });
+      scheduleBrowserWarmRetry();
+    }
   }
-  // Idle self-shutdown removed — Fly manages machine lifecycle via fly.toml.
+  // Idle self-shutdown removed -- Fly manages machine lifecycle via fly.toml.
 });
 
 server.on('error', (err) => {

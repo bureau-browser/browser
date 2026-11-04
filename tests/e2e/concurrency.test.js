@@ -1,23 +1,17 @@
-import { startServer, stopServer, getServerUrl } from '../helpers/startServer.js';
-import { startTestSite, stopTestSite, getTestSiteUrl } from '../helpers/testSite.js';
 import { createClient } from '../helpers/client.js';
+import { getSharedEnv } from './sharedEnv.js';
 
 describe('Concurrency', () => {
   let serverUrl;
   let testSiteUrl;
   
-  beforeAll(async () => {
-    const port = await startServer();
-    serverUrl = getServerUrl();
-    
-    const testPort = await startTestSite();
-    testSiteUrl = getTestSiteUrl();
-  }, 120000);
+  beforeAll(() => {
+    const env = getSharedEnv();
+    serverUrl = env.serverUrl;
+    testSiteUrl = env.testSiteUrl;
+  });
   
-  afterAll(async () => {
-    await stopTestSite();
-    await stopServer();
-  }, 30000);
+  // Server lifecycle managed by globalSetup/globalTeardown
   
   test('concurrent operations on same tab are serialized', async () => {
     const client = createClient(serverUrl);
@@ -98,6 +92,36 @@ describe('Concurrency', () => {
     } finally {
       await client1.cleanup();
       await client2.cleanup();
+    }
+  });
+
+  test('recovery after one user reaches the navigation failure threshold leaves another user usable', async () => {
+    const failingClient = createClient(serverUrl);
+    const healthyClient = createClient(serverUrl);
+
+    try {
+      const [failingTab, healthyTab] = await Promise.all([
+        failingClient.createTab(`${testSiteUrl}/pageA`),
+        healthyClient.createTab(`${testSiteUrl}/pageB`),
+      ]);
+      const failingUrl = `${testSiteUrl}/connection-reset`;
+
+      await expect(failingClient.navigate(failingTab.tabId, failingUrl)).rejects.toMatchObject({ status: 500 });
+      await expect(failingClient.navigate(failingTab.tabId, failingUrl)).rejects.toMatchObject({ status: 500 });
+
+      const [, healthySnapshot] = await Promise.all([
+        expect(failingClient.navigate(failingTab.tabId, failingUrl)).rejects.toMatchObject({ status: 500 }),
+        healthyClient.getSnapshot(healthyTab.tabId),
+      ]);
+
+      expect(healthySnapshot.snapshot).toContain('Page B');
+      expect((await healthyClient.health()).browserConnected).toBe(true);
+
+      const recoveredTab = await failingClient.createTab(`${testSiteUrl}/pageA`);
+      expect((await failingClient.getSnapshot(recoveredTab.tabId)).snapshot).toContain('Page A');
+    } finally {
+      await failingClient.cleanup();
+      await healthyClient.cleanup();
     }
   });
 });

@@ -36,6 +36,32 @@ function createTestApp() {
     `);
   });
   
+  // A deterministic upstream failure for navigation error handling tests.
+  app.get('/unavailable', (req, res) => {
+    res.status(503).send('Temporarily unavailable');
+  });
+
+  // A response that never completes, used to exercise navigation timeouts.
+  app.get('/slow-navigation', () => {
+    // Deliberately leave the HTTP response open until the browser aborts it.
+  });
+
+  // Page that fires a client-side redirect shortly after DOMContentLoaded
+  app.get('/lateRedirect', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Late Redirect</title></head>
+      <body>
+        <h1>Redirecting soon</h1>
+        <script>setTimeout(() => { location.href = '/pageA'; }, 300);</script>
+      </body></html>
+    `);
+  });
+
+  app.get('/connection-reset', (req, res) => {
+    req.socket.destroy();
+  });
+
   // Page with multiple links for links extraction test
   app.get('/links', (req, res) => {
     res.send(`
@@ -136,6 +162,23 @@ function createTestApp() {
       </body></html>
     `);
   });
+
+  app.get('/structure', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Structure Test</title></head>
+      <body>
+        <form id="report-filters" method="get">
+          <label for="period">Period</label>
+          <select id="period" name="period"><option value="month">Month</option><option value="year" selected>Year</option></select>
+          <label for="from">From</label><input id="from" name="from" value="2022-01-01" />
+          <input id="api_token" name="api_token" value="must-not-appear" />
+          <button id="show-report" type="submit">Show Report</button>
+        </form>
+        <table id="sales"><thead><tr><th>Product</th><th>Quantity</th></tr></thead><tbody><tr><td>Yoga ball</td><td>7</td></tr></tbody></table>
+      </body></html>
+    `);
+  });
   
   // Page with refresh counter (to verify refresh actually works)
   let refreshCount = 0;
@@ -216,6 +259,10 @@ function createTestApp() {
     `);
   });
 
+  app.get('/bare-image', (req, res) => {
+    res.type('png').send(Buffer.from(samplePngBase64, 'base64'));
+  });
+
   // Page and endpoint for download capture tests
   app.get('/download-page', (req, res) => {
     res.send(`
@@ -235,7 +282,31 @@ function createTestApp() {
     res.send(body);
   });
 
-  // Large page for snapshot truncation tests — simulates a big product listing
+  app.get('/inline-document.pdf', (req, res) => {
+    // Small valid PDF fixture. No Content-Disposition means Firefox displays it inline.
+    const pdf = '%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n';
+    res.type('application/pdf').send(pdf);
+  });
+
+  // Page with a direct file input for upload endpoint tests
+  app.get('/upload', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Upload Test</title></head>
+      <body>
+        <h1>Upload Test Page</h1>
+        <input type="file" id="fileInput" />
+        <output id="selected">No file selected</output>
+        <script>
+          document.getElementById('fileInput').addEventListener('change', (event) => {
+            const [file] = event.target.files;
+            document.getElementById('selected').textContent = file ? file.name : 'No file selected';
+          });
+        </script>
+      </body></html>
+    `);
+  });
+
   app.get('/large-page', (req, res) => {
     const count = parseInt(req.query.count) || 500;
     const items = Array.from({ length: count }, (_, i) =>
@@ -280,6 +351,30 @@ function createTestApp() {
         <h1>Scroll Test Page</h1>
         ${items}
         <div id="bottom">Bottom of page</div>
+      </body></html>
+    `);
+  });
+
+  // Page with target=_blank link and window.open button (popup test)
+  app.get('/popup-source', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Popup Source</title></head>
+      <body>
+        <h1>Popup Source Page</h1>
+        <a id="blankLink" href="/popup-target" target="_blank">Open in new tab</a>
+        <button id="openBtn" onclick="window.open('/popup-target', '_blank')">window.open</button>
+      </body></html>
+    `);
+  });
+
+  app.get('/popup-target', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Popup Target</title></head>
+      <body>
+        <h1>Popup Target Page</h1>
+        <p>This page was opened as a popup.</p>
       </body></html>
     `);
   });

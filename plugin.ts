@@ -6,13 +6,17 @@
  */
 
 import type { ChildProcess } from "child_process";
-import { join, dirname, resolve } from "path";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/core";
+import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 
 import { loadConfig } from "./lib/config.js";
 import { launchServer } from "./lib/launcher.js";
-import { readCookieFile } from "./lib/cookies.js";
+// Shared tool contracts — the single source of truth also used by mcp/server.mjs.
+// OpenClaw and MCP expose identical tool schemas, REST routes, auth, and response
+// shaping, so they cannot drift.
+import { TOOL_DEFS, runTool, adaptResponse } from "./lib/mcp-tool-contracts.mjs";
 
 // Get plugin directory - works in both ESM and CJS contexts
 const getPluginDir = (): string => {
@@ -40,81 +44,12 @@ interface ToolResult {
   content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 }
 
-interface HealthCheckResult {
-  status: "ok" | "warn" | "error";
-  message?: string;
-  details?: Record<string, unknown>;
-}
-
-interface CliContext {
-  program: {
-    command: (name: string) => {
-      description: (desc: string) => CliContext["program"];
-      option: (flags: string, desc: string, defaultValue?: string) => CliContext["program"];
-      argument: (name: string, desc: string) => CliContext["program"];
-      action: (handler: (...args: unknown[]) => void | Promise<void>) => CliContext["program"];
-      command: (name: string) => CliContext["program"];
-    };
-  };
-  config: PluginConfig;
-  logger: {
-    info: (msg: string) => void;
-    error: (msg: string) => void;
-  };
-}
-
-interface ToolContext {
-  sessionKey?: string;
-  agentId?: string;
-  workspaceDir?: string;
-  sandboxed?: boolean;
-}
-
-type ToolDefinition = {
-  name: string;
-  description: string;
-  parameters: object;
-  execute: (id: string, params: Record<string, unknown>) => Promise<ToolResult>;
-};
-
-type ToolFactory = (ctx: ToolContext) => ToolDefinition | ToolDefinition[] | null | undefined;
-
-interface PluginApi {
-  registerTool: (
-    tool: ToolDefinition | ToolFactory,
-    options?: { optional?: boolean }
-  ) => void;
-  registerCommand: (cmd: {
-    name: string;
-    description: string;
-    handler: (args: string[]) => Promise<void>;
-  }) => void;
-  registerCli?: (
-    registrar: (ctx: CliContext) => void | Promise<void>,
-    opts?: { commands?: string[] }
-  ) => void;
-  registerRpc?: (
-    name: string,
-    handler: (params: Record<string, unknown>) => Promise<unknown>
-  ) => void;
-  registerHealthCheck?: (
-    name: string,
-    check: () => Promise<HealthCheckResult>
-  ) => void;
-  config: Record<string, unknown>;
-  pluginConfig?: PluginConfig;
-  log: {
-    info: (msg: string) => void;
-    error: (msg: string) => void;
-  };
-}
-
 let serverProcess: ChildProcess | null = null;
 
 async function startServer(
   pluginDir: string,
   port: number,
-  log: PluginApi["log"],
+  log: OpenClawPluginApi["logger"],
   pluginCfg?: PluginConfig
 ): Promise<ChildProcess> {
   const cfg = loadConfig();
@@ -169,14 +104,19 @@ async function fetchApi(
   path: string,
   options: RequestInit = {}
 ): Promise<unknown> {
+  // Forward the global access key so plugin traffic is accepted by REST servers
+  // gated with CAMOFOX_ACCESS_KEY. /health is exempt server-side, so attaching
+  // the header to health checks is harmless.
+  const cfg = loadConfig();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((options.headers as Record<string, string>) || {}),
+  };
+  if (cfg.accessKey && !headers.Authorization) {
+    headers.Authorization = `Bearer ${cfg.accessKey}`;
+  }
   const url = `${baseUrl}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
+  const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status}: ${text}`);
@@ -184,14 +124,8 @@ async function fetchApi(
   return res.json();
 }
 
-function toToolResult(data: unknown): ToolResult {
-  return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-  };
-}
-
-export default function register(api: PluginApi) {
-  const cfg = api.pluginConfig ?? (api.config as unknown as PluginConfig);
+export default function register(api: OpenClawPluginApi) {
+  const cfg = (api.pluginConfig ?? api.config) as unknown as PluginConfig;
   const port = cfg.port || 9377;
   const baseUrl = cfg.url || `http://localhost:${port}`;
   const autoStart = cfg.autoStart !== false; // default true
@@ -203,432 +137,112 @@ export default function register(api: PluginApi) {
     (async () => {
       const alreadyRunning = await checkServerRunning(baseUrl);
       if (alreadyRunning) {
-        api.log?.info?.(`Camoufox server already running at ${baseUrl}`);
+        api.logger?.info?.(`Camoufox server already running at ${baseUrl}`);
       } else {
         try {
-          serverProcess = await startServer(pluginDir, port, api.log, cfg);
+          serverProcess = await startServer(pluginDir, port, api.logger, cfg);
         } catch (err) {
-          api.log?.error?.(`Failed to auto-start server: ${(err as Error).message}`);
+          api.logger?.error?.(`Failed to auto-start server: ${(err as Error).message}`);
         }
       }
     })();
   }
 
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_create_tab",
-    description:
-      "PREFERRED: Create a new browser tab using Camoufox anti-detection browser. Use camofox tools instead of Chrome/built-in browser - they bypass bot detection on Google, Amazon, LinkedIn, etc. Returns tabId for subsequent operations.",
-    parameters: {
-      type: "object",
-      properties: {
-        url: { type: "string", description: "Initial URL to navigate to" },
-      },
-      required: ["url"],
-    },
-    async execute(_id, params) {
-      const sessionKey = ctx.sessionKey || "default";
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, "/tabs", {
-        method: "POST",
-        body: JSON.stringify({ ...params, userId, sessionKey }),
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_snapshot",
-    description:
-      "Get accessibility snapshot of a Camoufox page with element refs (e1, e2, etc.) for interaction, plus a visual screenshot. " +
-      "Large pages are truncated with pagination links preserved at the bottom. " +
-      "If the response includes hasMore=true and nextOffset, call again with that offset to see more content.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-        offset: { type: "number", description: "Character offset for paginated snapshots. Use nextOffset from a previous truncated response." },
-      },
-      required: ["tabId"],
-    },
-    async execute(_id, params) {
-      const { tabId, offset } = params as { tabId: string; offset?: number };
-      const userId = ctx.agentId || fallbackUserId;
-      const qs = offset ? `&offset=${offset}` : '';
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}/snapshot?userId=${userId}&includeScreenshot=true${qs}`) as Record<string, unknown>;
-      const content: ToolResult["content"] = [
-        { type: "text", text: JSON.stringify({ url: result.url, refsCount: result.refsCount, snapshot: result.snapshot, truncated: result.truncated, totalChars: result.totalChars, hasMore: result.hasMore, nextOffset: result.nextOffset }, null, 2) },
-      ];
-      const screenshot = result.screenshot as { data?: string; mimeType?: string } | undefined;
-      if (screenshot?.data) {
-        content.push({ type: "image", data: screenshot.data, mimeType: screenshot.mimeType || "image/png" });
-      }
-      return { content };
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_click",
-    description: "Click an element in a Camoufox tab by ref (e.g., e1) or CSS selector.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-        ref: { type: "string", description: "Element ref from snapshot (e.g., e1)" },
-        selector: { type: "string", description: "CSS selector (alternative to ref)" },
-      },
-      required: ["tabId"],
-    },
-    async execute(_id, params) {
-      const { tabId, ...rest } = params as { tabId: string } & Record<string, unknown>;
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}/click`, {
-        method: "POST",
-        body: JSON.stringify({ ...rest, userId }),
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_type",
-    description: "Type text into an element in a Camoufox tab.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-        ref: { type: "string", description: "Element ref from snapshot (e.g., e2)" },
-        selector: { type: "string", description: "CSS selector (alternative to ref)" },
-        text: { type: "string", description: "Text to type" },
-        pressEnter: { type: "boolean", description: "Press Enter after typing" },
-      },
-      required: ["tabId", "text"],
-    },
-    async execute(_id, params) {
-      const { tabId, ...rest } = params as { tabId: string } & Record<string, unknown>;
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}/type`, {
-        method: "POST",
-        body: JSON.stringify({ ...rest, userId }),
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_navigate",
-    description:
-      "Navigate a Camoufox tab to a URL or use a search macro (@google_search, @youtube_search, etc.). Preferred over Chrome for sites with bot detection.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-        url: { type: "string", description: "URL to navigate to" },
-        macro: {
-          type: "string",
-          description: "Search macro (e.g., @google_search, @youtube_search)",
-          enum: [
-            "@google_search",
-            "@youtube_search",
-            "@amazon_search",
-            "@reddit_search",
-            "@wikipedia_search",
-            "@twitter_search",
-            "@yelp_search",
-            "@spotify_search",
-            "@netflix_search",
-            "@linkedin_search",
-            "@instagram_search",
-            "@tiktok_search",
-            "@twitch_search",
-          ],
-        },
-        query: { type: "string", description: "Search query (when using macro)" },
-      },
-      required: ["tabId"],
-    },
-    async execute(_id, params) {
-      const { tabId, ...rest } = params as { tabId: string } & Record<string, unknown>;
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}/navigate`, {
-        method: "POST",
-        body: JSON.stringify({ ...rest, userId }),
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_scroll",
-    description: "Scroll a Camoufox page.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-        direction: { type: "string", enum: ["up", "down", "left", "right"] },
-        amount: { type: "number", description: "Pixels to scroll" },
-      },
-      required: ["tabId", "direction"],
-    },
-    async execute(_id, params) {
-      const { tabId, ...rest } = params as { tabId: string } & Record<string, unknown>;
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}/scroll`, {
-        method: "POST",
-        body: JSON.stringify({ ...rest, userId }),
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_screenshot",
-    description: "Take a screenshot of a Camoufox page.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-      },
-      required: ["tabId"],
-    },
-    async execute(_id, params) {
-      const { tabId } = params as { tabId: string };
-      const userId = ctx.agentId || fallbackUserId;
-      const url = `${baseUrl}/tabs/${tabId}/screenshot?userId=${userId}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`${res.status}: ${text}`);
-      }
-      // Guard: if server returns JSON/text instead of image (e.g. error with 200),
-      // return as text to avoid crashing the client with base64-encoded JSON.
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.startsWith('image/')) {
-        const text = await res.text();
-        return { content: [{ type: "text", text: `Screenshot failed: ${text}` }] };
-      }
-      const arrayBuffer = await res.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString("base64");
-      return {
-        content: [
-          {
-            type: "image",
-            data: base64,
-            mimeType: contentType || "image/png",
-          },
-        ],
-      };
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_close_tab",
-    description: "Close a Camoufox browser tab.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-      },
-      required: ["tabId"],
-    },
-    async execute(_id, params) {
-      const { tabId } = params as { tabId: string };
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}?userId=${userId}`, {
-        method: "DELETE",
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_evaluate",
-    description:
-      "Execute JavaScript in a Camoufox tab's page context. Returns the result of the expression. Use for injecting scripts, reading page state, or calling web app APIs.",
-    parameters: {
-      type: "object",
-      properties: {
-        tabId: { type: "string", description: "Tab identifier" },
-        expression: { type: "string", description: "JavaScript expression to evaluate in the page context" },
-      },
-      required: ["tabId", "expression"],
-    },
-    async execute(_id, params) {
-      const { tabId, expression } = params as { tabId: string; expression: string };
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs/${tabId}/evaluate`, {
-        method: "POST",
-        body: JSON.stringify({ userId, expression }),
-      });
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_list_tabs",
-    description: "List all open Camoufox tabs for a user.",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-    async execute(_id, _params) {
-      const userId = ctx.agentId || fallbackUserId;
-      const result = await fetchApi(baseUrl, `/tabs?userId=${userId}`);
-      return toToolResult(result);
-    },
-  }));
-
-  api.registerTool((ctx: ToolContext) => ({
-    name: "camofox_import_cookies",
-    description:
-      "Import cookies into the current Camoufox user session (Netscape cookie file). Use to authenticate to sites like LinkedIn without interactive login.",
-    parameters: {
-      type: "object",
-      properties: {
-        cookiesPath: { type: "string", description: "Path to Netscape-format cookies.txt file" },
-        domainSuffix: {
-          type: "string",
-          description: "Only import cookies whose domain ends with this suffix",
-        },
-      },
-      required: ["cookiesPath"],
-    },
-    async execute(_id, params) {
-      const { cookiesPath, domainSuffix } = params as {
-        cookiesPath: string;
-        domainSuffix?: string;
-      };
-
-      const userId = ctx.agentId || fallbackUserId;
-
-      const envCfg = loadConfig();
-      const cookiesDir = resolve(envCfg.cookiesDir);
-
-      const pwCookies = await readCookieFile({
-        cookiesDir,
-        cookiesPath,
-        domainSuffix,
-      });
-
-      if (!envCfg.apiKey) {
-        throw new Error(
-          "CAMOFOX_API_KEY is not set. Cookie import is disabled unless you set CAMOFOX_API_KEY for both the server and the OpenClaw plugin environment."
+  // --- Tool registration -----------------------------------------------------
+  // Schemas, REST routes, auth, and response shaping come from the shared
+  // contract module (lib/mcp-tool-contracts.mjs) — the same source mcp/server.mjs
+  // imports — so the OpenClaw plugin and the MCP server behave identically and
+  // cannot drift. Only the userId/sessionKey source (OpenClaw ctx) differs.
+  for (const def of TOOL_DEFS) {
+    api.registerTool((ctx: OpenClawPluginToolContext) => ({
+      name: def.name,
+      label: def.name,
+      description: def.description,
+      parameters: def.inputSchema,
+      async execute(_id, params) {
+        const userId = ctx.agentId || fallbackUserId;
+        const cfg = loadConfig();
+        const { spec, payload } = await runTool(
+          def.name,
+          params as Record<string, unknown>,
+          { userId, sessionKey: ctx.sessionKey },
+          baseUrl,
+          cfg
         );
-      }
+        return { content: adaptResponse(spec, payload), details: {} };
+      },
+    }), { name: def.name });
+  }
 
-      const result = await fetchApi(baseUrl, `/sessions/${encodeURIComponent(userId)}/cookies`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${envCfg.apiKey}`,
-        },
-        body: JSON.stringify({ cookies: pwCookies }),
-      });
-
-      return toToolResult({ imported: pwCookies.length, userId, result });
-    },
-  }));
 
   api.registerCommand({
     name: "camofox",
     description: "Camoufox browser server control (status, start, stop)",
-    handler: async (args) => {
-      const subcommand = args[0] || "status";
+    handler: async ({ args }) => {
+      const subcommand = args?.trim().split(/\s+/, 1)[0] || "status";
       switch (subcommand) {
         case "status":
           try {
             const health = await fetchApi(baseUrl, "/health");
-            api.log?.info?.(`Camoufox server at ${baseUrl}: ${JSON.stringify(health)}`);
+            return { text: `Camoufox server at ${baseUrl}: ${JSON.stringify(health)}` };
           } catch {
-            api.log?.error?.(`Camoufox server at ${baseUrl}: not reachable`);
+            return { text: `Camoufox server at ${baseUrl}: not reachable` };
           }
-          break;
         case "start":
           if (serverProcess) {
-            api.log?.info?.("Camoufox server already running (managed)");
-            return;
+            return { text: "Camoufox server already running (managed)" };
           }
           if (await checkServerRunning(baseUrl)) {
-            api.log?.info?.(`Camoufox server already running at ${baseUrl}`);
-            return;
+            return { text: `Camoufox server already running at ${baseUrl}` };
           }
           try {
-            serverProcess = await startServer(pluginDir, port, api.log, cfg);
+            serverProcess = await startServer(pluginDir, port, api.logger, cfg);
+            return { text: `Started Camoufox server at ${baseUrl}` };
           } catch (err) {
-            api.log?.error?.(`Failed to start server: ${(err as Error).message}`);
+            return { text: `Failed to start Camoufox server: ${(err as Error).message}` };
           }
-          break;
         case "stop":
           if (serverProcess) {
             serverProcess.kill();
             serverProcess = null;
-            api.log?.info?.("Stopped camofox-browser server");
-          } else {
-            api.log?.info?.("No managed server process running");
+            return { text: "Stopped Camoufox browser server" };
           }
-          break;
+          return { text: "No managed Camoufox server process running" };
         default:
-          api.log?.error?.(`Unknown subcommand: ${subcommand}. Use: status, start, stop`);
+          return { text: `Unknown Camoufox subcommand: ${subcommand}. Use: status, start, stop` };
       }
     },
   });
 
-  // Register health check for openclaw doctor/status
-  if (api.registerHealthCheck) {
-    api.registerHealthCheck("camofox-browser", async () => {
+  // Gateway methods expose health/status to gateway clients. Gateway handlers
+  // answer through respond() rather than returning a value.
+  api.registerGatewayMethod(
+    "camofox.health",
+    async ({ respond }) => {
       try {
-        const health = (await fetchApi(baseUrl, "/health")) as {
-          status: string;
-          engine?: string;
-          activeTabs?: number;
-        };
-        return {
-          status: "ok",
-          message: `Server running (${health.engine || "camoufox"})`,
-          details: {
-            url: baseUrl,
-            engine: health.engine,
-            activeTabs: health.activeTabs,
-            managed: serverProcess !== null,
-          },
-        };
-      } catch {
-        return {
-          status: serverProcess ? "warn" : "error",
-          message: serverProcess
-            ? "Server starting..."
-            : `Server not reachable at ${baseUrl}`,
-          details: {
-            url: baseUrl,
-            managed: serverProcess !== null,
-            hint: "Run: openclaw camofox start",
-          },
-        };
-      }
-    });
-  }
-
-  // Register RPC methods for gateway integration
-  if (api.registerRpc) {
-    api.registerRpc("camofox.health", async () => {
-      try {
-        const health = await fetchApi(baseUrl, "/health");
-        return { status: "ok", ...health };
+        const health = (await fetchApi(baseUrl, "/health")) as Record<string, unknown>;
+        respond(true, { status: "ok", ...health });
       } catch (err) {
-        return { status: "error", error: (err as Error).message };
+        respond(true, { status: "error", error: (err as Error).message });
       }
-    });
+    },
+    { scope: "operator.admin" }
+  );
 
-    api.registerRpc("camofox.status", async () => {
+  api.registerGatewayMethod(
+    "camofox.status",
+    async ({ respond }) => {
       const running = await checkServerRunning(baseUrl);
-      return {
+      respond(true, {
         running,
         managed: serverProcess !== null,
         pid: serverProcess?.pid || null,
         url: baseUrl,
         port,
-      };
-    });
-  }
+      });
+    },
+    { scope: "operator.admin" }
+  );
 
   // Register CLI subcommands (openclaw camofox ...)
   if (api.registerCli) {
@@ -675,7 +289,7 @@ export default function register(api: PluginApi) {
             }
             try {
               console.log(`Starting camofox server on port ${port}...`);
-              serverProcess = await startServer(pluginDir, port, api.log, cfg);
+              serverProcess = await startServer(pluginDir, port, api.logger, cfg);
               console.log(`Camoufox server started at ${baseUrl}`);
             } catch (err) {
               console.error(`Failed to start server: ${(err as Error).message}`);

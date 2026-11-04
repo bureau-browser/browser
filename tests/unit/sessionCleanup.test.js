@@ -1,77 +1,79 @@
 /**
- * Unit tests for session cleanup after tab reaper empties all tabs.
+ * Unit tests for session cleanup race conditions.
  *
- * Tests the logic that when the tab reaper closes all idle tabs in a session,
- * the empty session (browser context) should be cleaned up immediately rather
- * than lingering until the session timeout.
+ * Covers:
+ * 1. Tab reaper → empty session cleanup (with _closing flag)
+ * 2. getSession() skips sessions marked _closing
+ * 3. YT transcript cleanup uses context.pages() instead of tabGroups
+ * 4. Session expiry sets _closing before teardown
  */
 
-describe('session cleanup after tab reaper', () => {
-  // Simulate the reaper loop logic from server.js
-  function runTabReaper({ sessions, TAB_INACTIVITY_MS, destroyTab, onSessionEmpty }) {
-    const now = Date.now();
-    for (const [userId, session] of sessions) {
-      for (const [listItemId, group] of session.tabGroups) {
-        for (const [tabId, tabState] of group) {
-          if (!tabState._lastReaperCheck) {
-            tabState._lastReaperCheck = now;
-            tabState._lastReaperToolCalls = tabState.toolCalls;
-            continue;
-          }
-          if (tabState.toolCalls === tabState._lastReaperToolCalls) {
-            const idleMs = now - tabState._lastReaperCheck;
-            if (idleMs >= TAB_INACTIVITY_MS) {
-              destroyTab(tabId);
-              group.delete(tabId);
-            }
-          } else {
-            tabState._lastReaperCheck = now;
-            tabState._lastReaperToolCalls = tabState.toolCalls;
-          }
-        }
-        if (group.size === 0) {
-          session.tabGroups.delete(listItemId);
-        }
-      }
-      // The fix: clean up empty sessions
-      if (session.tabGroups.size === 0) {
-        onSessionEmpty(userId);
-        sessions.delete(userId);
-      }
-    }
-  }
+import { runTabReaperTick } from '../../lib/tab-reaper.js';
 
-  function makeSession(tabs) {
+describe('tab reaper (server runTabReaperTick)', () => {
+  function makeSession(tabs, opts = {}) {
     const tabGroups = new Map();
     const group = new Map();
     for (const [tabId, tabState] of Object.entries(tabs)) {
       group.set(tabId, { toolCalls: 0, ...tabState });
     }
     tabGroups.set('list-1', group);
-    return { tabGroups, lastAccess: Date.now() };
+    return { tabGroups, lastAccess: Date.now(), ...opts };
+  }
+
+  function tick({ sessions, tabInactivityMs = 300_000, now = Date.now(), hasActivePageLeases, onSessionEmpty, reaped }) {
+    return runTabReaperTick({
+      sessions,
+      tabInactivityMs,
+      now,
+      hasActivePageLeases,
+      onTabReaped: (info) => reaped?.push(info),
+      onSessionEmpty: onSessionEmpty || ((userId) => sessions.delete(userId)),
+    });
   }
 
   test('empty session is cleaned up when all tabs are reaped', () => {
-    const past = Date.now() - 600_000; // 10 min ago
+    const past = Date.now() - 600_000;
     const sessions = new Map();
-    sessions.set('user-1', makeSession({
+    const session = makeSession({
       'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 },
       'tab-2': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 },
-    }));
-
-    const destroyed = [];
+    });
+    sessions.set('user-1', session);
+    const reaped = [];
     const emptied = [];
 
-    runTabReaper({
-      sessions,
-      TAB_INACTIVITY_MS: 300_000,
-      destroyTab: (id) => destroyed.push(id),
-      onSessionEmpty: (userId) => emptied.push(userId),
-    });
+    tick({ sessions, reaped, onSessionEmpty: (id) => { emptied.push(id); sessions.delete(id); } });
 
-    expect(destroyed).toEqual(['tab-1', 'tab-2']);
+    expect(reaped.map((r) => r.tabId)).toEqual(['tab-1', 'tab-2']);
     expect(emptied).toEqual(['user-1']);
     expect(sessions.size).toBe(0);
+    expect(session._closing).toBe(true);
+  });
+
+  test('empty session with a page lease is NOT closed', () => {
+    const sessions = new Map();
+    const session = { tabGroups: new Map(), pageLeases: new Set([{}]), lastAccess: Date.now() };
+    sessions.set('user-1', session);
+    const emptied = [];
+
+    tick({ sessions, hasActivePageLeases: (s) => s.pageLeases.size > 0, onSessionEmpty: (id) => emptied.push(id) });
+
+    expect(emptied).toEqual([]);
+    expect(sessions.get('user-1')).toBe(session);
+    expect(session._closing).toBeUndefined();
+  });
+
+  test('_closing is set before the onSessionEmpty callback', () => {
+    const past = Date.now() - 600_000;
+    const sessions = new Map();
+    const session = makeSession({ 'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 } });
+    sessions.set('user-1', session);
+    let closingAtCallback = null;
+
+    tick({ sessions, onSessionEmpty: () => { closingAtCallback = session._closing; } });
+
+    expect(closingAtCallback).toBe(true);
   });
 
   test('session with active tabs is NOT cleaned up', () => {
@@ -79,69 +81,323 @@ describe('session cleanup after tab reaper', () => {
     const sessions = new Map();
     sessions.set('user-1', makeSession({
       'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 },
-      'tab-2': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 5 }, // active
+      'tab-2': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 5 },
     }));
+    const reaped = [];
 
-    const destroyed = [];
-    const emptied = [];
+    tick({ sessions, reaped });
 
-    runTabReaper({
-      sessions,
-      TAB_INACTIVITY_MS: 300_000,
-      destroyTab: (id) => destroyed.push(id),
-      onSessionEmpty: (userId) => emptied.push(userId),
-    });
-
-    expect(destroyed).toEqual(['tab-1']);
-    expect(emptied).toEqual([]);
+    expect(reaped.map((r) => r.tabId)).toEqual(['tab-1']);
     expect(sessions.size).toBe(1);
-    // Active tab should still be present
-    const session = sessions.get('user-1');
-    expect(session.tabGroups.get('list-1').has('tab-2')).toBe(true);
+    expect(sessions.get('user-1').tabGroups.get('list-1').has('tab-2')).toBe(true);
   });
 
-  test('multiple sessions: only empty ones are cleaned up', () => {
+  test('tabs not yet checked are skipped (first pass initializes state)', () => {
+    const sessions = new Map();
+    sessions.set('user-1', makeSession({ 'tab-1': { toolCalls: 0 } }));
+    const reaped = [];
+
+    tick({ sessions, reaped });
+
+    expect(reaped).toEqual([]);
+    expect(sessions.size).toBe(1);
+    const tab = sessions.get('user-1').tabGroups.get('list-1').get('tab-1');
+    expect(tab._lastReaperCheck).toBeDefined();
+  });
+
+  test('TAB_INACTIVITY_MS=0 skips all idle tabs', () => {
     const past = Date.now() - 600_000;
     const sessions = new Map();
-    sessions.set('user-1', makeSession({
-      'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 },
-    }));
-    sessions.set('user-2', makeSession({
-      'tab-2': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 3 }, // active
-    }));
-
+    sessions.set('user-1', makeSession({ 'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 } }));
+    const reaped = [];
     const emptied = [];
 
-    runTabReaper({
-      sessions,
-      TAB_INACTIVITY_MS: 300_000,
-      destroyTab: () => {},
-      onSessionEmpty: (userId) => emptied.push(userId),
-    });
+    tick({ sessions, tabInactivityMs: 0, reaped, onSessionEmpty: (id) => emptied.push(id) });
 
-    expect(emptied).toEqual(['user-1']);
-    expect(sessions.size).toBe(1);
-    expect(sessions.has('user-2')).toBe(true);
-  });
-
-  test('tabs not yet checked are skipped (first pass initializes reaper state)', () => {
-    const sessions = new Map();
-    sessions.set('user-1', makeSession({
-      'tab-1': { toolCalls: 0 }, // no _lastReaperCheck
-    }));
-
-    const destroyed = [];
-    const emptied = [];
-
-    runTabReaper({
-      sessions,
-      TAB_INACTIVITY_MS: 300_000,
-      destroyTab: (id) => destroyed.push(id),
-      onSessionEmpty: (userId) => emptied.push(userId),
-    });
-
-    expect(destroyed).toEqual([]);
+    expect(reaped).toEqual([]);
     expect(emptied).toEqual([]);
     expect(sessions.size).toBe(1);
+  });
+
+  test('negative TAB_INACTIVITY_MS also disables reaping', () => {
+    const past = Date.now() - 600_000;
+    const sessions = new Map();
+    sessions.set('user-1', makeSession({ 'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 } }));
+    const reaped = [];
+
+    tick({ sessions, tabInactivityMs: -1, reaped });
+
+    expect(reaped).toEqual([]);
+    expect(sessions.size).toBe(1);
+  });
+
+  test('keepAlive session is NOT reaped even when all tabs idle', () => {
+    const past = Date.now() - 600_000;
+    const sessions = new Map();
+    sessions.set('linkedin', makeSession(
+      { 'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 } },
+      { keepAlive: true }
+    ));
+    const reaped = [];
+    const emptied = [];
+
+    tick({ sessions, reaped, onSessionEmpty: (id) => emptied.push(id) });
+
+    expect(reaped).toEqual([]);
+    expect(emptied).toEqual([]);
+    expect(sessions.size).toBe(1);
+  });
+
+  test('non-keepAlive sibling IS reaped while keepAlive session survives', () => {
+    const past = Date.now() - 600_000;
+    const sessions = new Map();
+    sessions.set('linkedin', makeSession(
+      { 'tab-1': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 } },
+      { keepAlive: true }
+    ));
+    sessions.set('anonymous', makeSession({
+      'tab-2': { _lastReaperCheck: past, _lastReaperToolCalls: 0, toolCalls: 0 },
+    }));
+    const reaped = [];
+    const emptied = [];
+
+    tick({ sessions, reaped, onSessionEmpty: (id) => { emptied.push(id); sessions.delete(id); } });
+
+    expect(reaped.map((r) => r.tabId)).toEqual(['tab-2']);
+    expect(emptied).toEqual(['anonymous']);
+    expect(sessions.size).toBe(1);
+    expect(sessions.has('linkedin')).toBe(true);
+  });
+});
+
+describe('getSession _closing flag handling', () => {
+  // Simulate getSession logic from server.js
+  function getSession(sessions, userId, createContext) {
+    const key = String(userId);
+    let session = sessions.get(key);
+
+    if (session) {
+      if (session._closing) {
+        session = null;
+      } else {
+        try {
+          session.context.pages();
+        } catch {
+          sessions.delete(key);
+          session = null;
+        }
+      }
+    }
+
+    if (!session) {
+      const context = createContext();
+      session = { context, tabGroups: new Map(), lastAccess: Date.now() };
+      sessions.set(key, session);
+    }
+    session.lastAccess = Date.now();
+    return session;
+  }
+
+  test('returns existing session when context is alive', () => {
+    const sessions = new Map();
+    const existingContext = { pages: () => [] };
+    sessions.set('user-1', { context: existingContext, tabGroups: new Map(), lastAccess: 0 });
+
+    const result = getSession(sessions, 'user-1', () => { throw new Error('should not create'); });
+    expect(result.context).toBe(existingContext);
+  });
+
+  test('skips session with _closing flag and creates new one', () => {
+    const sessions = new Map();
+    const oldContext = { pages: () => [] };
+    sessions.set('user-1', { context: oldContext, tabGroups: new Map(), lastAccess: 0, _closing: true });
+
+    const newContext = { pages: () => [] };
+    const result = getSession(sessions, 'user-1', () => newContext);
+
+    expect(result.context).toBe(newContext);
+    expect(result.context).not.toBe(oldContext);
+    expect(result._closing).toBeUndefined();
+    // Old entry is replaced in the map
+    expect(sessions.get('user-1').context).toBe(newContext);
+  });
+
+  test('recreates session when context.pages() throws', () => {
+    const sessions = new Map();
+    const deadContext = { pages: () => { throw new Error('context closed'); } };
+    sessions.set('user-1', { context: deadContext, tabGroups: new Map(), lastAccess: 0 });
+
+    const newContext = { pages: () => [] };
+    const result = getSession(sessions, 'user-1', () => newContext);
+
+    expect(result.context).toBe(newContext);
+  });
+
+  test('creates fresh session when none exists', () => {
+    const sessions = new Map();
+    const newContext = { pages: () => [] };
+    const result = getSession(sessions, 'user-1', () => newContext);
+
+    expect(result.context).toBe(newContext);
+    expect(sessions.has('user-1')).toBe(true);
+  });
+});
+
+describe('YT transcript session cleanup', () => {
+  // Simulate the finally-block cleanup logic from browserTranscript
+  function ytCleanup(sessions, ytKey, contextPagesResult, contextPagesThrows) {
+    const ytSession = sessions.get(ytKey);
+    if (ytSession && !ytSession._closing) {
+      try {
+        if (contextPagesThrows) throw new Error('context closed');
+        const remainingPages = contextPagesResult;
+        if (remainingPages.length === 0) {
+          ytSession._closing = true;
+          // context.close() would be called here
+          sessions.delete(ytKey);
+        }
+      } catch {
+        sessions.delete(ytKey);
+      }
+    }
+  }
+
+  test('does NOT close session when other pages are still open', () => {
+    const sessions = new Map();
+    const session = { context: {}, tabGroups: new Map(), lastAccess: Date.now() };
+    sessions.set('__yt_transcript__', session);
+
+    // Another transcript request still has a page open
+    ytCleanup(sessions, '__yt_transcript__', [{ /* page */ }], false);
+
+    expect(sessions.has('__yt_transcript__')).toBe(true);
+    expect(session._closing).toBeUndefined();
+  });
+
+  test('closes session when no pages remain', () => {
+    const sessions = new Map();
+    const session = { context: {}, tabGroups: new Map(), lastAccess: Date.now() };
+    sessions.set('__yt_transcript__', session);
+
+    ytCleanup(sessions, '__yt_transcript__', [], false);
+
+    expect(sessions.has('__yt_transcript__')).toBe(false);
+    expect(session._closing).toBe(true);
+  });
+
+  test('cleans up map entry when context is already dead', () => {
+    const sessions = new Map();
+    const session = { context: {}, tabGroups: new Map(), lastAccess: Date.now() };
+    sessions.set('__yt_transcript__', session);
+
+    ytCleanup(sessions, '__yt_transcript__', [], true /* throws */);
+
+    expect(sessions.has('__yt_transcript__')).toBe(false);
+  });
+
+  test('skips cleanup when session is already _closing', () => {
+    const sessions = new Map();
+    const session = { context: {}, tabGroups: new Map(), lastAccess: Date.now(), _closing: true };
+    sessions.set('__yt_transcript__', session);
+
+    ytCleanup(sessions, '__yt_transcript__', [], false);
+
+    // Session is still in the map (another cleanup path owns it)
+    expect(sessions.has('__yt_transcript__')).toBe(true);
+  });
+
+  test('concurrent requests: first closer sees pages, second sees empty', () => {
+    const sessions = new Map();
+    const session = { context: {}, tabGroups: new Map(), lastAccess: Date.now() };
+    sessions.set('__yt_transcript__', session);
+
+    // Request A finishes first — request B still has a page
+    ytCleanup(sessions, '__yt_transcript__', [{ /* B's page */ }], false);
+    expect(sessions.has('__yt_transcript__')).toBe(true);
+    expect(session._closing).toBeUndefined();
+
+    // Request B finishes — no pages left
+    ytCleanup(sessions, '__yt_transcript__', [], false);
+    expect(sessions.has('__yt_transcript__')).toBe(false);
+    expect(session._closing).toBe(true);
+  });
+});
+
+describe('session expiry _closing flag', () => {
+  // Simulate session expiry logic from server.js
+  function runSessionExpiry({ sessions, SESSION_TIMEOUT_MS, onExpired }) {
+    const now = Date.now();
+    for (const [userId, session] of sessions) {
+      if (SESSION_TIMEOUT_MS > 0 && now - session.lastAccess > SESSION_TIMEOUT_MS) {
+        session._closing = true;
+        onExpired(userId);
+        sessions.delete(userId);
+      }
+    }
+  }
+
+  test('expired session gets _closing flag before deletion', () => {
+    const past = Date.now() - 600_000;
+    const sessions = new Map();
+    const session = { tabGroups: new Map(), lastAccess: past };
+    sessions.set('user-1', session);
+
+    let closingFlagAtCallback = null;
+    runSessionExpiry({
+      sessions,
+      SESSION_TIMEOUT_MS: 300_000,
+      onExpired: () => { closingFlagAtCallback = session._closing; },
+    });
+
+    expect(closingFlagAtCallback).toBe(true);
+    expect(sessions.size).toBe(0);
+  });
+
+  test('a zero timeout does not expire sessions', () => {
+    const sessions = new Map();
+    const session = { tabGroups: new Map(), lastAccess: Date.now() - 600_000 };
+    sessions.set('user-1', session);
+
+    runSessionExpiry({
+      sessions,
+      SESSION_TIMEOUT_MS: 0,
+      onExpired: () => { throw new Error('should not expire'); },
+    });
+
+    expect(sessions.size).toBe(1);
+    expect(session._closing).toBeUndefined();
+  });
+  test('active session is NOT expired or flagged', () => {
+    const sessions = new Map();
+    const session = { tabGroups: new Map(), lastAccess: Date.now() };
+    sessions.set('user-1', session);
+
+    runSessionExpiry({
+      sessions,
+      SESSION_TIMEOUT_MS: 300_000,
+      onExpired: () => { throw new Error('should not expire'); },
+    });
+
+    expect(sessions.size).toBe(1);
+    expect(session._closing).toBeUndefined();
+  });
+});
+describe('config: TAB_INACTIVITY_MS=0 parses correctly', () => {
+  test('explicit 0 is preserved (not replaced by default)', () => {
+    const raw = '0';
+    const parsed = raw !== undefined ? parseInt(raw, 10) : 300000;
+    expect(parsed).toBe(0);
+  });
+
+  test('undefined falls back to default 300000', () => {
+    const raw = undefined;
+    const parsed = raw !== undefined ? parseInt(raw, 10) : 300000;
+    expect(parsed).toBe(300000);
+  });
+
+  test('empty string parses to NaN, not 0', () => {
+    const raw = '';
+    const parsed = raw !== undefined ? parseInt(raw, 10) : 300000;
+    expect(parsed).toBeNaN();
   });
 });

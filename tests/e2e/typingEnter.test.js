@@ -1,23 +1,17 @@
-import { startServer, stopServer, getServerUrl } from '../helpers/startServer.js';
-import { startTestSite, stopTestSite, getTestSiteUrl } from '../helpers/testSite.js';
 import { createClient } from '../helpers/client.js';
+import { getSharedEnv } from './sharedEnv.js';
 
 describe('Typing and Enter', () => {
   let serverUrl;
   let testSiteUrl;
   
-  beforeAll(async () => {
-    const port = await startServer();
-    serverUrl = getServerUrl();
-    
-    const testPort = await startTestSite();
-    testSiteUrl = getTestSiteUrl();
-  }, 120000);
+  beforeAll(() => {
+    const env = getSharedEnv();
+    serverUrl = env.serverUrl;
+    testSiteUrl = env.testSiteUrl;
+  });
   
-  afterAll(async () => {
-    await stopTestSite();
-    await stopServer();
-  }, 30000);
+  // Server lifecycle managed by globalSetup/globalTeardown
   
   test('type text into input field', async () => {
     const client = createClient(serverUrl);
@@ -67,6 +61,24 @@ describe('Typing and Enter', () => {
     }
   });
   
+  test('keyboard mode with delay and no selector types into the focused field without clearing it', async () => {
+    const client = createClient(serverUrl);
+
+    try {
+      const { tabId } = await client.createTab(`${testSiteUrl}/typing`);
+      await client.type(tabId, { selector: '#input', text: 'Hello ' });
+      await client.evaluate(tabId, "(() => { const el = document.querySelector('#input'); el.focus(); el.setSelectionRange(el.value.length, el.value.length); return true; })()");
+
+      const result = await client.type(tabId, { mode: 'keyboard', delay: 10, text: 'World' });
+      expect(result.ok).toBe(true);
+
+      const snapshot = await client.waitForSnapshotContains(tabId, 'Preview: Hello World');
+      expect(snapshot.snapshot).toContain('Hello World');
+    } finally {
+      await client.cleanup();
+    }
+  });
+
   test('type and press Enter navigates page', async () => {
     const client = createClient(serverUrl);
     

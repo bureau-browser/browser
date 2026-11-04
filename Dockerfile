@@ -1,20 +1,23 @@
-FROM node:20-slim
-
-# Pinned Camoufox version for reproducible builds
-# Update these when upgrading Camoufox
-ARG CAMOUFOX_VERSION=135.0.1
-ARG CAMOUFOX_RELEASE=beta.24
-ARG ARCH=x86_64
+# Trixie (glibc 2.41), not bookworm (2.36): better-sqlite3 ships an arm64 prebuild
+# linked against GLIBC_2.38, so on bookworm it loads and then dies at runtime with
+# "version `GLIBC_2.38' not found" the first time a tab is opened. amd64 is
+# unaffected because that prebuild targets an older glibc.
+FROM node:22-trixie-slim AS camofox-browser
 
 # Run as a non-root user (uid 1001) to match the cluster securityContext
-# (runAsNonRoot / runAsUser: 1001). Camoufox resolves its binary cache
-# (~/.cache/camoufox) and cookie dir (~/.camofox) via $HOME / os.homedir(),
-# so give 1001 a real, writable home and bake the browser cache THERE —
-# /root is mode 700 and a non-root uid can't traverse it, which is what
-# broke stealth on the new cluster (legacy k8s ran as root and worked).
+# (runAsNonRoot / runAsUser: 1001). Camoufox resolves its binary cache via
+# $HOME, and /root is mode 700, so bake the cache under a writable home.
 ENV HOME=/home/camofox
 RUN groupadd -g 1001 camofox \
     && useradd -u 1001 -g 1001 -m -d /home/camofox -s /usr/sbin/nologin camofox
+
+# Pinned Camoufox version for reproducible builds
+# Update these when upgrading Camoufox
+ARG CAMOUFOX_VERSION=152.0.4
+ARG CAMOUFOX_RELEASE=beta.28
+ARG TARGETARCH
+ARG YT_DLP_VERSION=2026.08.19
+ARG YT_DLP_SHA256=1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6
 
 # Install dependencies for Camoufox (Firefox-based)
 RUN apt-get update && apt-get install -y \
@@ -34,11 +37,12 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libxtst6 \
     # Mesa OpenGL/EGL for WebGL support (software rendering via llvmpipe)
-    # Without these, Firefox cannot create WebGL contexts — a major bot detection signal
-    libegl1-mesa \
+    # Without these, Firefox cannot create WebGL contexts -- a major bot detection signal
+    # libegl1 -- named libegl1-mesa on bookworm, dropped in trixie
+    libegl1 \
     libgl1-mesa-dri \
     libgbm1 \
-    # Xvfb virtual display — runs Camoufox as if on a real desktop (better anti-detection)
+    # Xvfb virtual display -- runs Camoufox as if on a real desktop (better anti-detection)
     xvfb \
     # Fonts
     fonts-liberation \
@@ -46,64 +50,83 @@ RUN apt-get update && apt-get install -y \
     fontconfig \
     # Utils
     ca-certificates \
+    curl \
     unzip \
     # yt-dlp runtime dependency
     python3-minimal \
-    # ffmpeg for x11grab screen recording (the Playwright-Firefox video
-    # path doesn't work on Camoufox, so we record the Xvfb display
-    # directly — see `recordVideo` branch in server.js).
+    # ffmpeg is the tab recorder backend (frame-grab assembly / x11grab).
+    # Playwright's Firefox recordVideo path does not work on Camoufox.
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Pre-bake Camoufox browser binary into image via bind mount (downloaded by Makefile)
+# Pre-bake Camoufox browser binary into image (downloaded at build time)
 # Note: unzip returns exit code 1 for warnings (Unicode filenames), so we use || true and verify
-RUN --mount=type=bind,source=dist,target=/dist \
-    mkdir -p "$HOME/.cache/camoufox" \
-    && (unzip -q /dist/camoufox-${ARCH}.zip -d "$HOME/.cache/camoufox" || true) \
+# -f so a 404 fails here instead of writing "Not Found" into the .zip: without it the
+# build dies three commands later on "unzip: cannot find zipfile directory", which
+# points at the archive rather than at the URL that was actually wrong. Note the Linux
+# BuildKit supplies TARGETARCH; map its names to Camoufox release asset names.
+RUN case "${TARGETARCH}" in \
+      amd64) CAMOUFOX_ARCH="x86_64" ;; \
+      arm64) CAMOUFOX_ARCH="arm64" ;; \
+      *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && mkdir -p "$HOME/.cache/camoufox" \
+    && curl -fL -o /tmp/camoufox.zip "https://github.com/daijro/camoufox/releases/download/v${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}/camoufox-${CAMOUFOX_VERSION}-${CAMOUFOX_RELEASE}-lin.${CAMOUFOX_ARCH}.zip" \
+    && (unzip -q /tmp/camoufox.zip -d "$HOME/.cache/camoufox" || true) \
+    && rm /tmp/camoufox.zip \
+    && chmod -R 755 "$HOME/.cache/camoufox" \
     && echo "{\"version\":\"${CAMOUFOX_VERSION}\",\"release\":\"${CAMOUFOX_RELEASE}\"}" > "$HOME/.cache/camoufox/version.json" \
     && test -f "$HOME/.cache/camoufox/camoufox-bin" && echo "Camoufox installed successfully" \
-    && chown -R 1001:1001 "$HOME/.cache" \
-    && chmod -R 755 "$HOME/.cache/camoufox"
+    && chown -R 1001:1001 "$HOME/.cache"
 
-# Install yt-dlp for YouTube transcript extraction (no browser needed)
-RUN --mount=type=bind,source=dist,target=/dist \
-    install -m 755 /dist/yt-dlp-${ARCH} /usr/local/bin/yt-dlp
+# yt-dlp is installed and verified by the enabled YouTube plugin hook below.
 
 WORKDIR /app
 
-COPY package.json ./
-# better-sqlite3 builds a native addon during install. node-gyp finds
-# python via the python3-minimal installed above, but still needs a
-# C/C++ toolchain (make + g++). Install them for the build, then purge
-# so they don't bloat the runtime image. python3-minimal is left intact
-# (yt-dlp depends on it).
+COPY package.json package-lock.json postinstall.js ./
+COPY lib/camoufox-download.js ./lib/
+COPY scripts/ ./scripts/
+# better-sqlite3 has no prebuild matching this node/arch, so npm ci falls back to
+# `node-gyp rebuild`, which fails on node:*-slim with "Error: not found: make".
+# Install a toolchain for the build and purge it in the same layer so it does not
+# land in the image. Independent of the glibc issue noted at the FROM line: this
+# one fails at build time on any Debian release, that one at runtime on bookworm.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends make g++ \
-    && npm install --production \
-    && apt-get purge -y --auto-remove make g++ \
+    && apt-get install -y --no-install-recommends build-essential python3 \
+    && npm ci --omit=dev \
+    && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Playwright ffmpeg binary — required for `page.video()` / recordVideo
-# contexts. Without this, any newContext({ recordVideo }) call fails with
-# "Executable doesn't exist at $HOME/.cache/ms-playwright/ffmpeg-XXXX/ffmpeg-linux".
-# Installs under $HOME (=/home/camofox) since HOME is set above; chown so the
-# non-root runtime user can read it. Only the ffmpeg helper is installed (not
-# the Playwright browsers, which Camoufox ships separately).
-RUN npx playwright install ffmpeg \
-    && chown -R 1001:1001 "$HOME/.cache"
-
 COPY server.js ./
+COPY camofox.config.json ./
 COPY lib/ ./lib/
+# lib/cookies.js is a compatibility re-export from ../mcp/lib/cookies.mjs, so mcp/
+# must ship even though the MCP server itself is not run here. Without it the
+# persistence plugin dies at load with ERR_MODULE_NOT_FOUND, the server starts
+# anyway, /health keeps reporting ok, and no profile is ever written -- i.e. the
+# container silently loses the durable-profile feature it exists to provide.
+COPY mcp/ ./mcp/
+COPY plugins/ ./plugins/
+COPY scripts/ ./scripts/
 
-# /app is owned by root from the COPY/npm steps (world-readable, fine). The
-# runtime user only needs to WRITE under $HOME (cookies, mozilla profile,
-# Xvfb) — hand that to 1001 and drop to the non-root user.
+# Install default plugin dependencies (apt packages + post-install hooks)
+RUN sh scripts/install-plugin-deps.sh
+
+# Hand the runtime user the writable parts of $HOME (cookies, profile, Xvfb).
 RUN chown -R 1001:1001 /home/camofox
 USER camofox
 
 ENV NODE_ENV=production
-ENV CAMOFOX_PORT=3000
+ENV CAMOFOX_PORT=9377
 
 EXPOSE 9377
 
 CMD ["sh", "-c", "node --max-old-space-size=${MAX_OLD_SPACE_SIZE:-128} server.js"]
+
+# Optional: rebuild plugin deps after adding third-party plugins
+# Usage: docker build --target with-plugins -t camofox-browser .
+FROM camofox-browser AS with-plugins
+COPY plugins/ ./plugins/
+COPY camofox.config.json ./
+COPY scripts/install-plugin-deps.sh /tmp/install-plugin-deps.sh
+RUN /tmp/install-plugin-deps.sh && rm /tmp/install-plugin-deps.sh
