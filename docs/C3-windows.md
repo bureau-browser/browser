@@ -13,27 +13,30 @@ plus `context.waitForEvent("page")`, so Firefox applies its own tab policy and
 the page becomes a tab of the existing window. `GET /tabs` now exposes
 `contextId`, so a test can prove two tabs share one context.
 
-Creation is serialised per context. The first page is `newPage`; when the
-second page is requested an about:blank anchor tab is opened once from the
-first page, and every later tab is opened from that anchor with a unique
-window name and `noopener`. The new page's name is checked before it is used,
-so concurrent creations cannot receive each other's page, and the opener is
-null before any site code runs.
+Creation is serialised per context. The first `context.newPage()` is an
+about:blank ANCHOR tab we own; it is never navigated, never returned to a
+caller and never counted as a tab. Every user page, including the first, is
+opened from that anchor with a unique window name and `noopener`. No
+window.open ever runs in a page the site controls. The new page's name is
+checked before it is used, so concurrent creations cannot receive each other's
+page, and the opener is null before any site code runs. If the anchor dies it
+is recreated with `context.newPage()`.
 
-Headful trace with `CAMOFOX_TRACE_WINDOWS=1`, one user, three `POST /tabs`
-(page-1 is the first page, page-2 and page-3 are tabs; the anchor is not a
-managed tab):
+Headful trace with `CAMOFOX_TRACE_WINDOWS=1`, three concurrent cold
+`POST /tabs` for one new user (page-3 is the anchor and is not a managed tab):
 
 ```json
-{"event":"context_created","contextId":"ctx-1","reason":"session-create","userId":"main"}
-{"event":"page_created","pageId":"page-1","contextId":"ctx-1","reason":"tab","openedVia":"newPage"}
-{"event":"page_created","pageId":"page-2","contextId":"ctx-1","reason":"tab","openedVia":"window.open"}
-{"event":"page_created","pageId":"page-3","contextId":"ctx-1","reason":"tab","openedVia":"window.open"}
+{"event":"context_created","contextId":"ctx-2","reason":"session-create","userId":"cold"}
+{"event":"page_created","pageId":"page-3","contextId":"ctx-2","reason":"anchor","openedVia":"newPage"}
+{"event":"page_created","pageId":"page-4","contextId":"ctx-2","reason":"tab","openedVia":"window.open"}
+{"event":"page_created","pageId":"page-5","contextId":"ctx-2","reason":"tab","openedVia":"window.open"}
+{"event":"page_created","pageId":"page-6","contextId":"ctx-2","reason":"tab","openedVia":"window.open"}
 ```
 
-Firefox window count from `System Events`: 0 before the first page, 1 after the
-first page, and still 1 after the second and third tabs. The page screenshot
-reported real dimensions `1728x999`.
+Firefox window count from `System Events`: 0 before any tab, 1 after one tab,
+0 after closing that session, and 1 after three concurrent cold tabs for one
+new user. `/health` reported `windows:1`, `activeTabs:3`; the three tabs shared
+`ctx-2`. The page screenshot reported real dimensions `1728x999`.
 
 Background-tab check: after opening a second tab, `document.visibilityState`
 stayed `visible`, `document.hidden` stayed `false`, and `requestAnimationFrame`
