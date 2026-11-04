@@ -65,22 +65,42 @@ workflow is guarded with `github.repository == 'jo-inc/camofox-browser'`. On the
 fork the jobs are skipped; an upstream sync keeps the workflow intact. No other
 workflow was changed.
 
+A second review round made three of these behavioural rather than source
+checks: `plugins/persistence/plugin.test.js` proves a `jar_auth_gained` close
+does not write the jar, `tests/unit/typeMode.test.js` plus a keyboard+delay e2e
+case prove delay does not turn keyboard mode into human fill, and
+`tests/unit/tabLockBudget.test.js` proves a queued op waits for the holder's
+remaining budget. The lock also no longer destroys a tab on a queue timeout.
+
+### Known follow-up
+
+The jar-change login pickup runs only in `getSession`. An already-listed tab
+that is reused without a `getSession` call (Bureau's `openSession` with
+`injectCookies: false` reuses the remembered tab id) will not pick up a login
+made by another instance until the session is rebuilt. A future fix should
+check the jar mtime on the tab-reuse path too, or expose an explicit refresh
+call.
+
+The Paris geolocation identity also grants `permissions: ['geolocation']` in
+the session context options again, so `navigator.geolocation` works instead of
+being present-but-denied.
+
 ## Tests
 
 All on the final tree after the review fixes.
 
 ```
 npm run test:unit
-  Test Suites: 85 passed, 85 total
-  Tests:       2 skipped, 914 passed, 916 total
+  Test Suites: 87 passed, 87 total
+  Tests:       2 skipped, 920 passed, 922 total
 
 npm run test:plugins
   Test Suites: 7 passed, 7 total
-  Tests:       48 passed, 48 total
+  Tests:       49 passed, 49 total
 
 CAMOFOX_PROFILE_DIR=<tmp> CAMOUFOX_INSTALL_DIR=<tmp cache> npm run test:e2e
   Test Suites: 16 passed, 16 total
-  Tests:       82 passed, 82 total
+  Tests:       83 passed, 83 total
 ```
 
 E2E uses only the local Express test site (no external network, no credentials).
