@@ -58,6 +58,67 @@ describe('Security', () => {
       }
     });
 
+    test('allows about:blank on tab creation', async () => {
+      const client = createClient(serverUrl);
+      try {
+        const result = await client.createTab('about:blank');
+        expect(result.tabId).toBeDefined();
+        expect(result.url).toBe('about:blank');
+      } finally {
+        await client.cleanup();
+      }
+    });
+
+    test('allows about:blank on navigate and keeps the tab listed and usable', async () => {
+      const client = createClient(serverUrl);
+      try {
+        const before = await client.health();
+        const { tabId } = await client.createTab(`${testSiteUrl}/pageA`);
+        const afterCreate = await client.health();
+        const result = await client.navigate(tabId, 'about:blank');
+        expect(result.ok).toBe(true);
+        expect(result.url).toBe('about:blank');
+        const afterBlank = await client.health();
+        expect(afterCreate.activeTabs - before.activeTabs).toBe(1);
+        expect(afterBlank.activeTabs).toBe(afterCreate.activeTabs);
+        expect(afterBlank.windows).toBe(afterCreate.windows);
+
+        const listed = await client.request('GET', `/tabs?userId=${encodeURIComponent(client.userId)}`);
+        expect(listed.tabs.some((tab) => tab.tabId === tabId)).toBe(true);
+
+        const snapshot = await client.getSnapshot(tabId);
+        expect(snapshot.url).toBe('about:blank');
+
+        const evaluated = await client.evaluate(tabId, 'JSON.stringify({ href: location.href, title: document.title })');
+        expect(JSON.parse(evaluated.result)).toEqual({ href: 'about:blank', title: '' });
+      } finally {
+        await client.cleanup();
+      }
+    });
+
+    test('blocks privileged about: pages', async () => {
+      const client = createClient(serverUrl);
+      try {
+        for (const url of ['about:config', 'about:preferences', 'ABOUT:config', 'about:blank?x']) {
+          await expect(client.createTab(url)).rejects.toMatchObject({ status: 400 });
+        }
+      } finally {
+        await client.cleanup();
+      }
+    });
+
+    test('blocks privileged about: pages on navigate', async () => {
+      const client = createClient(serverUrl);
+      try {
+        const { tabId } = await client.createTab(`${testSiteUrl}/pageA`);
+        for (const url of ['about:config', 'about:preferences', 'ABOUT:config']) {
+          await expect(client.navigate(tabId, url)).rejects.toMatchObject({ status: 400 });
+        }
+      } finally {
+        await client.cleanup();
+      }
+    });
+
     test('blocks file:// URLs on navigate', async () => {
       const client = createClient(serverUrl);
       try {
