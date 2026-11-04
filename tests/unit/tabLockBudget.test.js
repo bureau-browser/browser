@@ -27,18 +27,22 @@ describe('tab lock holder-aware queue budget', () => {
 
   test('a caller deadline removes the queued entry so it never runs later', async () => {
     const lock = new TabLock();
-    const releaseHolder = await acquireForOp(lock, 300, 0);
+    const releaseHolder = await acquireForOp(lock, 500, 0);
     let ran = false;
+    const startedAt = Date.now();
 
-    const queued = acquireForOp(lock, 35, 0, 40).then((release) => {
+    const queued = acquireForOp(lock, 35, 0, 100).then((release) => {
       ran = true;
       release();
     });
 
+    // The cap must win over the holder-remaining + own-budget wait. On the
+    // pre-fix code this rejects only after ~535 ms (holder 500 + own 35).
     await expect(queued).rejects.toThrow('Tab lock queue timeout');
-    await sleep(60);
+    expect(Date.now() - startedAt).toBeLessThan(200);
+
     releaseHolder();
-    await sleep(80);
+    await sleep(60);
     expect(ran).toBe(false);
   });
 
@@ -51,7 +55,13 @@ describe('tab lock holder-aware queue budget', () => {
       json(payload) { this.payload = payload; return this; },
     };
 
-    handleTabLockQueueTimeout({ res, extraFields: { reqId: 'r1' } });
+    handleTabLockQueueTimeout({
+      res,
+      extraFields: { reqId: 'r1' },
+      sessions,
+      userId: 'user-1',
+      tabId: 'tab-1',
+    });
 
     expect(res.statusCode).toBe(503);
     expect(res.payload.code).toBe('tab_unresponsive');

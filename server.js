@@ -1689,7 +1689,7 @@ function handleRouteError(err, req, res, extraFields = {}) {
   // destroy it: the holder may still be making progress (for example a long
   // human-typed fill). The caller can retry or wait.
   if (userId && isTabLockQueueTimeout(err)) {
-    handleTabLockQueueTimeout({ res, extraFields });
+    handleTabLockQueueTimeout({ res, extraFields, sessions, userId, tabId });
     return;
   }
   // Tab was destroyed while this request was queued in the lock
