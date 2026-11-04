@@ -734,6 +734,13 @@
                           },
                           "listItemId": {
                             "type": "string"
+                          },
+                          "contextId": {
+                            "type": "string"
+                          },
+                          "userId": {
+                            "type": "string",
+                            "description": "Present when the request omitted userId (all users)."
                           }
                         }
                       }
@@ -2213,11 +2220,19 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "meta",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Return JSON with base64 data plus the real width and height instead of raw bytes."
           }
         ],
         "responses": {
           "200": {
-            "description": "Screenshot.",
+            "description": "Screenshot bytes, or a JSON metadata envelope when meta=1.",
             "content": {
               "application/json": {
                 "schema": {

@@ -144,6 +144,19 @@ describe('loadConfig', () => {
     expect(loadConfig().headful).toBe(true);
   });
 
+  test('headful defaults the browser idle timeout to 0 (never hide the window)', () => {
+    delete process.env.BROWSER_IDLE_TIMEOUT_MS;
+    process.env.CAMOFOX_HEADFUL = 'true';
+    expect(loadConfig().browserIdleTimeoutMs).toBe(0);
+
+    process.env.BROWSER_IDLE_TIMEOUT_MS = '120000';
+    expect(loadConfig().browserIdleTimeoutMs).toBe(120000);
+
+    delete process.env.BROWSER_IDLE_TIMEOUT_MS;
+    process.env.CAMOFOX_HEADFUL = 'false';
+    expect(loadConfig().browserIdleTimeoutMs).toBe(300000);
+  });
+
   test('uses default timeout values when timeout environment variables are unset or invalid', () => {
     delete process.env.SESSION_TIMEOUT_MS;
     delete process.env.BROWSER_IDLE_TIMEOUT_MS;
